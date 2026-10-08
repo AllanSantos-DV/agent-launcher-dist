@@ -1,0 +1,35 @@
+# Recebe o pacote montado pela release; publica a tag no npm com proveniência (trusted publishing, sem token).
+
+name: Publish to npm
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node 24 traz npm 11.5+, exigido pelo trusted publishing; sem registry-url, para usar OIDC.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Tag corresponde ao package.json
+        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+
+      - name: Publish
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if npm view "@allansantos-dev/agent-launcher@$version" version >/dev/null 2>&1; then
+            echo "::notice::@allansantos-dev/agent-launcher@$version já está no npm; nada a publicar."
+          else
+            npm publish --provenance
+          fi
