@@ -674,6 +674,10 @@ def build_plan(gateway: Gateway, cli: str, directory: str, model: str, resume: b
         fast_model = families.get("haiku") or families.get("sonnet") or model
         if catalog.verified and selected.one_million and selected.family:
             context_window = 1_000_000
+        elif catalog.verified and not selected.family and selected.max_input_tokens:
+            # Modelo de outro fornecedor via roteador: o Claude Code não reconhece o ID e assumiria a janela padrão.
+            # Sem [1m] no ID, CLAUDE_CODE_MAX_CONTEXT_TOKENS vale direto (code.claude.com/docs/en/model-config).
+            context_window = selected.max_input_tokens
         api_key = gateway.targets.get("claude_auth") == "api_key"
         secret_variable = "ANTHROPIC_API_KEY" if api_key else "ANTHROPIC_AUTH_TOKEN"
         overrides = {
@@ -694,6 +698,12 @@ def build_plan(gateway: Gateway, cli: str, directory: str, model: str, resume: b
         }
         if preserve_terminal_title:
             overrides["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"] = "1"
+        if context_window and not selected.family:
+            overrides["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(context_window)
+        if gateway.options.get("tool_search") is True:
+            # Fora da Anthropic o Claude Code carrega todo MCP de uma vez; a conexão declara que o host aceita
+            # tool_reference, então as ferramentas passam a carregar sob demanda.
+            overrides["ENABLE_TOOL_SEARCH"] = "true"
         for family in CLAUDE_FAMILIES:
             variable = f"ANTHROPIC_DEFAULT_{family.upper()}_MODEL"
             record = family_records.get(family)
@@ -744,8 +754,17 @@ def build_plan(gateway: Gateway, cli: str, directory: str, model: str, resume: b
         command += ["--model", model]
         command += (["--dangerously-bypass-approvals-and-sandbox"] if bypass_permissions else
                     ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"])
+        if controlled:
+            # Valem no app-server para conversa nova e retomada: com --remote, a TUI não aceita flag de permissão
+            # ao retomar ("Permission overrides are not supported when resuming a remote task").
+            options.update(check_for_update_on_startup=False, approval_policy="never", sandbox_mode="danger-full-access")
         for key, value in options.items():
             command += ["-c", f"{key}={json.dumps(value, ensure_ascii=True)}"]
+        if controlled:
+            # Sessão aberta pelo orquestrador (que já validou o projeto): nada pode esperar clique. Confiança da
+            # pasta só para esta pasta cadastrada e só neste processo (tabela inline TOML; nada é gravado em disco).
+            command += ["-c", f"projects={{{json.dumps(str(path), ensure_ascii=True)}={{trust_level=\"trusted\"}}}}",
+                        "--dangerously-bypass-hook-trust"]
     environment.update(overrides)
     local_hosts = ["127.0.0.1", "localhost"]
     host = urllib.parse.urlparse(gateway.targets[cli]).hostname or ""
@@ -757,6 +776,114 @@ def build_plan(gateway: Gateway, cli: str, directory: str, model: str, resume: b
     environment["no_proxy"] = bypass
     return LaunchPlan(cli, model, path, command, environment, overrides, input_limit, context_window,
                       auto_compact_limit, families, warnings, controlled, gateway.name, (secret_variable,))
+
+
+def claude_config_file() -> Path:
+    """Onde o Claude Code guarda o estado do usuário (inclusive a confiança por pasta)."""
+    folder = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(folder) / ".claude.json" if folder else Path.home() / ".claude.json"
+
+
+def trust_claude_folder(path: Path, config: Path | None = None, attempts: int = 8, before_replace=None) -> bool:
+    """Grava projects[<pasta>].hasTrustDialogAccepted=true no estado do Claude Code. Só para sessões controladas
+    em projetos cadastrados. O arquivo é reescrito pelas sessões abertas: troca atômica e só se ele não mudou desde
+    a leitura; senão relê e tenta de novo. Devolve False se a pasta já era confiável."""
+    config = config or claude_config_file()
+    key = str(path).replace("\\", "/")
+    for attempt in range(attempts):
+        try:
+            before = config.stat()
+            data = json.loads(config.read_text(encoding="utf-8"))
+        except FileNotFoundError as error:
+            raise LauncherError(f"Estado do Claude Code não encontrado em {config}; abra o Claude Code uma vez.") from error
+        except ValueError as error:
+            raise LauncherError(f"{config} não é JSON válido; confiança da pasta não gravada.") from error
+        projects = data.get("projects")
+        if not isinstance(projects, dict):
+            raise LauncherError(f"Formato inesperado em {config} (sem 'projects'); confiança da pasta não gravada.")
+        keys = [name for name in projects if name.replace("\\", "/").casefold() == key.casefold()] or [key]
+        if all(isinstance(projects.get(name), dict) and projects[name].get("hasTrustDialogAccepted") is True
+               for name in keys):
+            return False
+        for name in keys:
+            entry = projects.get(name)
+            projects[name] = {**(entry if isinstance(entry, dict) else {}), "hasTrustDialogAccepted": True}
+        descriptor, temporary = tempfile.mkstemp(prefix=config.name + ".", suffix=".tmp", dir=config.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(data, stream, ensure_ascii=False, indent=2)
+            if before_replace:
+                before_replace()
+            now = config.stat()
+            if (now.st_mtime_ns, now.st_size) == (before.st_mtime_ns, before.st_size):
+                os.replace(temporary, config)
+                return True
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        time.sleep(0.1 * (attempt + 1))  # outra sessão gravou no meio: relê e tenta de novo
+    raise LauncherError(f"{config} mudou durante todas as {attempts} tentativas; confiança da pasta não gravada.")
+
+
+def prepare_unattended(plan: LaunchPlan) -> None:
+    """Antes de abrir uma sessão controlada do Claude Code: confia a pasta do projeto cadastrado. Falha visível."""
+    if plan.controlled and plan.cli == "claude":
+        try:
+            if trust_claude_folder(plan.directory):
+                print(f"  Pasta marcada como confiável no Claude Code: {plan.directory}")
+        except (LauncherError, OSError) as error:
+            print(f"  Aviso: {error} A sessão pode pedir confirmação de confiança da pasta.")
+
+
+def approve_codex_hooks(directory: Path, environment: dict | None = None, command: list[str] | None = None,
+                        timeout: float = 60) -> list[str]:
+    """Sessão controlada do Codex: aprova, pelo app-server do próprio Codex, os hooks novos ou alterados daquela pasta
+    (o mesmo que o "Trust all" da TUI: hooks/list e config/batchWrite em hooks.state com trusted_hash=currentHash).
+    Necessário porque --dangerously-bypass-hook-trust não vale na retomada de uma sessão persistente. Devolve as
+    chaves aprovadas; levanta LauncherError se o app-server recusar."""
+    import queue
+    import threading
+    process = subprocess.Popen(command or resolve_cli("codex") + ["app-server"], cwd=directory, env=environment,
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                               encoding="utf-8", errors="replace",
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    replies = queue.Queue()
+    threading.Thread(target=lambda: [replies.put(line) for line in process.stdout], daemon=True).start()
+
+    def send(message: dict) -> None:
+        process.stdin.write(json.dumps({"jsonrpc": "2.0", **message}) + "\n")
+        process.stdin.flush()
+
+    def call(identifier: int, method: str, params: dict) -> dict:
+        send({"id": identifier, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                message = json.loads(replies.get(timeout=max(0.1, deadline - time.monotonic())))
+            except queue.Empty as error:
+                raise LauncherError(f"O app-server do Codex não respondeu {method} em {timeout:.0f} s.") from error
+            except ValueError:
+                continue
+            if message.get("id") == identifier:
+                if "error" in message:
+                    raise LauncherError(f"O app-server do Codex recusou {method}: {message['error']}")
+                return message.get("result") or {}
+
+    try:
+        call(1, "initialize", {"clientInfo": {"name": "agent-launcher", "version": "1"}})
+        send({"method": "initialized"})
+        listing = call(2, "hooks/list", {"cwds": [str(directory)]})
+        pending = {hook["key"]: hook["currentHash"]
+                   for entry in listing.get("data", []) if path_key(entry.get("cwd", "")) == path_key(str(directory))
+                   for hook in entry.get("hooks", [])
+                   if hook.get("trustStatus") in ("untrusted", "modified") and hook.get("key") and hook.get("currentHash")}
+        if pending:
+            call(3, "config/batchWrite", {"edits": [{"keyPath": "hooks.state", "mergeStrategy": "upsert",
+                                                     "value": {key: {"trusted_hash": digest} for key, digest in pending.items()}}],
+                                          "filePath": None, "expectedVersion": None, "reloadUserConfig": True})
+        return sorted(pending)
+    finally:
+        stop_tree(process)
 
 
 def prepare_codex_command(plan: LaunchPlan, directory: Path) -> tuple[list[str], str]:
@@ -868,15 +995,29 @@ def controlled_codex_commands(plan: LaunchPlan, url: str, token_sha256: str = "<
         else:
             index += 1
     server = base + ["app-server", "--listen", url, "--ws-auth", "capability-token", "--ws-token-sha256", token_sha256] + options
-    tui = base + ["--remote", url, "--remote-auth-token-env", "ORQ_CODEX_TOKEN", "--model", plan.model,
-                  "--dangerously-bypass-approvals-and-sandbox"]
-    if "resume" in plan.command:
+    # A TUI faz o aviso de atualização e a revisão de hooks; com --remote ela repassa bypass_hook_trust ao app-server
+    # em cada thread/start e thread/resume (o app-server não aceita a flag na linha de comando).
+    unattended = [part for pair in zip(options[::2], options[1::2]) if pair[1].startswith(
+        ("check_for_update_on_startup=", "projects=")) for part in pair]
+    resuming = "resume" in plan.command
+    tui = base + ["--remote", url, "--remote-auth-token-env", "ORQ_CODEX_TOKEN", "--model", plan.model, *unattended]
+    if not resuming:
+        tui.append("--dangerously-bypass-approvals-and-sandbox")
+    if "--dangerously-bypass-hook-trust" in plan.command:
+        tui.append("--dangerously-bypass-hook-trust")
+    if resuming:
         tui += ["resume", "--last"]
     return server, tui
 
 
 def run_controlled_codex(plan: LaunchPlan, project: str) -> int:
     """Codex controlável: o orchestrador encontra o app-server pelo registro e manda turnos na janela visível."""
+    try:
+        approved = approve_codex_hooks(plan.directory, plan.environment)
+        if approved:
+            print(f"  Hooks aprovados para a sessão controlada: {len(approved)}")
+    except (LauncherError, OSError) as error:
+        print(f"  Aviso: não foi possível aprovar os hooks ({error}); a retomada pode pedir revisão de hooks.")
     port = free_port()
     url = f"ws://127.0.0.1:{port}"
     token = secrets.token_urlsafe(32)

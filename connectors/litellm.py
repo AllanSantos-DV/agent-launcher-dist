@@ -5,7 +5,7 @@ O LiteLLM serve /v1/messages e /v1/responses na mesma base, então os dois CLIs 
 """
 from catalog import merge_records
 from connectors import ConnectorError
-from connectors._http import NO_KEY, base_url, bearer, get_json, listed
+from connectors._http import NO_KEY, TOOL_SEARCH, base_url, bearer, get_json, listed
 
 NAME = "litellm"
 LABEL = "LiteLLM / host próprio"
@@ -17,6 +17,7 @@ FIELDS = (
     {"name": "api_key", "label": "Chave", "secret": True, "hint": "Opcional: virtual key do LiteLLM."},
     {"name": "any_model", "label": "Qualquer modelo nos dois CLIs", "type": "bool", "default": False,
      "hint": "Desmarcado: Claude Code só lista claude-*, Codex só gpt-*/o*. Marque se o proxy traduz os demais."},
+    TOOL_SEARCH,
 )
 
 

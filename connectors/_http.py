@@ -69,6 +69,22 @@ def get_json(url: str, headers: dict | None = None, timeout: float = 15) -> dict
     return result
 
 
+def auth_probe(url: str, headers: dict, timeout: float = 15) -> None:
+    """Confere a chave com um POST de corpo vazio: o host autentica antes de validar o corpo, então 401/403 é chave
+    recusada e qualquer outro status (400 "Missing model"...) é chave aceita, sem gerar nenhuma resposta de modelo."""
+    request = urllib.request.Request(url, data=b"{}", headers={"Content-Type": "application/json", **headers},
+                                     method="POST")
+    try:
+        with _opener(url).open(request, timeout=timeout) as response:
+            response.read(1024)
+    except urllib.error.HTTPError as error:
+        error.close()
+        if error.code in (401, 403):
+            raise ConnectorError(f"O host recusou a chave (HTTP {error.code}) em {url}.") from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
+        raise ConnectorError(f"Sem resposta de {url}: {getattr(error, 'reason', error)}") from None
+
+
 def bearer(token: str) -> dict:
     return {"Authorization": "Bearer " + token} if token else {}
 
@@ -128,6 +144,10 @@ def router_records(entries: list, extra: str = "") -> tuple[list[ModelInfo], boo
     result = [records[key] for key in sorted(records, key=str.casefold)]
     return result, any(record.max_input_tokens for record in result)
 
+
+TOOL_SEARCH = {"name": "tool_search", "label": "Tool search de MCP no Claude Code", "type": "bool", "default": False,
+               "hint": "Carrega as ferramentas MCP sob demanda (bem menos contexto). Só ligue se o host suportar "
+                       "tool_reference: sem esse suporte as requisições do Claude Code falham."}
 
 EXTRA_MODELS = {"name": "extra_models", "label": "Modelos extras",
                 "placeholder": "id-1, id-2", "hint": "IDs separados por vírgula para hosts que não listam todos os modelos."}

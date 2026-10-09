@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.0, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.1, Windows 10/11.
 
 ## Requisitos
 
@@ -72,6 +72,12 @@ projeto lembra a última conexão, o CLI e o modelo usados.
 | Compatível com Anthropic | `{endereço}` | — | o que o host listar + extras | se o host informar |
 | Compatível com OpenAI | — | `{endereço}` (Responses) | o que o host listar + extras | se o host informar |
 
+Conexões que levam o Claude Code a hosts de terceiros (LiteLLM, 9router, OmniRoute, OpenRouter, compatíveis com
+Anthropic) têm a opção **Tool search de MCP no Claude Code**: fora da Anthropic o Claude Code carrega todas as
+ferramentas MCP de uma vez, e com a opção ligada elas passam a carregar sob demanda (`ENABLE_TOOL_SEARCH=true`), com
+bem menos contexto. Só ligue se o host suportar `tool_reference`; sem esse suporte as requisições falham. O teste da
+conexão do 9router também confere a chave (o `/v1/models` dele responde sem chave).
+
 Modelos de imagem, áudio, embeddings e os que o host declara sem ferramentas não entram nas listas. Para hosts que não
 listam tudo, os conectores compatíveis aceitam **Modelos extras** (IDs separados por vírgula).
 
@@ -108,6 +114,8 @@ alterados.
 
 ### Contexto
 
+- Para um modelo de outro fornecedor no Claude Code (via roteador), o limite informado pelo host vai em
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS`; sem isso o Claude Code assumiria a janela padrão para um ID que não reconhece.
 - `[1m]` é acrescentado a um modelo **Claude** (e a cada alias elegível) só quando o host informa entrada de pelo menos
   1.000.000 tokens para aquele ID. Sem metadados confirmados, 1M fica desligado na sessão.
 - No Codex, o limite informado vira `model_context_window`, e a compactação automática fica no menor entre 90% dele e o
@@ -134,6 +142,17 @@ Implica bypass e:
   TUI conectada a ele. O registro `~/.cli-launcher/codex-controlled/<porta>.json` é como o orquestrador encontra a
   sessão. O app-server fica num Job Object do Windows e morre junto com a janela.
 
+Sessão controlada não pode parar esperando clique (o orquestrador já validou o projeto antes de cadastrar). Só nela,
+e só para a pasta do projeto cadastrado:
+
+- **Claude:** antes de abrir, grava `hasTrustDialogAccepted` daquela pasta no `~/.claude.json` (troca atômica, refeita
+  se outra sessão gravou no meio).
+- **Codex:** `-c check_for_update_on_startup=false`, confiança da pasta só neste processo
+  (`-c projects={"<pasta>"={trust_level="trusted"}}`, nada gravado em disco) e `--dangerously-bypass-hook-trust`, que
+  roda os hooks habilitados sem a revisão de hooks novos ou alterados.
+
+Fora do modo controlado (abrir pela interface ou pelo modo texto sem `--controlled`), os CLIs continuam pedindo essas
+confirmações normalmente.
 ## Escrever um conector
 
 Um conector é um arquivo `.py` em `~/.agent-launcher/connectors/`. Ele aparece na interface ao lado dos embutidos;

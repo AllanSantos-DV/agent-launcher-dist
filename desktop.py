@@ -7,7 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 
-from core import (ROOT, Gateway, LauncherError, Store, build_plan, project_path, run_controlled_codex, run_plan,
+from core import (ROOT, Gateway, LauncherError, Store, build_plan, prepare_unattended, project_path,
+                  run_controlled_codex, run_plan,
                   without_parent_session)
 import terminal
 from version import APP_ID, APP_NAME
@@ -82,6 +83,7 @@ def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
                           bypass_permissions=bypass_permissions, controlled=controlled)
         for warning in plan.warnings:
             print(f"  Aviso: {warning}")
+        prepare_unattended(plan)
         if plan.controlled and cli == "codex":
             return run_controlled_codex(plan, project["name"])
         return run_plan(plan)

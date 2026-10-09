@@ -8,7 +8,8 @@ import sys
 from pathlib import Path
 
 from catalog import CLAUDE_FAMILIES, CLIS, base_model, token_label
-from core import (ROOT, LauncherError, Gateway, Store, build_plan, controlled_codex_commands, resolve_cli,
+from core import (ROOT, LauncherError, Gateway, Store, build_plan, controlled_codex_commands, prepare_unattended,
+                  resolve_cli,
                   run_controlled_codex, run_plan)
 import clis
 import terminal
@@ -236,6 +237,7 @@ def launch(store: Store, project: dict, gateway: Gateway, cli: str, model: str, 
         print(f"  [AVISO] {warning}")
     print("  Configurações globais dos CLIs preservadas.\n")
     store.remember(project, gateway.connection, cli, base_model(model))
+    prepare_unattended(plan)
     exit_code = run_controlled_codex(plan, project["name"]) if plan.controlled and cli == "codex" else run_plan(plan)
     if exit_code:
         print(f"\n{cli} encerrou com código {exit_code}. Use 'doctor' para verificar a conexão e o catálogo.")
