@@ -13,6 +13,7 @@ from core import (ROOT, LauncherError, Gateway, Store, build_plan, controlled_co
                   run_controlled_codex, run_plan)
 import clis
 import terminal
+import updater
 from version import APP_NAME, VERSION
 
 CLI_LABELS = {"claude": "Claude Code", "codex": "Codex"}
@@ -460,6 +461,10 @@ def parser() -> argparse.ArgumentParser:
     preferences = commands.add_parser("preferences", help="Preferências")
     preferences.add_argument("--bypass-default", choices=("on", "off"),
                              help="Bypass de permissões marcado por padrão na interface")
+    preferences.add_argument("--auto-update", choices=("on", "off"),
+                             help="Interface se atualiza sozinha pelo npm a cada abertura")
+    update = commands.add_parser("update", help="Atualizar agora pela última versão publicada no npm")
+    update.add_argument("--check", action="store_true", help="só mostra se há versão nova, sem instalar")
     session = commands.add_parser("launch", help="Iniciar um CLI no terminal atual")
     session.add_argument("--project", required=True, help="Nome, ID ou caminho de projeto cadastrado")
     session.add_argument("--connection", help="Nome ou ID; omitido usa a última do projeto ou a padrão")
@@ -554,7 +559,21 @@ def main(arguments: list[str] | None = None) -> int:
         elif options.action == "preferences":
             if options.bypass_default:
                 store.set_preference("bypass_default", options.bypass_default == "on")
+            if options.auto_update:
+                store.set_preference("auto_update", options.auto_update == "on")
             print(f"Bypass marcado por padrão: {'sim' if store.preference('bypass_default') else 'não'}")
+            print(f"Atualização automática: {'sim' if store.preference('auto_update') else 'não'}")
+        elif options.action == "update":
+            try:
+                if options.check:
+                    meta = updater.latest()
+                    print(f"Instalada: {VERSION} · publicada no npm: {meta['version']}"
+                          + (" (há versão nova)" if updater.newer(meta) else " (em dia)"))
+                    return 0
+                updater.update(ROOT, log=print)
+            except updater.UpdateError as error:
+                print(f"Atualização falhou: {error}")
+                return 1
         elif options.action == "launch":
             project = store.find(options.project)
             gateway = Gateway.for_project(store, project, options.connection)

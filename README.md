@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.4, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.5, Windows 10/11.
 
 ## Requisitos
 
@@ -24,8 +24,19 @@ npx @allansantos-dev/agent-launcher@latest install
 
 O instalador copia o app para `%LOCALAPPDATA%\Programs\AgentLauncher`, cria o ambiente com PySide6, instala o que
 faltar (Windows Terminal, Claude Code, Codex) e coloca o atalho **Agent Launcher** no Menu Iniciar e na Área de
-Trabalho. O atalho abre a interface direto, sem janela de console. Rodar de novo com `@latest` atualiza (com backup e
-rollback se algo falhar). Opções úteis: `--no-clis`, `--no-terminal`, `--terminal-zip CAMINHO`, `--no-shortcuts`.
+Trabalho. O atalho abre a interface direto, sem janela de console. Opções úteis: `--no-clis`, `--no-terminal`,
+`--terminal-zip CAMINHO`, `--no-shortcuts`.
+
+### Atualização automática
+
+A partir da 1.0.5, a interface confere o npm a cada abertura e, havendo versão nova, se atualiza sozinha em segundo
+plano. O pacote só é aceito se vier do próprio registro e bater com o sha512 publicado nele. A troca é feita pelo
+instalador da versão nova, com backup e rollback se algo falhar. As sessões abertas continuam; uma faixa avisa e
+oferece **Reiniciar agora** para usar a versão nova. Sem rede, nada muda: o resultado da última verificação aparece
+em Diagnóstico e em `~/.agent-launcher/update.log`. Para desligar, use **Atualizar automaticamente** no menu de
+opções, `launcher preferences --auto-update off` ou `AGENT_LAUNCHER_NO_AUTO_UPDATE=1`. Para atualizar na hora:
+`launcher update` (`--check` só consulta). Quem está na 1.0.4 ou anterior atualiza uma última vez à mão, rodando de
+novo o comando de instalação acima.
 
 Desinstalar: `npx @allansantos-dev/agent-launcher@latest install --uninstall`. Remove o app e os atalhos; seus dados
 ficam em `~/.agent-launcher`.
@@ -196,6 +207,7 @@ launcher projects import "C:\caminho\config.json"   # só nomes e caminhos
 launcher models --connection OpenRouter --cli claude --search sonnet --refresh
 launcher launch --project "Meu app" --connection OpenRouter --cli codex --model "openai/gpt-6" --dry-run
 launcher launch --project "Meu app" --resume
+launcher update                # atualiza agora pelo npm (--check só consulta)
 ```
 
 `--dry-run` mostra o plano (comando, overrides, contexto, avisos) com a chave mascarada, sem rede e sem salvar nada.

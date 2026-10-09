@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 
 import clis
 import terminal
+import updater
 from catalog import base_model, token_label
 from connections_ui import ConnectionsDialog
 from core import ROOT, Gateway, LauncherError, Store
@@ -121,6 +122,22 @@ class RefreshSignals(QObject):
     completed = Signal(object, str)
 
 
+class UpdateTask(QRunnable):
+    """Confere o npm e, havendo versão nova, instala por cima (fora da thread da interface)."""
+
+    def __init__(self, root: Path):
+        super().__init__()
+        self.root = root
+        self.signals = RefreshSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            self.signals.completed.emit(updater.update(self.root), "")
+        except Exception as error:  # rede, integridade ou instalador: volta para a tela/diagnóstico
+            self.signals.completed.emit(error, "")
+
+
 class RefreshTask(QRunnable):
     def __init__(self, home: Path, connection: str, force: bool):
         super().__init__()
@@ -155,6 +172,7 @@ class LauncherWindow(QMainWindow):
         self.refreshing = False
         self.sessions = []
         self.terminal_warned = False
+        self.update_status = "não verificada nesta execução"
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(str(ROOT / "assets" / "launcher.ico")))
         available = QApplication.primaryScreen().availableGeometry()
@@ -172,6 +190,8 @@ class LauncherWindow(QMainWindow):
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.activated.connect(callback)
             self.shortcuts.append(shortcut)
+        if self.auto_refresh:
+            QTimer.singleShot(1500, self.start_auto_update)
 
     def _build(self):
         root = QWidget()
@@ -270,6 +290,11 @@ class LauncherWindow(QMainWindow):
         self.bypass_preference.setChecked(self.store.preference("bypass_default"))
         self.bypass_preference.toggled.connect(self.set_bypass_default)
         menu.addAction(self.bypass_preference)
+        self.update_preference = QAction("Atualizar automaticamente", self)
+        self.update_preference.setCheckable(True)
+        self.update_preference.setChecked(self.store.preference("auto_update"))
+        self.update_preference.toggled.connect(self.set_auto_update)
+        menu.addAction(self.update_preference)
         menu.addAction("Abrir instruções", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(ROOT / "README.md"))))
         self.options.setMenu(menu)
         top.addWidget(self.options)
@@ -354,6 +379,12 @@ class LauncherWindow(QMainWindow):
         self.notice.setWordWrap(True)
         self.notice.hide()
         body.addWidget(self.notice)
+        self.update_notice = label("", "notice")
+        self.update_notice.setWordWrap(True)
+        self.update_notice.setTextFormat(Qt.TextFormat.RichText)
+        self.update_notice.linkActivated.connect(lambda _link: self.restart())
+        self.update_notice.hide()
+        body.addWidget(self.update_notice)
         actions = QHBoxLayout()
         session_options = QVBoxLayout()
         session_options.setSpacing(4)
@@ -436,6 +467,54 @@ class LauncherWindow(QMainWindow):
     @property
     def bypass_default(self) -> bool:
         return self.store.preference("bypass_default")
+
+    def set_auto_update(self, checked):
+        try:
+            fresh = Store(self.store.home)
+            fresh.set_preference("auto_update", checked)
+            self.store = fresh
+        except (LauncherError, OSError, ValueError) as error:
+            self.show_error(f"Não foi possível salvar a preferência: {error}")
+
+    def start_auto_update(self):
+        if not self.store.preference("auto_update"):
+            self.update_status = "desligada nas opções"
+        elif updater.disabled_by_env():
+            self.update_status = f"desligada por {updater.DISABLE_ENV}"
+        elif not updater.installed(ROOT):
+            self.update_status = "não se aplica (cópia de desenvolvimento, sem manifesto do instalador)"
+        else:
+            self.update_status = "verificando…"
+            self.update_task = UpdateTask(ROOT)
+            self.update_task.signals.completed.connect(self.finish_auto_update)
+            QThreadPool.globalInstance().start(self.update_task)
+
+    @Slot(object, str)
+    def finish_auto_update(self, result, _unused=""):
+        if isinstance(result, updater.CheckError):
+            # Sem rede/proxy: não vira faixa a cada abertura; fica no Diagnóstico e no update.log.
+            self.update_status = f"falhou: {result}"
+        elif isinstance(result, Exception):
+            self.update_status = f"falhou: {result}"
+            self.update_notice.setText(f"Atualização automática falhou: {result}".replace("<", "&lt;"))
+            self.update_notice.show()
+        elif result:
+            self.update_status = f"atualizado para {result}; reabra para usar"
+            self.update_notice.setText(f"{APP_NAME} atualizado para {result}. As sessões abertas continuam; "
+                                       f'<a href="restart">Reiniciar agora</a> para usar a versão nova.')
+            self.update_notice.show()
+        else:
+            self.update_status = f"em dia ({VERSION})"
+        updater.record(self.update_status)
+
+    def restart(self):
+        """Reabre o launcher pela versão instalada e fecha esta janela (as sessões são processos à parte)."""
+        import subprocess
+        pythonw = ROOT / ".venv" / "Scripts" / "pythonw.exe"
+        executable = pythonw if pythonw.is_file() else Path(sys.executable)
+        subprocess.Popen([str(executable), str(ROOT / "launcher.pyw")], cwd=ROOT, close_fds=True,
+                         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        QApplication.instance().quit()
 
     def set_bypass_default(self, checked):
         try:
@@ -793,7 +872,8 @@ class LauncherWindow(QMainWindow):
                  "Conexão: " + (f"{self.gateway.name} ({self.gateway.module.LABEL})" if self.gateway else "nenhuma"),
                  "Endereço: " + (self.gateway.url if self.gateway else "-"),
                  "Estado: " + ("respondeu" if self.online else "não confirmado"),
-                 "Windows Terminal: " + (terminal.find(ROOT) or "ausente (sessões em consoles separados)"), ""]
+                 "Windows Terminal: " + (terminal.find(ROOT) or "ausente (sessões em consoles separados)"),
+                 "Atualização automática: " + self.update_status, ""]
         for cli, name in CLI_NAMES.items():
             try:
                 executable = resolve_cli(cli)
