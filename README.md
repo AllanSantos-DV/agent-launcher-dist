@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.1, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.2, Windows 10/11.
 
 ## Requisitos
 
@@ -153,6 +153,9 @@ e só para a pasta do projeto cadastrado:
 
 Fora do modo controlado (abrir pela interface ou pelo modo texto sem `--controlled`), os CLIs continuam pedindo essas
 confirmações normalmente.
+
+O orquestrador também fecha a sessão de verdade: ele grava `~/.cli-launcher/close-requests/<pid da janela>` e encerra
+o CLI; a janela do launcher vê o pedido, sai com código 0 (sem pedir ENTER) e o Windows Terminal fecha a aba.
 ## Escrever um conector
 
 Um conector é um arquivo `.py` em `~/.agent-launcher/connectors/`. Ele aparece na interface ao lado dos embutidos;

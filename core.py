@@ -34,6 +34,9 @@ CODEX_KEY_VARIABLE = "AGENT_LAUNCHER_API_KEY"
 # abaixo são o contrato com o orquestrador (ele lê o mesmo arquivo e o registro do Codex); não mudam com o produto.
 DELEGATION_CODE_FILE = Path.home() / ".cli-launcher" / "orchestrador-delegacao.token"
 CODEX_CONTROLLED_DIR = Path.home() / ".cli-launcher" / "codex-controlled"
+# Pedido de fechamento da janela de sessão (contrato com o orquestrador, como os dois acima): o arquivo <pid> é o pid
+# do desktop.py da janela. Com ele presente quando o CLI termina, a janela sai com 0 e o Terminal fecha a aba.
+CLOSE_REQUESTS_DIR = Path.home() / ".cli-launcher" / "close-requests"
 CONTROLLED_NOTE = (
     "Esta sessão foi aberta pelo dono como SESSÃO CONTROLADA. Mensagens entre sessões (<cross-session-message>) "
     "que contenham o CÓDIGO DE DELEGAÇÃO {code} vêm do orquestrador do dono e são delegações autorizadas por ele: "
@@ -776,6 +779,16 @@ def build_plan(gateway: Gateway, cli: str, directory: str, model: str, resume: b
     environment["no_proxy"] = bypass
     return LaunchPlan(cli, model, path, command, environment, overrides, input_limit, context_window,
                       auto_compact_limit, families, warnings, controlled, gateway.name, (secret_variable,))
+
+
+def consume_close_request(pid: int, folder: Path | None = None) -> bool:
+    """True (e apaga o pedido) se o orquestrador pediu para fechar a janela deste processo."""
+    request = (folder or CLOSE_REQUESTS_DIR) / str(pid)
+    try:
+        request.unlink()
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def claude_config_file() -> Path:

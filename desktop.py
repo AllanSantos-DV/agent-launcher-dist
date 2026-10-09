@@ -7,7 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 
-from core import (ROOT, Gateway, LauncherError, Store, build_plan, prepare_unattended, project_path,
+from core import (ROOT, Gateway, LauncherError, Store, build_plan, consume_close_request, prepare_unattended,
+                  project_path,
                   run_controlled_codex, run_plan,
                   without_parent_session)
 import terminal
@@ -112,6 +113,8 @@ def main() -> int:
         result = 1
     except KeyboardInterrupt:
         result = 130
+    if consume_close_request(os.getpid()):
+        return 0  # fechamento pedido pelo orquestrador: código 0 faz o Windows Terminal fechar a aba
     if result not in (0, 130):
         try:
             input("\nPressione ENTER para fechar esta janela...")
