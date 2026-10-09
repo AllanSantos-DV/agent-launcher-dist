@@ -18,6 +18,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -89,6 +90,10 @@ def download(meta: dict, folder: Path, timeout: float = 60) -> Path:
     """Baixa, confere o sha512 e extrai; devolve a pasta do pacote (com install.py da versão anunciada)."""
     try:
         data = _get(meta["tarball"], timeout, DOWNLOAD_LIMIT)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:  # logo após publicar, /latest já anuncia a versão e a CDN ainda não tem o pacote
+            raise CheckError(f"Pacote {meta['version']} ainda propagando no npm; tenta de novo na próxima abertura.") from error
+        raise UpdateError(f"Não foi possível baixar {meta['tarball']}: {error}") from error
     except OSError as error:
         raise UpdateError(f"Não foi possível baixar {meta['tarball']}: {error}") from error
     expected = meta["integrity"].removeprefix("sha512-")
