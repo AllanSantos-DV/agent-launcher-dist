@@ -4,7 +4,7 @@ import re
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
@@ -122,6 +122,24 @@ class RefreshSignals(QObject):
     completed = Signal(object, str)
 
 
+class TerminalTask(QRunnable):
+    """Instala o Windows Terminal sem admin (ZIP portátil oficial, depois winget) fora da thread da interface."""
+
+    def __init__(self, root: Path):
+        super().__init__()
+        self.root = root
+        self.signals = RefreshSignals()
+
+    @Slot()
+    def run(self):
+        lines = []
+        try:
+            found = terminal.ensure(self.root, log=lines.append)
+        except Exception as error:  # falha inesperada também precisa voltar para a tela
+            found, lines = None, lines + [str(error)]
+        self.signals.completed.emit(found, "\n".join(lines))
+
+
 class UpdateTask(QRunnable):
     """Confere o npm e, havendo versão nova, instala por cima (fora da thread da interface)."""
 
@@ -171,7 +189,7 @@ class LauncherWindow(QMainWindow):
         self.online = False
         self.refreshing = False
         self.sessions = []
-        self.terminal_warned = False
+        self.terminal_installing = False
         self.update_status = "não verificada nesta execução"
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(str(ROOT / "assets" / "launcher.ico")))
@@ -192,6 +210,7 @@ class LauncherWindow(QMainWindow):
             self.shortcuts.append(shortcut)
         if self.auto_refresh:
             QTimer.singleShot(1500, self.start_auto_update)
+            QTimer.singleShot(800, self.ensure_terminal)
 
     def _build(self):
         root = QWidget()
@@ -378,7 +397,15 @@ class LauncherWindow(QMainWindow):
         self.notice = label("", "notice")
         self.notice.setWordWrap(True)
         self.notice.hide()
-        body.addWidget(self.notice)
+        notice_row = QHBoxLayout()
+        notice_row.addWidget(self.notice, 1)
+        self.copy_error = button("Copiar erro", "copy", "ghost")
+        self.copy_error.setToolTip("Copia o aviso com o contexto (versões, Windows, Terminal) para colar num chat de IA")
+        self.copy_error.clicked.connect(self.copy_notice)
+        self.copy_error.hide()
+        notice_row.addWidget(self.copy_error, 0, Qt.AlignmentFlag.AlignTop)
+        body.addLayout(notice_row)
+        self.notice.installEventFilter(self)  # o botão aparece e some junto com a faixa
         self.update_notice = label("", "notice")
         self.update_notice.setWordWrap(True)
         self.update_notice.setTextFormat(Qt.TextFormat.RichText)
@@ -746,14 +773,8 @@ class LauncherWindow(QMainWindow):
             self.show_error(f"A janela abriu, mas não foi possível salvar a preferência: {error}")
         mode = " · bypass ativo" if bypass_permissions else ""
         self.footer.setText(f"Janela aberta: {title}{mode}. A janela verifica a conexão antes de iniciar.")
-        if not self.terminal_warned and terminal.find(ROOT) is None:
-            # A instalação tenta o Terminal (ZIP portátil, winget); se tudo foi bloqueado, avisa aqui também, uma vez.
-            self.terminal_warned = True
-            message = ("Windows Terminal indisponível: a sessão abriu em um console separado. "
-                       "Para instalar depois: launcher.py terminal --install (ou --zip com o ZIP entregue pela TI).")
-            self.notice.setText(message)
-            self.notice.setToolTip(message)
-            self.notice.show()
+        if terminal.find(ROOT) is None:
+            self.ensure_terminal(opened_in_console=True)
 
     def install_cli(self):
         if self.installing_cli:
@@ -780,6 +801,64 @@ class LauncherWindow(QMainWindow):
         self.sessions = [(process, title) for process, title in self.sessions if process.poll() is None]
         if finished:
             self.footer.setText(f"Sessão encerrada: {finished[-1][1]} · {len(self.sessions)} janela(s) ainda abertas")
+
+    def eventFilter(self, watched, event):
+        # *ToParent: chegam ao mostrar/esconder a faixa mesmo com a janela ainda invisível (Show/Hide não).
+        if watched is self.notice and event.type() in (QEvent.Type.ShowToParent, QEvent.Type.HideToParent):
+            self.copy_error.setVisible(event.type() == QEvent.Type.ShowToParent)
+        return super().eventFilter(watched, event)
+
+    def problem_report(self, message: str) -> str:
+        """Aviso + contexto para diagnosticar fora daqui (sem chaves: só versões, caminhos e estado do Terminal)."""
+        import os
+        import platform
+        path = os.environ.get("PATH", "")
+        alias = terminal.store_alias()
+        return "\n".join([
+            f"{APP_NAME} {VERSION} — problema relatado pela interface", "", message.strip(), "",
+            f"Instalação: {ROOT}",
+            f"Python: {sys.version.split()[0]} ({sys.executable})",
+            f"Windows: {platform.platform()}",
+            f"Windows Terminal: find={terminal.find(ROOT)} | alias da Store existe={os.path.lexists(alias)} ({alias})",
+            f"PATH do processo: {len(path)} caracteres, contém WindowsApps={'WindowsApps' in path}",
+            f"Atualização automática: {self.update_status}",
+        ])
+
+    def copy_notice(self):
+        QApplication.clipboard().setText(self.problem_report(self.notice.toolTip() or self.notice.text()))
+        self.footer.setText("Erro copiado com o contexto: cole num chat de IA ou mande para o suporte.")
+
+    def ensure_terminal(self, opened_in_console: bool = False):
+        """Sem Terminal: instala sozinho em segundo plano; só avisa de erro se todas as formas falharem."""
+        if terminal.find(ROOT):
+            return
+        record_terminal_problem(self.problem_report("Windows Terminal não encontrado pela interface."))
+        if opened_in_console:
+            self.show_info("Esta sessão abriu em um console separado porque o Windows Terminal não foi encontrado. "
+                           "Instalando o Terminal agora, sem admin; as próximas sessões abrem nele.")
+        if self.terminal_installing:
+            return
+        self.terminal_installing = True
+        self.terminal_task = TerminalTask(ROOT)
+        self.terminal_task.signals.completed.connect(self.finish_terminal)
+        QThreadPool.globalInstance().start(self.terminal_task)
+
+    @Slot(object, str)
+    def finish_terminal(self, found, log):
+        self.terminal_installing = False
+        if found:
+            self.show_info(f"Windows Terminal pronto ({found}). As próximas sessões abrem nele.")
+            return
+        details = "\n".join(line.strip() for line in log.splitlines() if "[falhou]" in line or "ambiente:" in line)
+        self.show_error("Windows Terminal indisponível: nenhuma forma de instalação funcionou nesta máquina, então as "
+                        "sessões abrem em consoles separados. Use \"Copiar erro\" para ver o motivo."
+                        + (f"\n{details}" if details else ""))
+        record_terminal_problem(self.problem_report(log or "Instalação do Windows Terminal falhou sem detalhes."))
+
+    def show_info(self, message):
+        self.notice.setText(message)
+        self.notice.setToolTip(message)
+        self.notice.show()
 
     def show_error(self, message):
         self.notice.setText(message)
@@ -883,6 +962,19 @@ class LauncherWindow(QMainWindow):
         lines.extend(["", self.catalog.status if self.catalog else "Sem catálogo.", "",
                       "As chaves das conexões ficam cifradas (DPAPI) e nunca aparecem aqui."])
         QMessageBox.information(self, "Diagnóstico", "\n".join(lines))
+
+
+def record_terminal_problem(report: str) -> None:
+    """Guarda em ~/.agent-launcher/terminal.log quando e por que o Terminal não foi achado (para diagnosticar depois)."""
+    import time
+    from version import data_home
+    try:
+        destination = data_home() / "terminal.log"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("a", encoding="utf-8") as stream:
+            stream.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}\n{report}\n")
+    except OSError:
+        pass
 
 
 def create_application(arguments=None):

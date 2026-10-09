@@ -781,14 +781,22 @@ def build_plan(gateway: Gateway, cli: str, directory: str, model: str, resume: b
                       auto_compact_limit, families, warnings, controlled, gateway.name, (secret_variable,))
 
 
+CLOSE_REQUEST_MAX_AGE_S = 120
+
+
 def consume_close_request(pid: int, folder: Path | None = None) -> bool:
-    """True (e apaga o pedido) se o orquestrador pediu para fechar a janela deste processo."""
+    """True (e apaga o pedido) se o orquestrador pediu agora para fechar a janela deste processo.
+
+    Pedido antigo é apagado e ignorado: sobrou de uma janela que morreu sem consumi-lo, e o Windows reaproveita PIDs,
+    então valeria para uma janela nova que nada tem a ver com ele.
+    """
     request = (folder or CLOSE_REQUESTS_DIR) / str(pid)
     try:
+        age = time.time() - request.stat().st_mtime
         request.unlink()
-        return True
     except FileNotFoundError:
         return False
+    return age <= CLOSE_REQUEST_MAX_AGE_S
 
 
 def claude_config_file() -> Path:

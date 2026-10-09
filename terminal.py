@@ -58,11 +58,24 @@ def portable_dir(root: Path) -> Path:
     return Path(root) / "terminal"
 
 
+def store_alias() -> Path:
+    """Alias de execução que o pacote da Store/MSIX cria para wt.exe (fica na pasta do usuário, fora de Program Files)."""
+    local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    return local / "Microsoft" / "WindowsApps" / "wt.exe"
+
+
 def find(root: Path | None = None) -> str | None:
-    """wt.exe a usar: o do Windows Terminal instalado; senão a cópia portátil desta instalação."""
+    """wt.exe a usar: o do Windows Terminal instalado; senão a cópia portátil desta instalação.
+
+    Não depende só do PATH: um processo aberto por outro com PATH reduzido (serviço, agendador, outro app) não vê
+    a pasta WindowsApps e concluía que o Terminal faltava, abrindo as sessões em consoles separados.
+    """
     installed = shutil.which("wt.exe")
     if installed:
         return installed
+    alias = store_alias()
+    if os.path.lexists(alias):  # o alias é um reparse point; lexists não depende de segui-lo
+        return str(alias)
     if root is not None:
         portable = portable_dir(root) / "wt.exe"
         if portable.is_file():

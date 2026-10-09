@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.6, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.7, Windows 10/11.
 
 ## Requisitos
 
@@ -59,9 +59,13 @@ Se a máquina não tem o Terminal, o instalador resolve **sem admin**, nesta ord
    publicado na release e o `wt.exe` tiver assinatura válida da Microsoft. Exige Windows 10 2004 ou superior.
 3. Tenta o winget, a menos que a política da empresa bloqueie winget ou pacotes MSIX por usuário.
 
-Vale igual para a instalação pelo npm. Só quando as três são bloqueadas o launcher segue sem o Terminal, e avisa:
-no fim da instalação, na interface (na primeira sessão aberta e no Diagnóstico) e no modo texto. As sessões
-abrem então em consoles separados (Ctrl+J continua quebrando linha). Em empresa sem
+Vale igual para a instalação pelo npm. A interface também confere o Terminal ao abrir. Ela não depende só do PATH:
+procura o alias da Store em `%LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe`, porque um processo aberto por outro com
+PATH reduzido não enxerga essa pasta. Se ele faltar, a interface instala sozinha em segundo plano, pela mesma ordem.
+Só quando as três formas são bloqueadas o launcher segue sem o Terminal e avisa, com o botão **Copiar erro**, que
+copia o aviso e o contexto (versões, Windows, PATH, Terminal) para colar num chat de IA. Cada ocorrência fica em
+`~/.agent-launcher/terminal.log`. As sessões abrem então em consoles separados (Ctrl+J continua quebrando linha).
+Em empresa sem
 acesso ao GitHub, a TI entrega o ZIP: `npx @allansantos-dev/agent-launcher@latest install --terminal-zip C:\caminho\Microsoft.WindowsTerminal_x64.zip`.
 `launcher terminal` mostra o que foi encontrado e os bloqueios corporativos detectados (máquina em domínio
 ou Entra ID, Store removida ou restrita, MSIX por usuário bloqueado, winget desativado, AppLocker, SRP);
