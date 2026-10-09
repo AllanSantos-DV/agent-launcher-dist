@@ -1,0 +1,2 @@
+# O repositório dist leva o workflow de publicação; ele não faz parte do pacote npm.
+.github/
