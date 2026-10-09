@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.3, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.4, Windows 10/11.
 
 ## Requisitos
 
@@ -48,7 +48,9 @@ Se a máquina não tem o Terminal, o instalador resolve **sem admin**, nesta ord
    publicado na release e o `wt.exe` tiver assinatura válida da Microsoft. Exige Windows 10 2004 ou superior.
 3. Tenta o winget, a menos que a política da empresa bloqueie winget ou pacotes MSIX por usuário.
 
-Sem nenhuma das opções, as sessões abrem em consoles separados (Ctrl+J continua quebrando linha). Em empresa sem
+Vale igual para a instalação pelo npm. Só quando as três são bloqueadas o launcher segue sem o Terminal, e avisa:
+no fim da instalação, na interface (na primeira sessão aberta e no Diagnóstico) e no modo texto. As sessões
+abrem então em consoles separados (Ctrl+J continua quebrando linha). Em empresa sem
 acesso ao GitHub, a TI entrega o ZIP: `npx @allansantos-dev/agent-launcher@latest install --terminal-zip C:\caminho\Microsoft.WindowsTerminal_x64.zip`.
 `launcher terminal` mostra o que foi encontrado e os bloqueios corporativos detectados (máquina em domínio
 ou Entra ID, Store removida ou restrita, MSIX por usuário bloqueado, winget desativado, AppLocker, SRP);

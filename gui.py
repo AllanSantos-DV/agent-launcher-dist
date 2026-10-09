@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 import clis
+import terminal
 from catalog import base_model, token_label
 from connections_ui import ConnectionsDialog
 from core import ROOT, Gateway, LauncherError, Store
@@ -153,6 +154,7 @@ class LauncherWindow(QMainWindow):
         self.online = False
         self.refreshing = False
         self.sessions = []
+        self.terminal_warned = False
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(str(ROOT / "assets" / "launcher.ico")))
         available = QApplication.primaryScreen().availableGeometry()
@@ -665,6 +667,14 @@ class LauncherWindow(QMainWindow):
             self.show_error(f"A janela abriu, mas não foi possível salvar a preferência: {error}")
         mode = " · bypass ativo" if bypass_permissions else ""
         self.footer.setText(f"Janela aberta: {title}{mode}. A janela verifica a conexão antes de iniciar.")
+        if not self.terminal_warned and terminal.find(ROOT) is None:
+            # A instalação tenta o Terminal (ZIP portátil, winget); se tudo foi bloqueado, avisa aqui também, uma vez.
+            self.terminal_warned = True
+            message = ("Windows Terminal indisponível: a sessão abriu em um console separado. "
+                       "Para instalar depois: launcher.py terminal --install (ou --zip com o ZIP entregue pela TI).")
+            self.notice.setText(message)
+            self.notice.setToolTip(message)
+            self.notice.show()
 
     def install_cli(self):
         if self.installing_cli:
@@ -782,7 +792,8 @@ class LauncherWindow(QMainWindow):
         lines = [f"{APP_NAME} {VERSION}", f"Dados: {self.store.home}", "",
                  "Conexão: " + (f"{self.gateway.name} ({self.gateway.module.LABEL})" if self.gateway else "nenhuma"),
                  "Endereço: " + (self.gateway.url if self.gateway else "-"),
-                 "Estado: " + ("respondeu" if self.online else "não confirmado"), ""]
+                 "Estado: " + ("respondeu" if self.online else "não confirmado"),
+                 "Windows Terminal: " + (terminal.find(ROOT) or "ausente (sessões em consoles separados)"), ""]
         for cli, name in CLI_NAMES.items():
             try:
                 executable = resolve_cli(cli)
