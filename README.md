@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.11, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.12, Windows 10/11.
 
 ## Requisitos
 
@@ -170,8 +170,11 @@ e só para a pasta do projeto cadastrado:
 - **Claude:** antes de abrir, grava `hasTrustDialogAccepted` daquela pasta no `~/.claude.json` (troca atômica, refeita
   se outra sessão gravou no meio).
 - **Codex:** `-c check_for_update_on_startup=false`, confiança da pasta só neste processo
-  (`-c projects={"<pasta>"={trust_level="trusted"}}`, nada gravado em disco) e `--dangerously-bypass-hook-trust`, que
-  roda os hooks habilitados sem a revisão de hooks novos ou alterados.
+  (`-c projects={"<pasta>"={trust_level="trusted"}}`, nada gravado em disco) e, antes de abrir (conversa nova ou
+  retomada), a confiança dos hooks novos ou alterados daquela pasta gravada pelo app-server do Codex (o mesmo "Trust
+  all" da revisão de hooks, em `hooks.state`). Os hooks do projeto ficam confiados e ativos de verdade, sem
+  `--dangerously-bypass-hook-trust`. Se o Codex recusar a confiança, ou algum hook continuar sem ela, a sessão não abre
+  e o erro aparece na janela.
 
 Fora do modo controlado (abrir pela interface ou pelo modo texto sem `--controlled`), os CLIs continuam pedindo essas
 confirmações normalmente.

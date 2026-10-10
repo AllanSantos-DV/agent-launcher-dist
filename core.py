@@ -780,8 +780,8 @@ def build_plan(gateway: Gateway, cli: str, directory: str, model: str, resume: b
         if controlled:
             # Sessão aberta pelo orquestrador (que já validou o projeto): nada pode esperar clique. Confiança da
             # pasta só para esta pasta cadastrada e só neste processo (tabela inline TOML; nada é gravado em disco).
-            command += ["-c", f"projects={{{json.dumps(str(path), ensure_ascii=True)}={{trust_level=\"trusted\"}}}}",
-                        "--dangerously-bypass-hook-trust"]
+            # Os hooks não usam bypass: approve_codex_hooks grava a confiança deles antes de abrir.
+            command += ["-c", f"projects={{{json.dumps(str(path), ensure_ascii=True)}={{trust_level=\"trusted\"}}}}"]
     environment.update(overrides)
     local_hosts = ["127.0.0.1", "localhost"]
     host = urllib.parse.urlparse(gateway.targets[cli]).hostname or ""
@@ -909,14 +909,15 @@ def prepare_unattended(plan: LaunchPlan) -> None:
 
 
 def approve_codex_hooks(directory: Path, environment: dict | None = None, command: list[str] | None = None,
-                        timeout: float = 60) -> list[str]:
+                        timeout: float = 60, options: list[str] = ()) -> list[str]:
     """Sessão controlada do Codex: aprova, pelo app-server do próprio Codex, os hooks novos ou alterados daquela pasta
-    (o mesmo que o "Trust all" da TUI: hooks/list e config/batchWrite em hooks.state com trusted_hash=currentHash).
-    Necessário porque --dangerously-bypass-hook-trust não vale na retomada de uma sessão persistente. Devolve as
-    chaves aprovadas; levanta LauncherError se o app-server recusar."""
+    (o mesmo que o "Trust all" da TUI: hooks/list e config/batchWrite em hooks.state com trusted_hash=currentHash),
+    em conversa nova e na retomada. options são os -c do plano: sem a confiança da pasta (projects=...) o Codex nem
+    lista os hooks do projeto. Devolve as chaves aprovadas; levanta LauncherError se o app-server recusar ou se,
+    depois de gravar, algum hook da pasta continuar sem confiança."""
     import queue
     import threading
-    process = subprocess.Popen(command or resolve_cli("codex") + ["app-server"], cwd=directory, env=environment,
+    process = subprocess.Popen((command or resolve_cli("codex")) + ["app-server", *options], cwd=directory, env=environment,
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                                encoding="utf-8", errors="replace",
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -942,18 +943,26 @@ def approve_codex_hooks(directory: Path, environment: dict | None = None, comman
                     raise LauncherError(f"O app-server do Codex recusou {method}: {message['error']}")
                 return message.get("result") or {}
 
+    def untrusted(identifier: int) -> dict:
+        listing = call(identifier, "hooks/list", {"cwds": [str(directory)]})
+        return {hook.get("key"): hook.get("currentHash")
+                for entry in listing.get("data", []) if path_key(entry.get("cwd", "")) == path_key(str(directory))
+                for hook in entry.get("hooks", []) if hook.get("trustStatus") in ("untrusted", "modified")}
+
     try:
         call(1, "initialize", {"clientInfo": {"name": "agent-launcher", "version": "1"}})
         send({"method": "initialized"})
-        listing = call(2, "hooks/list", {"cwds": [str(directory)]})
-        pending = {hook["key"]: hook["currentHash"]
-                   for entry in listing.get("data", []) if path_key(entry.get("cwd", "")) == path_key(str(directory))
-                   for hook in entry.get("hooks", [])
-                   if hook.get("trustStatus") in ("untrusted", "modified") and hook.get("key") and hook.get("currentHash")}
-        if pending:
-            call(3, "config/batchWrite", {"edits": [{"keyPath": "hooks.state", "mergeStrategy": "upsert",
-                                                     "value": {key: {"trusted_hash": digest} for key, digest in pending.items()}}],
-                                          "filePath": None, "expectedVersion": None, "reloadUserConfig": True})
+        pending = untrusted(2)
+        if not pending:
+            return []
+        if not all(pending) or not all(pending.values()):
+            raise LauncherError(f"O app-server do Codex listou hooks sem chave ou hash; não dá para confiá-los: {pending}")
+        call(3, "config/batchWrite", {"edits": [{"keyPath": "hooks.state", "mergeStrategy": "upsert",
+                                                 "value": {key: {"trusted_hash": digest} for key, digest in pending.items()}}],
+                                      "filePath": None, "expectedVersion": None, "reloadUserConfig": True})
+        left = untrusted(4)
+        if left:
+            raise LauncherError(f"O Codex continua sem confiar nestes hooks depois da aprovação: {', '.join(sorted(left))}")
         return sorted(pending)
     finally:
         stop_tree(process)
@@ -1057,9 +1066,8 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
-def controlled_codex_commands(plan: LaunchPlan, url: str, token_sha256: str = "<sha256>") -> tuple[list[str], list[str]]:
-    """App-server autenticado (capability token) com o provider do plano (os -c) + TUI conectada por --remote."""
-    base = resolve_cli("codex")
+def codex_options(plan: LaunchPlan) -> list[str]:
+    """Os pares -c do plano (provider, permissões, confiança da pasta)."""
     options, index = [], 0
     while index < len(plan.command):
         if plan.command[index] == "-c":
@@ -1067,17 +1075,21 @@ def controlled_codex_commands(plan: LaunchPlan, url: str, token_sha256: str = "<
             index += 2
         else:
             index += 1
+    return options
+
+
+def controlled_codex_commands(plan: LaunchPlan, url: str, token_sha256: str = "<sha256>") -> tuple[list[str], list[str]]:
+    """App-server autenticado (capability token) com o provider do plano (os -c) + TUI conectada por --remote."""
+    base = resolve_cli("codex")
+    options = codex_options(plan)
     server = base + ["app-server", "--listen", url, "--ws-auth", "capability-token", "--ws-token-sha256", token_sha256] + options
-    # A TUI faz o aviso de atualização e a revisão de hooks; com --remote ela repassa bypass_hook_trust ao app-server
-    # em cada thread/start e thread/resume (o app-server não aceita a flag na linha de comando).
+    # A TUI faz o aviso de atualização; a confiança dos hooks já foi gravada por approve_codex_hooks.
     unattended = [part for pair in zip(options[::2], options[1::2]) if pair[1].startswith(
         ("check_for_update_on_startup=", "projects=")) for part in pair]
     resuming = "resume" in plan.command
     tui = base + ["--remote", url, "--remote-auth-token-env", "ORQ_CODEX_TOKEN", "--model", plan.model, *unattended]
     if not resuming:
         tui.append("--dangerously-bypass-approvals-and-sandbox")
-    if "--dangerously-bypass-hook-trust" in plan.command:
-        tui.append("--dangerously-bypass-hook-trust")
     if resuming:
         tui += ["resume", "--last"]
     return server, tui
@@ -1086,11 +1098,11 @@ def controlled_codex_commands(plan: LaunchPlan, url: str, token_sha256: str = "<
 def run_controlled_codex(plan: LaunchPlan, project: str) -> int:
     """Codex controlável: o orchestrador encontra o app-server pelo registro e manda turnos na janela visível."""
     try:
-        approved = approve_codex_hooks(plan.directory, plan.environment)
-        if approved:
-            print(f"  Hooks aprovados para a sessão controlada: {len(approved)}")
-    except (LauncherError, OSError) as error:
-        print(f"  Aviso: não foi possível aprovar os hooks ({error}); a retomada pode pedir revisão de hooks.")
+        approved = approve_codex_hooks(plan.directory, plan.environment, options=codex_options(plan))
+    except OSError as error:
+        raise LauncherError(f"Não foi possível abrir o app-server do Codex para aprovar os hooks: {error}") from error
+    if approved:
+        print(f"  Hooks aprovados para a sessão controlada: {len(approved)}")
     port = free_port()
     url = f"ws://127.0.0.1:{port}"
     token = secrets.token_urlsafe(32)
