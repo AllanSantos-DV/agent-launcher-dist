@@ -134,6 +134,7 @@ def copy_files(target, files, backup, changed, removed, previous):
         changed.append(rel)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, dest)
+        os.utime(dest)  # o npm grava todo arquivo com a mesma data fixa: sem isto o .pyc antigo continuaria valendo
     for rel in sorted(previous - set(files)):
         if not removable(target, rel):
             print(f"  ! ignorado no manifesto (fora do destino ou protegido): {rel}")
@@ -144,6 +145,15 @@ def copy_files(target, files, backup, changed, removed, previous):
             removed.append(rel)
     (target / MANIFEST).write_text(json.dumps({"installed_at": time.time(), "version": VERSION, "source": str(SOURCE),
                                                "files": files}, indent=1), encoding="utf-8")
+
+
+def clear_bytecode(target):
+    """Apaga os __pycache__ da instalação (fora .venv e terminal/). O Python reaproveita o .pyc quando data e tamanho
+    da fonte batem; com a data fixa do pacote npm, um arquivo que muda sem mudar de tamanho (ex.: VERSION 1.0.7 →
+    1.0.8) seguiria rodando o código antigo."""
+    for cache in list(Path(target).rglob("__pycache__")):
+        if not any(part in (".venv", "terminal", "terminal.old") for part in cache.relative_to(target).parts):
+            shutil.rmtree(cache, ignore_errors=True)
 
 
 def restore(target, backup, changed, removed):
@@ -160,6 +170,7 @@ def restore(target, backup, changed, removed):
         shutil.copy2(backup / MANIFEST, target / MANIFEST)
     else:
         (target / MANIFEST).unlink(missing_ok=True)
+    clear_bytecode(target)
 
 
 def run_tests(python, root):
@@ -235,6 +246,7 @@ def main():
     changed, removed = [], []
     try:
         copy_files(target, files, backup, changed, removed, previous)
+        clear_bytecode(target)
         print(f"Arquivos alterados: {len(changed)}; removidos por obsolescência: {len(removed)}")
         if not args.skip_deps:
             install_dependencies(target, python)
