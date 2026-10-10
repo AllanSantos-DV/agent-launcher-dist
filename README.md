@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.10, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.11, Windows 10/11.
 
 ## Requisitos
 
@@ -115,7 +115,10 @@ forma oculta.
 
 ## Sessões
 
-Selecione projeto, conexão, CLI e modelo; **Nova sessão** ou **Retomar última**. Com o Windows Terminal instalado, cada sessão vira
+Selecione projeto, conexão, CLI e modelo; **Nova sessão** ou **Retomar última**. **Retomar última** só fica habilitado
+quando há conversa daquele CLI na pasta: as do terminal e do app contam; as de `claude -p` e do SDK não, porque o
+`--continue` as ignora. Sem conversa anterior (inclusive numa sessão aberta pelo orquestrador), a retomada vira
+sessão nova, com um aviso na janela, em vez de parar em "No conversation found to continue". Com o Windows Terminal instalado, cada sessão vira
 uma aba da janela **agent-launcher** (laranja para Claude Code, verde para Codex), com o título
 **Projeto — Claude Code/Codex**; sem ele, cada sessão abre num console próprio. A sessão confere a conexão antes de iniciar. Fechar o launcher não encerra as
 sessões. A lista de projetos fica do mais recente para o mais antigo e se reordena a cada abertura; o botão

@@ -18,7 +18,7 @@ import terminal
 import updater
 from catalog import base_model, token_label
 from connections_ui import ConnectionsDialog
-from core import ROOT, Gateway, LauncherError, Store
+from core import ROOT, Gateway, LauncherError, Store, has_previous_conversation, project_path
 from desktop import CLI_NAMES, session_title, start_session
 from ui_theme import GREEN, MUTED, STYLE, CliButton, ElidedLabel, icon
 from version import APP_NAME, APP_USER_MODEL_ID, VERSION
@@ -708,7 +708,8 @@ class LauncherWindow(QMainWindow):
         enabled = bool(self.project and self.gateway and self.selected_model and self.online and not self.refreshing
                        and not missing)
         self.launch_button.setEnabled(enabled)
-        self.resume_button.setEnabled(enabled)
+        resumable = enabled and self.has_previous_conversation()
+        self.resume_button.setEnabled(resumable)
         self.bypass_checkbox.setEnabled(enabled)
         bypass = self.bypass_checkbox.isChecked()
         risk = ("Executa comandos sem confirmações e sem sandbox no Codex." if self.cli == "codex" else
@@ -724,8 +725,15 @@ class LauncherWindow(QMainWindow):
         self.session_hint.style().unpolish(self.session_hint)
         self.session_hint.style().polish(self.session_hint)
         reason = "Retoma a última sessão nativa deste CLI na pasta do projeto." if enabled else "Escolha projeto, conexão e modelo; a conexão precisa responder."
-        self.resume_button.setToolTip(reason)
+        self.resume_button.setToolTip(reason if resumable or not enabled else
+                                      f"Ainda não há conversa do {clis.NAMES[self.cli]} nesta pasta para retomar: use Nova sessão.")
         self.launch_button.setToolTip(session_title(self.project, self.cli) if enabled else reason)
+
+    def has_previous_conversation(self) -> bool:
+        try:
+            return has_previous_conversation(self.cli, project_path(self.project["path"]))
+        except (LauncherError, OSError, ValueError):
+            return False
 
     @Slot()
     def refresh_catalog(self, force=False):

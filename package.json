@@ -1,6 +1,6 @@
 {
   "name": "@allansantos-dev/agent-launcher",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "Opens Claude Code and Codex in your projects through any model provider: LiteLLM, 9router, OmniRoute, OpenRouter, Anthropic, OpenAI or any compatible host. Windows.",
   "license": "MIT",
   "author": "Allan Santos",

@@ -661,6 +661,11 @@ def build_plan(gateway: Gateway, cli: str, directory: str, model: str, resume: b
     if input_limit is None:
         warnings.append("Janela de entrada não confirmada; não serão aplicados aumentos de contexto a este modelo.")
     path = project_path(directory)
+    if resume and not has_previous_conversation(cli, path):
+        # Retomar sem conversa anterior falha ("No conversation found to continue") e a janela para esperando ENTER;
+        # numa sessão controlada isso parecia travamento. Abre sessão nova e diz por quê.
+        warnings.append(f"Nenhuma conversa anterior do {cli} nesta pasta: abrindo uma sessão nova em vez de retomar.")
+        resume = False
     command = resolve_cli(cli)
     environment = without_parent_session(dict(os.environ))
     for key in list(environment):
@@ -806,6 +811,44 @@ def consume_close_request(pid: int, folder: Path | None = None) -> bool:
     except FileNotFoundError:
         return False
     return age <= CLOSE_REQUEST_MAX_AGE_S
+
+
+def _resumable_claude_transcript(transcript: Path, max_lines: int = 2000) -> bool:
+    """Conversa que o --continue aceita: a do terminal ou do app. As de -p/SDK (entrypoint sdk-*) ele ignora."""
+    try:
+        with transcript.open(encoding="utf-8", errors="replace") as stream:
+            for number, line in enumerate(stream):
+                if number >= max_lines:
+                    return False
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and entry.get("type") == "user":
+                    return not str(entry.get("entrypoint") or "").startswith("sdk-")
+    except OSError:
+        return False
+    return False
+
+
+def has_previous_conversation(cli: str, directory: Path) -> bool:
+    """Existe conversa desta pasta para retomar (--continue do Claude, resume --last do Codex)?"""
+    if cli == "claude":
+        base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+        folder = base / re.sub(r"[^A-Za-z0-9]", "-", str(directory))  # a mesma codificação de pasta do Claude Code
+        return any(_resumable_claude_transcript(transcript) for transcript in folder.glob("*.jsonl"))
+    target = os.path.normcase(os.path.normpath(str(directory)))
+    base = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
+    for rollout in sorted(base.glob("*/*/*/rollout-*.jsonl"), reverse=True):
+        try:
+            with rollout.open(encoding="utf-8", errors="replace") as stream:
+                meta = json.loads(stream.readline() or "{}")
+        except (OSError, ValueError):
+            continue
+        cwd = (meta.get("payload") or {}).get("cwd") if isinstance(meta, dict) else None
+        if cwd and os.path.normcase(os.path.normpath(cwd)) == target:
+            return True
+    return False
 
 
 def claude_config_file() -> Path:
