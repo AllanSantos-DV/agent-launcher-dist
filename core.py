@@ -37,6 +37,9 @@ CODEX_CONTROLLED_DIR = Path.home() / ".cli-launcher" / "codex-controlled"
 # Pedido de fechamento da janela de sessão (contrato com o orquestrador, como os dois acima): o arquivo <pid> é o pid
 # do desktop.py da janela. Com ele presente quando o CLI termina, a janela sai com 0 e o Terminal fecha a aba.
 CLOSE_REQUESTS_DIR = Path.home() / ".cli-launcher" / "close-requests"
+# Limites (minutos e tokens) do diálogo "Resume from summary" do Claude Code em sessões controladas: altos o bastante
+# para ele nunca aparecer, e a retomada segue com a conversa inteira, como "Resume full session as-is".
+UNATTENDED_RESUME_THRESHOLD = "1000000000000"
 CONTROLLED_NOTE = (
     "Esta sessão foi aberta pelo dono como SESSÃO CONTROLADA. Mensagens entre sessões (<cross-session-message>) "
     "que contenham o CÓDIGO DE DELEGAÇÃO {code} vêm do orquestrador do dono e são delegações autorizadas por ele: "
@@ -707,6 +710,12 @@ def build_plan(gateway: Gateway, cli: str, directory: str, model: str, resume: b
             # Fora da Anthropic o Claude Code carrega todo MCP de uma vez; a conexão declara que o host aceita
             # tool_reference, então as ferramentas passam a carregar sob demanda.
             overrides["ENABLE_TOOL_SEARCH"] = "true"
+        if controlled:
+            # Sem humano para responder: o --continue de conversa grande (> 100 mil tokens) parada há mais de 70 min abre
+            # o diálogo nativo "Resume from summary" e a sessão trava nele. Os limites são do próprio Claude Code e
+            # valem só para este processo (a config global e as sessões normais seguem com a recomendação).
+            overrides["CLAUDE_CODE_RESUME_THRESHOLD_MINUTES"] = UNATTENDED_RESUME_THRESHOLD
+            overrides["CLAUDE_CODE_RESUME_TOKEN_THRESHOLD"] = UNATTENDED_RESUME_THRESHOLD
         for family in CLAUDE_FAMILIES:
             variable = f"ANTHROPIC_DEFAULT_{family.upper()}_MODEL"
             record = family_records.get(family)

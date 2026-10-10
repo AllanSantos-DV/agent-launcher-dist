@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.9, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.10, Windows 10/11.
 
 ## Requisitos
 
@@ -172,6 +172,12 @@ e só para a pasta do projeto cadastrado:
 
 Fora do modo controlado (abrir pela interface ou pelo modo texto sem `--controlled`), os CLIs continuam pedindo essas
 confirmações normalmente.
+
+Retomar (`--continue`) uma conversa grande (mais de 100 mil tokens) parada há mais de 70 minutos faz o Claude Code
+oferecer o diálogo "Resume from summary", que ninguém responde numa sessão sem humano, e a sessão trava. Nas
+sessões controladas o launcher eleva os limites desse diálogo (`CLAUDE_CODE_RESUME_THRESHOLD_MINUTES` e
+`CLAUDE_CODE_RESUME_TOKEN_THRESHOLD`) só no processo da sessão. A retomada segue com a conversa inteira, e a
+configuração global e as sessões normais continuam com a recomendação.
 
 O orquestrador também fecha a sessão de verdade: ele grava `~/.cli-launcher/close-requests/<pid da janela>` e encerra
 o CLI; a janela do launcher vê o pedido, sai com código 0 (sem pedir ENTER) e o Windows Terminal fecha a aba.
