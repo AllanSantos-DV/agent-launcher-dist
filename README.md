@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.7, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.8, Windows 10/11.
 
 ## Requisitos
 
@@ -31,8 +31,10 @@ Trabalho. O atalho abre a interface direto, sem janela de console. Opções úte
 
 A partir da 1.0.5, a interface confere o npm a cada abertura e, havendo versão nova, se atualiza sozinha em segundo
 plano. O pacote só é aceito se vier do próprio registro e bater com o sha512 publicado nele. A troca é feita pelo
-instalador da versão nova, com backup e rollback se algo falhar. As sessões abertas continuam; uma faixa avisa e
-oferece **Reiniciar agora** para usar a versão nova. Sem rede, nada muda: o resultado da última verificação aparece
+instalador da versão nova, com backup e rollback se algo falhar. Em seguida a interface se reinicia sozinha em 5 s,
+porque a janela aberta segue com o código antigo na memória. As sessões abertas continuam. Se houver uma caixa de
+diálogo aberta ou uma instalação em curso, ela espera e mostra **reinicie**. Janela que fica aberta por dias também
+confere o npm a cada 4 horas. Sem rede, nada muda: o resultado da última verificação aparece
 em Diagnóstico e em `~/.agent-launcher/update.log`. Para desligar, use **Atualizar automaticamente** no menu de
 opções, `launcher preferences --auto-update off` ou `AGENT_LAUNCHER_NO_AUTO_UPDATE=1`. Para atualizar na hora:
 `launcher update` (`--check` só consulta). Quem está na 1.0.4 ou anterior atualiza uma última vez à mão, rodando de

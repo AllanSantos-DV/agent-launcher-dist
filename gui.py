@@ -210,6 +210,10 @@ class LauncherWindow(QMainWindow):
             self.shortcuts.append(shortcut)
         if self.auto_refresh:
             QTimer.singleShot(1500, self.start_auto_update)
+            # Janela aberta por dias também se atualiza (09/10: uma janela antiga seguia com o bug já corrigido).
+            self.update_timer = QTimer(self)
+            self.update_timer.timeout.connect(self.start_auto_update)
+            self.update_timer.start(UPDATE_INTERVAL_MS)
             QTimer.singleShot(800, self.ensure_terminal)
 
     def _build(self):
@@ -504,6 +508,8 @@ class LauncherWindow(QMainWindow):
             self.show_error(f"Não foi possível salvar a preferência: {error}")
 
     def start_auto_update(self):
+        if self.update_status == "verificando…":
+            return  # o timer periódico não sobrepõe uma verificação em andamento
         if not self.store.preference("auto_update"):
             self.update_status = "desligada nas opções"
         elif updater.disabled_by_env():
@@ -526,13 +532,26 @@ class LauncherWindow(QMainWindow):
             self.update_notice.setText(f"Atualização automática falhou: {result}".replace("<", "&lt;"))
             self.update_notice.show()
         elif result:
-            self.update_status = f"atualizado para {result}; reabra para usar"
-            self.update_notice.setText(f"{APP_NAME} atualizado para {result}. As sessões abertas continuam; "
-                                       f'<a href="restart">Reiniciar agora</a> para usar a versão nova.')
+            self.update_status = f"atualizado para {result}; reiniciando a interface"
+            self.update_notice.setText(f"{APP_NAME} atualizado para {result}. Reiniciando a interface em "
+                                       f"{RESTART_DELAY_MS // 1000} s; as sessões abertas continuam. "
+                                       f'<a href="restart">Reiniciar agora</a>')
             self.update_notice.show()
+            # A janela aberta segue com o código antigo na memória: sem reiniciar, correções não chegam a ela.
+            QTimer.singleShot(RESTART_DELAY_MS, self.restart_if_idle)
         else:
             self.update_status = f"em dia ({VERSION})"
         updater.record(self.update_status)
+
+    def restart_if_idle(self):
+        """Reinicia sozinho, a menos que haja diálogo aberto ou instalação em curso (aí fica a faixa com o link)."""
+        busy = QApplication.activeModalWidget() is not None or self.installing_cli or self.terminal_installing
+        if busy:
+            self.update_status = self.update_status.replace("reiniciando a interface", "reabra para usar")
+            self.update_notice.setText(f"{APP_NAME} atualizado. Termine o que está fazendo e "
+                                       f'<a href="restart">reinicie</a> para usar a versão nova.')
+            return
+        self.restart()
 
     def restart(self):
         """Reabre o launcher pela versão instalada e fecha esta janela (as sessões são processos à parte)."""
@@ -962,6 +981,10 @@ class LauncherWindow(QMainWindow):
         lines.extend(["", self.catalog.status if self.catalog else "Sem catálogo.", "",
                       "As chaves das conexões ficam cifradas (DPAPI) e nunca aparecem aqui."])
         QMessageBox.information(self, "Diagnóstico", "\n".join(lines))
+
+
+UPDATE_INTERVAL_MS = 4 * 60 * 60 * 1000
+RESTART_DELAY_MS = 5000
 
 
 def record_terminal_problem(report: str) -> None:
