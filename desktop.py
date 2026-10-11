@@ -13,6 +13,7 @@ from core import (ROOT, Gateway, LauncherError, Store, build_plan, consume_close
                   without_parent_session)
 import focus
 import terminal
+import updater
 from version import APP_ID, APP_NAME
 
 
@@ -42,6 +43,10 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
     quem está na frente; com a preferência sessions_secondary_monitor, a janela vai para outro monitor, se houver."""
     if os.name != "nt":
         raise LauncherError("A abertura de janelas de sessão requer Windows.")
+    try:  # sessões abertas por outro programa (sem a interface) também mantêm a instalação atualizada
+        updater.check_in_background(ROOT, store.preference("auto_update"))
+    except OSError as error:
+        print(f"Aviso: verificação de atualização não iniciou ({error}).", file=sys.stderr)
     directory = project_path(project["path"])
     gateway = Gateway.for_project(store, project, connection)
     build_plan(gateway, cli, str(directory), model, resume, gateway.catalog(offline=True),

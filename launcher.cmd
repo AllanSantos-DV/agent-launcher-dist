@@ -6,10 +6,9 @@ set "PYW=%~dp0.venv\Scripts\pythonw.exe"
 if not exist "%PY%" set "PY=python"
 if not exist "%PYW%" set "PYW=pythonw"
 if "%~1"=="" goto gui
+rem Sem pause aqui: o launcher.py so espera ENTER quando o console foi aberto so para ele (duplo clique, atalho).
 "%PY%" "%~dp0launcher.py" %*
-set "launcher_exit=%errorlevel%"
-if not "%launcher_exit%"=="0" pause
-exit /b %launcher_exit%
+exit /b %errorlevel%
 
 :gui
 start "" "%PYW%" "%~dp0launcher.pyw"

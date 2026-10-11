@@ -174,3 +174,37 @@ def record(message: str) -> None:
         destination.write_text(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n", encoding="utf-8")
     except OSError:
         pass
+
+
+CHECK_INTERVAL_S = 4 * 60 * 60  # o mesmo intervalo da interface aberta
+
+
+def check_in_background(root: Path = ROOT, enabled: bool = True, stamp: Path | None = None,
+                        spawn=subprocess.Popen) -> bool:
+    """Modo texto e sessões abertas por outro programa (sem a interface) também se atualizam: no máximo a cada
+    CHECK_INTERVAL_S, dispara este módulo num processo oculto e desligado deste (não atrasa o comando nem abre janela).
+    Devolve se disparou. Só a cópia instalada; desligado pela preferência ou por AGENT_LAUNCHER_NO_AUTO_UPDATE."""
+    if not enabled or disabled_by_env() or not installed(root):
+        return False
+    stamp = stamp or data_home() / "update-check"
+    try:
+        if time.time() - stamp.stat().st_mtime < CHECK_INTERVAL_S:
+            return False
+    except FileNotFoundError:
+        pass
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    python = Path(root) / ".venv" / "Scripts" / "pythonw.exe"
+    spawn([str(python if python.is_file() else Path(sys.executable)), str(Path(root) / "updater.py"), "--background"],
+          cwd=root, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0))
+    return True
+
+
+if __name__ == "__main__" and "--background" in sys.argv:
+    try:
+        installed_version = update(ROOT)
+        record(f"Atualizado em segundo plano para {installed_version}." if installed_version
+               else f"Verificação em segundo plano: {VERSION} já é a mais recente (ou outra atualização em andamento).")
+    except UpdateError as error:
+        record(f"Atualização em segundo plano falhou: {error}")

@@ -497,6 +497,11 @@ def main(arguments: list[str] | None = None) -> int:
     options = parser().parse_args(arguments)
     try:
         store = Store()
+        if options.action != "update":
+            try:
+                updater.check_in_background(ROOT, store.preference("auto_update"))
+            except OSError as error:
+                print(f"Aviso: verificação de atualização não iniciou ({error}).", file=sys.stderr)
         if options.action is None:
             return menu(store)
         if options.action == "doctor":
@@ -626,5 +631,25 @@ def main(arguments: list[str] | None = None) -> int:
         return 130
 
 
+def console_of_its_own() -> bool:
+    """O console foi aberto só para esta execução (duplo clique, atalho): nele vale esperar ENTER antes de sumir com
+    a mensagem de erro. Automação (entrada redirecionada, NUL ou sem console) e terminal já aberto não esperam."""
+    if os.name != "nt":
+        return False
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    handle, mode = kernel32.GetStdHandle(-10), ctypes.c_uint()  # STD_INPUT_HANDLE
+    if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        return False
+    processes = (ctypes.c_uint * 8)()
+    return kernel32.GetConsoleProcessList(processes, 8) <= 2  # só o cmd do launcher.cmd e este python
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    if exit_code not in (0, 130) and console_of_its_own():
+        try:
+            input("\nPressione ENTER para fechar...")
+        except (EOFError, KeyboardInterrupt):
+            pass
+    raise SystemExit(exit_code)
