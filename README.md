@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.14, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.15, Windows 10/11.
 
 ## Requisitos
 
@@ -192,13 +192,17 @@ o CLI; a janela do launcher vê o pedido, sai com código 0 (sem pedir ENTER) e 
 
 ### Janelas: segundo plano, sempre por cima e abrir por cima
 
-Sessão controlada abre **em segundo plano**: o Windows Terminal ativa a janela ao abrir uma aba (não há opção para não
-ativar), então o launcher devolve o foco do teclado a quem estava na frente logo em seguida. Pela interface, ou com
-`background=False`, a sessão abre na frente como antes.
+Sessão controlada abre **minimizada, em segundo plano**: o Windows Terminal ativa e mostra a janela ao abrir uma aba
+(não há opção para não ativar nem para abrir minimizado), então o launcher a minimiza assim que ela aparece (e de novo
+se o Terminal a reabrir nos primeiros segundos) e devolve o foco do teclado a quem estava na frente. Ela fica na barra
+de tarefas até o usuário abri-la. Se a janela das sessões já estava à vista (outra aba aberta antes), ela não é
+minimizada: só volta para trás de quem estava na frente. Pela interface, ou com `background=False`, a sessão abre na
+frente como antes.
 
 ```python
 from desktop import start_session
-start_session(store, projeto, "claude", modelo, controlled=True)                    # segundo plano (padrão)
+start_session(store, projeto, "claude", modelo, controlled=True)                    # minimizada (padrão)
+start_session(store, projeto, "claude", modelo, controlled=True, minimized=False)   # atrás, mas na tela
 start_session(store, projeto, "claude", modelo, controlled=True, background=False)  # primeiro plano, a pedido
 ```
 

@@ -38,9 +38,12 @@ def console_python() -> Path:
 
 def start_session(store: Store, project: dict, cli: str, model: str, resume: bool = False,
                   bypass_permissions: bool = False, controlled: bool = False,
-                  connection: str | None = None, background: bool | None = None) -> subprocess.Popen | None:
+                  connection: str | None = None, background: bool | None = None,
+                  minimized: bool | None = None) -> subprocess.Popen | None:
     """Abre a janela da sessão. background (padrão: só nas sessões controladas) abre sem tirar o foco do teclado de
-    quem está na frente; com a preferência sessions_secondary_monitor, a janela vai para outro monitor, se houver."""
+    quem está na frente e, com minimized (padrão: o mesmo que background), minimizada, sem cobrir nada na tela (o
+    usuário a abre pela barra de tarefas); com a preferência sessions_secondary_monitor, a janela vai para outro
+    monitor, se houver."""
     if os.name != "nt":
         raise LauncherError("A abertura de janelas de sessão requer Windows.")
     try:  # sessões abertas por outro programa (sem a interface) também mantêm a instalação atualizada
@@ -60,6 +63,7 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
     if controlled:
         command.append("--controlled")
     background = controlled if background is None else background
+    minimized = background if minimized is None else minimized
     environment = without_parent_session(dict(os.environ))
     title = session_title(project, cli)
     terminal_exe = terminal.find(ROOT)
@@ -81,7 +85,8 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
     if not background:
         return open_window()
     # O Windows Terminal ativa a janela ao abrir a aba (não há opção para não ativar): o foco volta logo em seguida.
-    report = focus.keep_behind(open_window, title.replace(";", " "), store.preference("sessions_secondary_monitor"))
+    report = focus.keep_behind(open_window, title.replace(";", " "), store.preference("sessions_secondary_monitor"),
+                               minimized=minimized)
     if not report["window"]:
         print(f"Aviso: a janela \"{title}\" não apareceu a tempo; ela pode ter tomado o foco.", file=sys.stderr)
     return report["result"]

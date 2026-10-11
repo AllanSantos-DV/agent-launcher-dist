@@ -1,7 +1,8 @@
 """Janelas no Windows: sessões que abrem sem tomar o foco, e uma janela marcada sempre por cima.
 
 - keep_behind: abre algo (aba do Windows Terminal ou console) e, se a janela nova tomar o foco do teclado, devolve o
-  foco a quem estava na frente. Opcionalmente leva a janela para outro monitor.
+  foco a quem estava na frente. Opcionalmente minimiza a janela nova (não cobre nada na tela; volta pela barra de
+  tarefas) e a leva para outro monitor.
 - Sempre por cima: um vigia oculto (instância única) mantém a janela com o título marcado como HWND_TOPMOST e reaplica
   se ela perder o estado ou for recriada. Só ordem Z: nunca toma o foco.
 - Abrir por cima: tira o "sempre por cima" por um tempo, abre o item na frente e restaura quando o usuário volta para
@@ -27,6 +28,7 @@ POLL_SECONDS = 0.5
 
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE, SWP_NOZORDER = 0x0001, 0x0002, 0x0010, 0x0004
 HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+SW_SHOWMINNOACTIVE = 7
 GWL_EXSTYLE, WS_EX_TOPMOST = -20, 0x0008
 VK_MENU, KEYEVENTF_KEYUP = 0x12, 0x0002
 MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_J, WM_HOTKEY = 0x1, 0x2, 0x4000, 0x4A, 0x0312
@@ -65,6 +67,32 @@ def find_window(title: str) -> int | None:
         return True
     user32.EnumWindows(ENUM_PROC(visit), 0)
     return hits[0] if hits else None
+
+
+def on_screen() -> set[int]:
+    """Janelas de nível superior visíveis e não minimizadas agora."""
+    hits = set()
+
+    def visit(hwnd, _):
+        if user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
+            hits.add(hwnd)
+        return True
+    user32.EnumWindows(ENUM_PROC(visit), 0)
+    return hits
+
+
+def is_minimized(hwnd: int) -> bool:
+    return bool(user32.IsIconic(hwnd))
+
+
+def minimize(hwnd: int) -> None:
+    """Minimiza sem ativar (a janela fica na barra de tarefas)."""
+    user32.ShowWindow(hwnd, SW_SHOWMINNOACTIVE)
+
+
+def place_behind(hwnd: int, other: int) -> None:
+    """Põe hwnd logo abaixo de other na ordem Z, sem ativar, mover nem redimensionar."""
+    user32.SetWindowPos(hwnd, other, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
 
 
 def bring_back(hwnd: int) -> bool:
@@ -121,34 +149,48 @@ def move_to(hwnd: int, monitor: dict) -> None:
 
 
 def keep_behind(open_window: Callable[[], object], title: str, other_monitor: bool = False,
-                timeout: float = 15, settle: float = 2.5) -> dict:
+                timeout: float = 15, settle: float = 2.5, minimized: bool = False) -> dict:
     """Abre (open_window) sem tirar o foco do teclado de quem está na frente: espera a janela com esse título aparecer
     e, por settle segundos, devolve o foco se ela o tomar (o Windows Terminal ativa a janela ao abrir uma aba e não tem
-    opção para não ativar). Não achar a janela não é erro da sessão (ela abriu); o resultado diz isso."""
+    opção para não ativar). Com minimized, a janela nova é minimizada assim que aparece (e de novo se ela se reabrir
+    nesse tempo); se ela já estava na tela antes (outra aba da mesma janela), só volta para trás de quem estava na
+    frente. Não achar a janela não é erro da sessão (ela abriu); o resultado diz isso."""
     previous = foreground()
+    shown = on_screen() if minimized else set()
     result = open_window()
-    report = {"previous": previous, "window": None, "restored": False, "moved": False, "result": result}
+    report = {"previous": previous, "window": None, "restored": False, "moved": False, "minimized": False,
+              "result": result}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline and not report["window"]:
         report["window"] = find_window(title)
         if not report["window"]:
-            time.sleep(0.05)
+            time.sleep(0.01 if minimized else 0.05)
     window = report["window"]
     if not window:
         return report
+    hide = minimized and window not in shown
+    if hide:
+        minimize(window)
+        report["minimized"] = True
     title_marked = read_state().get("title")
     marked = find_window(title_marked) if title_marked else None
     monitor = pick_monitor(monitors(), other_monitor, user32.MonitorFromWindow(marked, 0) if marked else None)
     if monitor:
         move_to(window, monitor)
         report["moved"] = True
-    if not previous or previous == window:
-        return report  # nada na frente, ou quem estava na frente já era a janela das sessões
+    # Nada na frente, ou quem estava na frente já era a janela das sessões: o foco fica como está.
+    watch_focus = bool(previous) and previous != window
+    if minimized and not hide and watch_focus:
+        place_behind(window, previous)
+    if not watch_focus and not hide:
+        return report
     end = time.monotonic() + settle
     while time.monotonic() < end:
-        if foreground() == window:
+        if watch_focus and foreground() == window:
             report["restored"] = bring_back(previous) or report["restored"]
-        time.sleep(0.05)
+        if hide and not is_minimized(window):
+            minimize(window)
+        time.sleep(0.01 if hide else 0.05)
     return report
 
 
