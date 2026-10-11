@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.12, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.13, Windows 10/11.
 
 ## Requisitos
 
@@ -187,6 +187,45 @@ configuração global e as sessões normais continuam com a recomendação.
 
 O orquestrador também fecha a sessão de verdade: ele grava `~/.cli-launcher/close-requests/<pid da janela>` e encerra
 o CLI; a janela do launcher vê o pedido, sai com código 0 (sem pedir ENTER) e o Windows Terminal fecha a aba.
+
+### Janelas: segundo plano, sempre por cima e abrir por cima
+
+Sessão controlada abre **em segundo plano**: o Windows Terminal ativa a janela ao abrir uma aba (não há opção para não
+ativar), então o launcher devolve o foco do teclado a quem estava na frente logo em seguida. Pela interface, ou com
+`background=False`, a sessão abre na frente como antes.
+
+```python
+from desktop import start_session
+start_session(store, projeto, "claude", modelo, controlled=True)                    # segundo plano (padrão)
+start_session(store, projeto, "claude", modelo, controlled=True, background=False)  # primeiro plano, a pedido
+```
+
+**Sempre por cima:** uma janela marcada pelo título (ex.: a tela do orquestrador em modo app) fica `HWND_TOPMOST`, e
+tudo o que abrir depois fica por baixo dela. Um vigia oculto (um só por usuário, sem console) reaplica se ela perder o
+estado ou for recriada; ele só mexe na ordem Z, nunca no foco.
+
+```powershell
+launcher topmost on --title "Jarvis"   # marca e mantém
+launcher topmost off                   # desmarca (o vigia sai)
+launcher topmost status                # {"enabled", "title", "found", "topmost", "front_until"}
+```
+
+**Abrir por cima** (só quando o usuário pede, ex.: "abre o PDF"): a janela marcada dá lugar, o item abre na frente
+pelo shell, e o "sempre por cima" volta sozinho quando o usuário clica na janela marcada, passa do item para outra
+janela, o tempo acaba (padrão 300 s) ou pede para voltar (`topmost resume`, ou Ctrl+Alt+J em qualquer lugar).
+
+```powershell
+launcher front "C:\docs\relatorio.pdf" --seconds 600
+launcher topmost resume                # "voltar": encerra o abrir por cima agora
+```
+
+Em Python: `focus.topmost_on(titulo)`, `focus.topmost_off()`, `focus.topmost_resume()` e
+`focus.open_front(alvo, segundos)`. Estado em `~/.cli-launcher/topmost.json`.
+
+**Monitor das sessões:** `launcher preferences --sessions-monitor other` leva as sessões em segundo plano para o
+monitor que não tem a janela marcada (ou para um não principal, sem janela marcada), se houver mais de um.
+`--sessions-monitor primary` volta ao padrão (ficam onde abrirem).
+
 ## Escrever um conector
 
 Um conector é um arquivo `.py` em `~/.agent-launcher/connectors/`. Ele aparece na interface ao lado dos embutidos;
@@ -226,6 +265,9 @@ launcher models --connection OpenRouter --cli claude --search sonnet --refresh
 launcher launch --project "Meu app" --connection OpenRouter --cli codex --model "openai/gpt-6" --dry-run
 launcher launch --project "Meu app" --resume
 launcher update                # atualiza agora pelo npm (--check só consulta)
+launcher topmost on --title "Jarvis"   # janela sempre por cima (off, resume, status)
+launcher front "C:\docs\relatorio.pdf" # abrir por cima, a pedido do usuário
+launcher preferences --sessions-monitor other   # sessões em segundo plano no outro monitor
 ```
 
 `--dry-run` mostra o plano (comando, overrides, contexto, avisos) com a chave mascarada, sem rede e sem salvar nada.

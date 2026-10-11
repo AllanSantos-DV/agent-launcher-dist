@@ -11,6 +11,7 @@ from core import (ROOT, Gateway, LauncherError, Store, build_plan, consume_close
                   project_path,
                   run_controlled_codex, run_plan,
                   without_parent_session)
+import focus
 import terminal
 from version import APP_ID, APP_NAME
 
@@ -36,7 +37,9 @@ def console_python() -> Path:
 
 def start_session(store: Store, project: dict, cli: str, model: str, resume: bool = False,
                   bypass_permissions: bool = False, controlled: bool = False,
-                  connection: str | None = None) -> subprocess.Popen | None:
+                  connection: str | None = None, background: bool | None = None) -> subprocess.Popen | None:
+    """Abre a janela da sessão. background (padrão: só nas sessões controladas) abre sem tirar o foco do teclado de
+    quem está na frente; com a preferência sessions_secondary_monitor, a janela vai para outro monitor, se houver."""
     if os.name != "nt":
         raise LauncherError("A abertura de janelas de sessão requer Windows.")
     directory = project_path(project["path"])
@@ -51,21 +54,32 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
         command.append("--bypass")
     if controlled:
         command.append("--controlled")
+    background = controlled if background is None else background
     environment = without_parent_session(dict(os.environ))
+    title = session_title(project, cli)
     terminal_exe = terminal.find(ROOT)
-    if terminal_exe:
-        # Aba na janela única do launcher; --suppressApplicationTitle impede o CLI de trocar o título da aba.
-        # wt.exe apenas encaminha a abertura e termina antes da sessão, por isso não há processo para acompanhar.
-        tab_title = session_title(project, cli).replace(";", " ")
-        try:
-            subprocess.Popen([terminal_exe, "-w", TERMINAL_WINDOW, "new-tab", "--title", tab_title,
-                              "--suppressApplicationTitle", "--tabColor", TAB_COLORS[cli], *command],
-                             cwd=directory, env=environment, shell=False)
-            return None
-        except OSError as error:  # ex.: AppLocker barrando o Terminal portátil
-            print(f"Aviso: Windows Terminal não abriu ({error}); usando um console separado.", file=sys.stderr)
-    return subprocess.Popen(command, cwd=directory, env=environment, shell=False,
-                            creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+    def open_window() -> subprocess.Popen | None:
+        if terminal_exe:
+            # Aba na janela única do launcher; --suppressApplicationTitle impede o CLI de trocar o título da aba.
+            # wt.exe apenas encaminha a abertura e termina antes da sessão, por isso não há processo para acompanhar.
+            try:
+                subprocess.Popen([terminal_exe, "-w", TERMINAL_WINDOW, "new-tab", "--title", title.replace(";", " "),
+                                  "--suppressApplicationTitle", "--tabColor", TAB_COLORS[cli], *command],
+                                 cwd=directory, env=environment, shell=False)
+                return None
+            except OSError as error:  # ex.: AppLocker barrando o Terminal portátil
+                print(f"Aviso: Windows Terminal não abriu ({error}); usando um console separado.", file=sys.stderr)
+        return subprocess.Popen(command, cwd=directory, env=environment, shell=False,
+                                creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+    if not background:
+        return open_window()
+    # O Windows Terminal ativa a janela ao abrir a aba (não há opção para não ativar): o foco volta logo em seguida.
+    report = focus.keep_behind(open_window, title.replace(";", " "), store.preference("sessions_secondary_monitor"))
+    if not report["window"]:
+        print(f"Aviso: a janela \"{title}\" não apareceu a tempo; ela pode ter tomado o foco.", file=sys.stderr)
+    return report["result"]
 
 
 def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,

@@ -165,7 +165,7 @@ class Vault:
 
 PROJECT_KEYS = {"id", "name", "path", "last_cli", "last_connection", "models", "last_used"}
 CONNECTION_KEYS = {"id", "name", "connector", "options"}
-PREFERENCES = {"bypass_default": False, "auto_update": True}
+PREFERENCES = {"bypass_default": False, "auto_update": True, "sessions_secondary_monitor": False}
 
 
 class Store:

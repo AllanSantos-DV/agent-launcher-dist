@@ -12,6 +12,7 @@ from core import (ROOT, LauncherError, Gateway, Store, build_plan, controlled_co
                   resolve_cli,
                   run_controlled_codex, run_plan)
 import clis
+import focus
 import terminal
 import updater
 from version import APP_NAME, VERSION
@@ -463,6 +464,19 @@ def parser() -> argparse.ArgumentParser:
                              help="Bypass de permissões marcado por padrão na interface")
     preferences.add_argument("--auto-update", choices=("on", "off"),
                              help="Interface se atualiza sozinha pelo npm a cada abertura")
+    preferences.add_argument("--sessions-monitor", choices=("primary", "other"),
+                             help="Sessões em segundo plano no outro monitor (o que não tem a janela sempre por cima), "
+                                  "se existir")
+    top = commands.add_parser("topmost", help="Janela sempre por cima (ex.: a tela do orquestrador)")
+    top.add_argument("state", choices=("on", "off", "resume", "status"),
+                     help="on marca e mantém; off desmarca; resume encerra um 'front' em andamento")
+    top.add_argument("--title", help="Título exato da janela (obrigatório com on)")
+    front = commands.add_parser("front", help="Abrir por cima, a pedido explícito do usuário (arquivo, pasta ou URL): "
+                                              "a janela sempre por cima dá lugar até o usuário voltar a ela, trocar de "
+                                              "janela, o tempo acabar ou apertar Ctrl+Alt+J")
+    front.add_argument("target")
+    front.add_argument("--seconds", type=float, default=focus.FRONT_SECONDS,
+                       help=f"tempo máximo por cima (padrão {focus.FRONT_SECONDS:.0f} s)")
     update = commands.add_parser("update", help="Atualizar agora pela última versão publicada no npm")
     update.add_argument("--check", action="store_true", help="só mostra se há versão nova, sem instalar")
     session = commands.add_parser("launch", help="Iniciar um CLI no terminal atual")
@@ -561,8 +575,29 @@ def main(arguments: list[str] | None = None) -> int:
                 store.set_preference("bypass_default", options.bypass_default == "on")
             if options.auto_update:
                 store.set_preference("auto_update", options.auto_update == "on")
+            if options.sessions_monitor:
+                store.set_preference("sessions_secondary_monitor", options.sessions_monitor == "other")
             print(f"Bypass marcado por padrão: {'sim' if store.preference('bypass_default') else 'não'}")
             print(f"Atualização automática: {'sim' if store.preference('auto_update') else 'não'}")
+            print(f"Sessões em segundo plano: "
+                  f"{'no outro monitor, se existir' if store.preference('sessions_secondary_monitor') else 'onde abrirem'}")
+        elif options.action == "topmost":
+            if options.state == "on":
+                if not options.title:
+                    raise LauncherError("Informe --title com o título exato da janela.")
+                focus.topmost_on(options.title)
+            elif options.state == "off":
+                focus.topmost_off()
+            elif options.state == "resume":
+                focus.topmost_resume()
+            state = focus.read_state()
+            marked = focus.find_window(state["title"]) if state.get("title") else None
+            print(json.dumps({"enabled": bool(state.get("enabled")), "title": state.get("title"),
+                              "found": bool(marked), "topmost": bool(marked and focus.is_topmost(marked)),
+                              "front_until": state.get("front_until")}, ensure_ascii=False))
+        elif options.action == "front":
+            focus.open_front(options.target, options.seconds)
+            print(f"Aberto por cima: {options.target}")
         elif options.action == "update":
             try:
                 if options.check:
