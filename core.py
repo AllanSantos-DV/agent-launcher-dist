@@ -166,13 +166,33 @@ class Vault:
 PROJECT_KEYS = {"id", "name", "path", "last_cli", "last_connection", "models", "last_used"}
 CONNECTION_KEYS = {"id", "name", "connector", "options"}
 PREFERENCES = {"bypass_default": False, "auto_update": True, "sessions_secondary_monitor": False}
+BACKUP_DAYS = 30
+DEFAULT_HOME = Path.home() / ".agent-launcher"
+
+
+def legacy_configs() -> list[Path]:
+    """config.json da instalação anterior (launcher-v2), que guardava os projetos em .data/ dentro da pasta instalada."""
+    local = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+    candidates = sorted((local / "Programs").glob("*/launcher-v2/.data/config.json"))
+    if os.environ.get("LAUNCHER_V2_HOME"):
+        candidates.insert(0, Path(os.environ["LAUNCHER_V2_HOME"]).expanduser() / "config.json")
+    return candidates
 
 
 class Store:
-    def __init__(self, home: Path | None = None):
+    """config.json em data_home(), fora da pasta instalada: atualizar ou reinstalar não toca nos projetos.
+
+    Cada gravação com projetos guarda uma cópia do dia em backups/ (BACKUP_DAYS mais recentes). Ao abrir sem
+    config.json, ou com a lista vazia sem que o usuário a tenha esvaziado, volta a cópia mais recente; sem cópia
+    nenhuma, importa os projetos da instalação anterior (launcher-v2, que guardava tudo dentro da pasta instalada).
+    O que foi recuperado fica em self.recovered para a interface e o modo texto avisarem."""
+
+    def __init__(self, home: Path | None = None, legacy: list[Path] | None = None):
         self.home = Path(home) if home else data_home()
         self.path = self.home / "config.json"
+        self.backups = self.home / "backups"
         self.vault = Vault(self.home)
+        self.recovered = None
         self.data = {"schema": 2, "projects": [], "last_project": None, "connections": [],
                      "default_connection": None, "preferences": dict(PREFERENCES)}
         if self.path.exists():
@@ -181,9 +201,36 @@ class Store:
                 self.validate()
             except (ValueError, TypeError, KeyError, AttributeError, LauncherError) as error:
                 raise LauncherError(
-                    f"Configuração inválida em {self.path}. O arquivo foi preservado; "
-                    "corrija-o ou mova-o para um backup antes de continuar."
+                    f"Configuração inválida em {self.path}. O arquivo foi preservado; corrija-o ou troque-o pela "
+                    f"cópia mais recente de {self.backups} antes de continuar."
                 ) from error
+        if not self.data["projects"]:
+            self._recover(legacy_configs() if legacy is None and self.home == DEFAULT_HOME else legacy or [])
+
+    def _recover(self, legacy: list[Path]) -> None:
+        copies = sorted(self.backups.glob("config-*.json"), reverse=True)
+        previous = self.data
+        for copy in copies:
+            try:
+                self.data = data = json.loads(copy.read_text(encoding="utf-8-sig"))
+                self.validate()
+            except (OSError, ValueError, TypeError, KeyError, AttributeError, LauncherError):
+                self.data = previous
+                continue  # cópia corrompida: tenta a anterior
+            if not data["projects"]:
+                self.data = previous  # a última cópia válida é de quando o usuário esvaziou a lista
+                return
+            atomic_json(self.path, self.data)
+            self.recovered = f"{len(data['projects'])} projeto(s) restaurado(s) da cópia {copy}."
+            return
+        if copies:
+            return
+        for source in legacy:
+            if source.is_file():
+                added, _skipped = self.import_legacy(source)
+                if added:
+                    self.recovered = f"{added} projeto(s) importado(s) da instalação anterior ({source})."
+                    return
 
     def validate(self) -> None:
         if not isinstance(self.data, dict) or self.data.get("schema") != 2:
@@ -245,9 +292,14 @@ class Store:
         if self.data["last_project"] is not None and self.data["last_project"] not in identifiers:
             raise ValueError("último projeto")
 
-    def save(self) -> None:
+    def save(self, backup: bool = False) -> None:
+        """Grava config.json e, se há projetos (ou backup=True, quando o usuário esvazia a lista), a cópia do dia."""
         self.validate()
         atomic_json(self.path, self.data)
+        if self.data["projects"] or backup:
+            atomic_json(self.backups / f"config-{time.strftime('%Y-%m-%d')}.json", self.data)
+            for old in sorted(self.backups.glob("config-*.json"), reverse=True)[BACKUP_DAYS:]:
+                old.unlink()
 
     # Projetos
 
@@ -304,7 +356,7 @@ class Store:
         self.data["projects"].remove(project)
         if self.data["last_project"] == project["id"]:
             self.data["last_project"] = None
-        self.save()
+        self.save(backup=True)
 
     def last_model(self, project: dict, connection: dict, cli: str) -> str:
         return project["models"].get(connection["id"], {}).get(cli, "")

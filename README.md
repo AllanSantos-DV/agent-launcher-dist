@@ -281,7 +281,12 @@ launcher preferences --sessions-monitor other   # sessões em segundo plano no o
 ## Dados e segurança
 
 - `~/.agent-launcher/config.json`: projetos, conexões (sem chaves) e preferências. `AGENT_LAUNCHER_HOME` escolhe
-  outra pasta. Gravação atômica; configuração inválida é preservada, nunca sobrescrita.
+  outra pasta. Gravação atômica; configuração inválida é preservada, nunca sobrescrita. Fica fora da pasta instalada:
+  instalar, atualizar ou desinstalar não toca nela.
+- `~/.agent-launcher/backups/`: cópia do `config.json` de cada dia com projetos (os 30 dias mais recentes). Se o
+  `config.json` sumir ou aparecer com a lista vazia sem que você tenha removido os projetos, o app volta a cópia mais
+  recente e avisa. Sem cópia nenhuma, importa os projetos da instalação
+  anterior (`%LOCALAPPDATA%\Programs\*\launcher-v2\.data`).
 - `~/.agent-launcher/secrets.json`: chaves das conexões, cada uma cifrada com DPAPI para o seu usuário do Windows.
   Uma cópia do arquivo não serve em outra conta ou máquina. Isso não protege contra programas rodando como você.
 - `~/.agent-launcher/cache/`: catálogo por conexão (IDs e limites numéricos; nunca chaves nem payloads brutos).

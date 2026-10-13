@@ -497,6 +497,8 @@ def main(arguments: list[str] | None = None) -> int:
     options = parser().parse_args(arguments)
     try:
         store = Store()
+        if store.recovered:
+            print(f"Aviso: {store.recovered}", file=sys.stderr)
         if options.action != "update":
             try:
                 updater.check_in_background(ROOT, store.preference("auto_update"))

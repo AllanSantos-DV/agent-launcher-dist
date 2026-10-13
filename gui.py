@@ -415,6 +415,9 @@ class LauncherWindow(QMainWindow):
         self.update_notice.setTextFormat(Qt.TextFormat.RichText)
         self.update_notice.linkActivated.connect(lambda _link: self.restart())
         self.update_notice.hide()
+        if self.store.recovered:
+            self.update_notice.setText(self.store.recovered.replace("<", "&lt;"))
+            self.update_notice.show()
         body.addWidget(self.update_notice)
         actions = QHBoxLayout()
         session_options = QVBoxLayout()
