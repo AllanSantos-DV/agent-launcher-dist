@@ -13,6 +13,7 @@ from core import (ROOT, LauncherError, Gateway, Store, build_plan, controlled_co
                   run_controlled_codex, run_plan)
 import clis
 import focus
+import keys
 import terminal
 import updater
 from version import APP_NAME, VERSION
@@ -477,6 +478,15 @@ def parser() -> argparse.ArgumentParser:
     front.add_argument("target")
     front.add_argument("--seconds", type=float, default=focus.FRONT_SECONDS,
                        help=f"tempo máximo por cima (padrão {focus.FRONT_SECONDS:.0f} s)")
+    send = commands.add_parser("keys", help="Enviar teclas a uma sessão aberta (responder ou dispensar um diálogo)")
+    send.add_argument("keys", nargs="*", metavar="TECLA",
+                      help="enter esc up down left right tab shift+tab space backspace ctrl+c home end pageup pagedown "
+                           "delete, um caractere (1, y) ou text:ALGO")
+    send.add_argument("--project", help="Nome, ID ou caminho do projeto da sessão")
+    send.add_argument("--cli", choices=CLIS, help="Desempata quando o projeto tem sessão Claude e Codex abertas")
+    send.add_argument("--pid", type=int, help="pid da janela da sessão (ver --list); dispensa --project")
+    send.add_argument("--list", action="store_true", help="Listar as sessões abertas (JSON) e sair")
+    send.add_argument("--screen", action="store_true", help="Mostrar o que a sessão exibe agora (antes das teclas)")
     update = commands.add_parser("update", help="Atualizar agora pela última versão publicada no npm")
     update.add_argument("--check", action="store_true", help="só mostra se há versão nova, sem instalar")
     session = commands.add_parser("launch", help="Iniciar um CLI no terminal atual")
@@ -605,6 +615,25 @@ def main(arguments: list[str] | None = None) -> int:
         elif options.action == "front":
             focus.open_front(options.target, options.seconds)
             print(f"Aberto por cima: {options.target}")
+        elif options.action == "keys":
+            if options.list:
+                print(json.dumps(keys.sessions(), ensure_ascii=False))
+                return 0
+            if options.pid is None and not options.project:
+                raise LauncherError("Informe --project (e --cli se preciso) ou --pid; veja --list.")
+            if not options.keys and not options.screen:
+                raise LauncherError("Informe as teclas a enviar ou --screen.")
+            try:
+                ids = {store.find(options.project)["id"]} if options.project else set()
+                session = keys.resolve(ids, options.cli, options.pid)
+                if options.screen:
+                    print(keys.read_screen(session["pid"]))
+                if options.keys:
+                    keys.send(session["pid"], options.keys)
+                    print(json.dumps({"ok": True, "pid": session["pid"], "title": session["title"],
+                                      "sent": options.keys}, ensure_ascii=False))
+            except keys.KeysError as error:
+                raise LauncherError(str(error)) from error
         elif options.action == "update":
             try:
                 if options.check:

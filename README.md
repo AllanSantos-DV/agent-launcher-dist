@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.15, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.17, Windows 10/11.
 
 ## Requisitos
 
@@ -228,6 +228,39 @@ launcher topmost resume                # "voltar": encerra o abrir por cima agor
 Em Python: `focus.topmost_on(titulo)`, `focus.topmost_off()`, `focus.topmost_resume()` e
 `focus.open_front(alvo, segundos)`. Estado em `~/.cli-launcher/topmost.json`.
 
+### Responder um diálogo aberto: `launcher keys`
+
+Sessão controlada pode parar num diálogo já aberto (pergunta, pedido de permissão). `launcher keys` envia teclas ao
+console da sessão sem trazer a janela para a frente: funciona com a janela minimizada, em outro monitor ou sem foco.
+Cada janela de sessão fica registrada em `~/.cli-launcher/sessions/<pid>.json` enquanto existir.
+
+```
+launcher keys [TECLA ...] (--project PROJETO [--cli claude|codex] | --pid PID) [--screen]
+launcher keys --list
+```
+
+| Parâmetro | Significado |
+| --- | --- |
+| `TECLA` | `enter esc up down left right tab shift+tab space backspace ctrl+c home end pageup pagedown delete`, um caractere (`1`, `y`) ou `text:ALGO` (digita ALGO). Enviadas em ordem. |
+| `--project` | Nome, ID ou caminho do projeto da sessão. `--cli` desempata Claude e Codex. |
+| `--pid` | pid da janela da sessão (de `--list`); dispensa `--project`. |
+| `--screen` | Imprime o que a sessão mostra agora (antes das teclas, se houver), para decidir o que enviar. |
+| `--list` | JSON com as sessões abertas: `pid, project, project_id, cli, title, controlled, startedAt`. |
+
+Saída ao enviar: `{"ok": true, "pid": 123, "title": "Projeto — Claude Code", "sent": ["down", "enter"]}`, código 0.
+Falha (tecla desconhecida, sessão inexistente ou ambígua, console inacessível): `Erro: ...` no stderr e código 1;
+nada é enviado quando alguma tecla é inválida.
+
+```powershell
+launcher keys --project "Meu app" --screen                 # ver o diálogo
+launcher keys --project "Meu app" --cli claude down enter  # escolher a 2ª opção
+launcher keys --project "Meu app" 1                        # opção numerada
+launcher keys --pid 4242 esc                               # dispensar
+```
+
+Em Python: `keys.sessions()`, `keys.resolve(ids_do_projeto, cli, pid)`, `keys.send(pid, tokens)`,
+`keys.read_screen(pid)`. Como e por quê: `docs/research/teclas-em-sessao.md`.
+
 **Monitor das sessões:** `launcher preferences --sessions-monitor other` leva as sessões em segundo plano para o
 monitor que não tem a janela marcada (ou para um não principal, sem janela marcada), se houver mais de um.
 `--sessions-monitor primary` volta ao padrão (ficam onde abrirem).
@@ -273,6 +306,7 @@ launcher launch --project "Meu app" --resume
 launcher update                # atualiza agora pelo npm (--check só consulta)
 launcher topmost on --title "Jarvis"   # janela sempre por cima (off, resume, status)
 launcher front "C:\docs\relatorio.pdf" # abrir por cima, a pedido do usuário
+launcher keys --project "Meu app" --screen      # ver e responder um diálogo aberto (keys ... down enter)
 launcher preferences --sessions-monitor other   # sessões em segundo plano no outro monitor
 ```
 

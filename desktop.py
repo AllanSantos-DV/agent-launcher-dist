@@ -12,6 +12,7 @@ from core import (ROOT, Gateway, LauncherError, Store, build_plan, consume_close
                   run_controlled_codex, run_plan,
                   without_parent_session)
 import focus
+import keys
 import terminal
 import updater
 from version import APP_ID, APP_NAME
@@ -99,6 +100,7 @@ def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
     title = session_title(project, cli)
     if os.name == "nt":
         ctypes.windll.kernel32.SetConsoleTitleW(title)
+    keys.register(os.getpid(), project["name"], project["id"], cli, title, controlled)  # para `launcher keys`
     try:
         print(f"\n  {title}\n  {project['path']}\n")
         gateway = Gateway.for_project(store, project, connection)
@@ -113,6 +115,7 @@ def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
             return run_controlled_codex(plan, project["name"])
         return run_plan(plan)
     finally:
+        keys.unregister(os.getpid())
         if os.name == "nt":
             ctypes.windll.kernel32.SetConsoleTitleW(title)
 
