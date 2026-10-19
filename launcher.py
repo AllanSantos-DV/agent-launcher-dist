@@ -12,6 +12,7 @@ from core import (ROOT, LauncherError, Gateway, Store, build_plan, controlled_co
                   resolve_cli,
                   run_controlled_codex, run_plan)
 import clis
+import elevated
 import focus
 import keys
 import terminal
@@ -460,6 +461,19 @@ def parser() -> argparse.ArgumentParser:
     term = commands.add_parser("terminal", help="Windows Terminal: situação, bloqueios corporativos e instalação sem admin")
     term.add_argument("--install", action="store_true", help="instala o Terminal portátil (ou via winget) se faltar")
     term.add_argument("--zip", type=Path, help="ZIP do Windows Terminal entregue pela TI; força a cópia portátil")
+    admin = commands.add_parser("elevated", help="Projetos que abrem sessões elevadas (administrador) sem pedido de UAC")
+    admin_actions = admin.add_subparsers(dest="elevated_action")
+    admin_actions.add_parser("status", help="Tarefa, projetos marcados e pendências")
+    for name, text in (("enable", "Marca projetos como elevados (um clique de UAC, uma vez)"),
+                       ("disable", "Desmarca projetos (um clique de UAC)")):
+        marker = admin_actions.add_parser(name, help=text)
+        marker.add_argument("projects", nargs="+", metavar="PROJETO", help="Nome ou ID de projeto cadastrado")
+    admin_actions.add_parser("probe", help="Prova, sem janela, que a tarefa roda com token elevado e sem UAC")
+    runner = admin_actions.add_parser("run", help="Executa um comando elevado (sem UAC) na pasta de um projeto marcado")
+    runner.add_argument("--project", help="Nome, ID ou caminho do projeto; omitido usa a pasta atual")
+    runner.add_argument("--cmd", action="store_true", help="interpretar como cmd em vez de PowerShell")
+    runner.add_argument("--timeout", type=int, default=600, help="segundos (padrão 600, máximo 3600)")
+    runner.add_argument("command", nargs=argparse.REMAINDER, metavar="-- COMANDO")
     preferences = commands.add_parser("preferences", help="Preferências")
     preferences.add_argument("--bypass-default", choices=("on", "off"),
                              help="Bypass de permissões marcado por padrão na interface")
@@ -587,6 +601,28 @@ def main(arguments: list[str] | None = None) -> int:
             print(f"Windows Terminal: {found or 'ausente (sessões em consoles separados)'}")
             for line in terminal.describe(terminal.environment()):
                 print(f"  {line}")
+        elif options.action == "elevated":
+            if options.elevated_action in ("enable", "disable"):
+                names = [store.find(reference)["name"] for reference in options.projects]
+                enabling = options.elevated_action == "enable"
+                outcome = elevated.change(store.home.resolve(), names if enabling else [], [] if enabling else names)
+                print(json.dumps({"ok": True, "projects": outcome["projects"], "task": outcome["task"]}, ensure_ascii=False))
+            elif options.elevated_action == "run":
+                words = options.command[1:] if options.command[:1] == ["--"] else options.command
+                if not words:
+                    raise LauncherError("Informe o comando depois de --.")
+                project = store.find(options.project or os.getcwd())
+                outcome = elevated.run_admin(project, " ".join(words), "cmd" if options.cmd else "powershell",
+                                             options.timeout, store.home.resolve())
+                sys.stdout.write(outcome.get("stdout", ""))
+                sys.stderr.write(outcome.get("stderr", ""))
+                if not outcome.get("ok"):
+                    raise LauncherError(f"Comando elevado: {outcome.get('error')}")
+                return outcome["exit"]
+            elif options.elevated_action == "probe":
+                print(json.dumps(elevated.probe(store.home.resolve()), ensure_ascii=False))
+            else:
+                print(json.dumps(elevated.status(store), ensure_ascii=False))
         elif options.action == "preferences":
             if options.bypass_default:
                 store.set_preference("bypass_default", options.bypass_default == "on")

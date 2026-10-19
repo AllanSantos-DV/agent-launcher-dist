@@ -11,6 +11,7 @@ from core import (ROOT, Gateway, LauncherError, Store, build_plan, consume_close
                   project_path,
                   run_controlled_codex, run_plan,
                   without_parent_session)
+import elevated
 import focus
 import keys
 import terminal
@@ -107,7 +108,8 @@ def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
         print(f"  Conexão: {gateway.name} • {gateway.targets.get(cli) or gateway.url}\n")
         gateway.verify()
         plan = build_plan(gateway, cli, project["path"], model, resume, gateway.catalog(), preserve_terminal_title=True,
-                          bypass_permissions=bypass_permissions, controlled=controlled)
+                          bypass_permissions=bypass_permissions, controlled=controlled,
+                          admin_note=elevated.session_note(project))
         for warning in plan.warnings:
             print(f"  Aviso: {warning}")
         prepare_unattended(plan)

@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.17, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.18, Windows 10/11.
 
 ## Requisitos
 
@@ -264,6 +264,22 @@ Em Python: `keys.sessions()`, `keys.resolve(ids_do_projeto, cli, pid)`, `keys.se
 **Monitor das sessões:** `launcher preferences --sessions-monitor other` leva as sessões em segundo plano para o
 monitor que não tem a janela marcada (ou para um não principal, sem janela marcada), se houver mais de um.
 `--sessions-monitor primary` volta ao padrão (ficam onde abrirem).
+
+### Administrador sem UAC
+
+Para projetos que instalam programas, mexem em firewall ou em pastas protegidas, `launcher elevated enable PROJETO...`
+cria uma vez a tarefa agendada `AgentLauncher-Elevated` (RunLevel Highest, só sob demanda). Isso exige **um** clique de
+UAC, na configuração. Depois, `launcher elevated run -- COMANDO` executa o comando como administrador, na pasta do
+projeto, sem prompt, e devolve a saída e o código de saída (`--cmd` usa o cmd, `--timeout` limita o tempo). As sessões
+desses projetos recebem no prompt a instrução de usar esse comando para tudo que exigiria administrador. A sessão em si
+continua comum: um Claude elevado não recebe mensagens do orquestrador nem teclas de `launcher keys`.
+
+`launcher elevated status` mostra a tarefa e os projetos marcados, `launcher elevated disable PROJETO...` desmarca (outro
+clique) e `launcher elevated probe` prova, sem janela, que a tarefa roda com token elevado.
+
+A lista dos marcados e o runner ficam em `%ProgramData%\agent-launcher\elevated`, onde só administrador grava. Risco: o
+UAC deixa de proteger esses projetos; qualquer programa do usuário pode disparar a tarefa e mandar um comando de um
+projeto marcado. Marque só quem precisa.
 
 ## Escrever um conector
 

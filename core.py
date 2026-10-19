@@ -688,7 +688,7 @@ ALL_MODELS_LIMIT = 150  # availableModels vai na linha de comando: roteadores co
 
 def build_plan(gateway: Gateway, cli: str, directory: str, model: str, resume: bool = False,
                catalog: Catalog | None = None, preserve_terminal_title: bool = False,
-               bypass_permissions: bool = False, controlled: bool = False) -> LaunchPlan:
+               bypass_permissions: bool = False, controlled: bool = False, admin_note: str | None = None) -> LaunchPlan:
     bypass_permissions = bypass_permissions or controlled
     if cli not in gateway.clis:
         raise LauncherError(f"A conexão {gateway.name} não atende o {cli}. Escolha outra conexão ou o outro CLI.")
@@ -792,8 +792,9 @@ def build_plan(gateway: Gateway, cli: str, directory: str, model: str, resume: b
         settings = json.dumps({"apiKeyHelper": "", "env": settings_env, "availableModels": allowed}, ensure_ascii=True, separators=(",", ":"))
         command += ["--settings", settings, "--model", model]
         command += ["--dangerously-skip-permissions"] if bypass_permissions else ["--permission-mode", "default"]
-        if controlled:
-            command += ["--append-system-prompt", CONTROLLED_NOTE.format(code=delegation_code())]
+        notes = ([CONTROLLED_NOTE.format(code=delegation_code())] if controlled else []) + ([admin_note] if admin_note else [])
+        if notes:
+            command += ["--append-system-prompt", "\n\n".join(notes)]
         if resume:
             command.append("--continue")
     else:
