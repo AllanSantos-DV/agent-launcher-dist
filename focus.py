@@ -29,6 +29,9 @@ POLL_SECONDS = 0.5
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE, SWP_NOZORDER = 0x0001, 0x0002, 0x0010, 0x0004
 HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
 SW_SHOWMINNOACTIVE = 7
+SW_SHOWNORMAL, SW_SHOWMINIMIZED = 1, 2
+TERMINAL_CLASS = "CASCADIA_HOSTING_WINDOW_CLASS"
+MIN_WIDTH, MIN_HEIGHT = 300, 150  # menor que isso (ou fora de todo monitor) o retângulo normal não serve para restaurar
 GWL_EXSTYLE, WS_EX_TOPMOST = -20, 0x0008
 VK_MENU, KEYEVENTF_KEYUP = 0x12, 0x0002
 MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_J, WM_HOTKEY = 0x1, 0x2, 0x4000, 0x4A, 0x0312
@@ -40,11 +43,19 @@ if os.name == "nt":
                                     ctypes.c_int, ctypes.c_uint]
     user32.MonitorFromWindow.restype = wintypes.HMONITOR
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    user32.SetWindowPlacement.argtypes = [wintypes.HWND, ctypes.c_void_p]
     kernel32_errors = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32_errors.CreateMutexW.restype = wintypes.HANDLE
     ENUM_PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     MONITOR_PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(wintypes.RECT),
                                       wintypes.LPARAM)
+
+
+class WindowPlacement(ctypes.Structure):
+    _fields_ = [("length", wintypes.UINT), ("flags", wintypes.UINT), ("showCmd", wintypes.UINT),
+                ("ptMinPosition", wintypes.POINT), ("ptMaxPosition", wintypes.POINT),
+                ("rcNormalPosition", wintypes.RECT)]
 
 
 def foreground() -> int:
@@ -85,9 +96,75 @@ def is_minimized(hwnd: int) -> bool:
     return bool(user32.IsIconic(hwnd))
 
 
+def get_placement(hwnd: int) -> WindowPlacement:
+    placement = WindowPlacement(length=ctypes.sizeof(WindowPlacement))
+    user32.GetWindowPlacement(hwnd, ctypes.byref(placement))
+    return placement
+
+
+def rect_usable(rect: tuple[int, int, int, int], available: list[dict]) -> bool:
+    """O retângulo "normal" de uma janela serve para restaurá-la: tamanho mínimo e à vista em algum monitor. Sem
+    monitores conhecidos (consulta falhou) só vale o tamanho."""
+    left, top, right, bottom = rect
+    if right - left < MIN_WIDTH or bottom - top < MIN_HEIGHT:
+        return False
+    return not available or any(left < m["right"] and right > m["left"] and top < m["bottom"] and bottom > m["top"]
+                                for m in available)
+
+
+def default_rect(available: list[dict]) -> tuple[int, int, int, int]:
+    """Retângulo padrão para uma janela com o normal corrompido: 70% da área de trabalho do monitor principal."""
+    work = next((m for m in available if m["primary"]), available[0] if available else
+                {"left": 0, "top": 0, "right": 1280, "bottom": 800})
+    width, height = (work["right"] - work["left"]) * 7 // 10, (work["bottom"] - work["top"]) * 7 // 10
+    left, top = work["left"] + (work["right"] - work["left"] - width) // 2, work["top"] + (work["bottom"] - work["top"] - height) // 2
+    return left, top, left + width, top + height
+
+
+def set_placement(hwnd: int, show_cmd: int, rect: tuple[int, int, int, int] | None = None) -> None:
+    placement = get_placement(hwnd)
+    placement.showCmd = show_cmd
+    if rect:
+        placement.rcNormalPosition = wintypes.RECT(*rect)
+    user32.SetWindowPlacement(hwnd, ctypes.byref(placement))
+
+
+def repair_placement(hwnd: int) -> bool:
+    """Conserta a janela cujo retângulo "normal" virou o do estado minimizado (o Windows Terminal minimizado no meio
+    da própria restauração fica em -32000 com 480x103: a janela não restaura nem maximiza e as abas nascem com 48x2).
+    Grava um retângulo são sem mudar minimizada/normal/maximizada. Devolve se corrigiu."""
+    placement = get_placement(hwnd)
+    rect = placement.rcNormalPosition
+    available = monitors()
+    if rect_usable((rect.left, rect.top, rect.right, rect.bottom), available):
+        return False
+    set_placement(hwnd, placement.showCmd, default_rect(available))
+    return True
+
+
+def heal_terminal_windows() -> int:
+    """Antes de abrir uma aba: janelas do Windows Terminal com o retângulo normal corrompido são consertadas, para a
+    aba não nascer minúscula. Só toca em janela já corrompida. Devolve quantas."""
+    found = []
+
+    def visit(hwnd, _):
+        buffer = ctypes.create_unicode_buffer(80)
+        user32.GetClassNameW(hwnd, buffer, 80)
+        if buffer.value == TERMINAL_CLASS and user32.IsWindowVisible(hwnd):
+            found.append(hwnd)
+        return True
+    user32.EnumWindows(ENUM_PROC(visit), 0)
+    return sum(repair_placement(hwnd) for hwnd in found)
+
+
 def minimize(hwnd: int) -> None:
-    """Minimiza sem ativar (a janela fica na barra de tarefas)."""
-    user32.ShowWindow(hwnd, SW_SHOWMINNOACTIVE)
+    """Minimiza sem ativar (a janela fica na barra de tarefas). Pelo placement e com o retângulo normal conferido: um
+    ShowWindow repetido enquanto o Windows Terminal se restaura gravava o retângulo de minimizada como o normal."""
+    placement = get_placement(hwnd)
+    rect = placement.rcNormalPosition
+    available = monitors()
+    usable = rect_usable((rect.left, rect.top, rect.right, rect.bottom), available)
+    set_placement(hwnd, SW_SHOWMINNOACTIVE, None if usable else default_rect(available))
 
 
 def place_behind(hwnd: int, other: int) -> None:
@@ -157,6 +234,7 @@ def keep_behind(open_window: Callable[[], object], title: str, other_monitor: bo
     frente. Não achar a janela não é erro da sessão (ela abriu); o resultado diz isso."""
     previous = foreground()
     shown = on_screen() if minimized else set()
+    heal_terminal_windows()
     result = open_window()
     report = {"previous": previous, "window": None, "restored": False, "moved": False, "minimized": False,
               "result": result}
@@ -183,6 +261,7 @@ def keep_behind(open_window: Callable[[], object], title: str, other_monitor: bo
     if minimized and not hide and watch_focus:
         place_behind(window, previous)
     if not watch_focus and not hide:
+        report["repaired"] = repair_placement(window)
         return report
     end = time.monotonic() + settle
     while time.monotonic() < end:
@@ -191,6 +270,7 @@ def keep_behind(open_window: Callable[[], object], title: str, other_monitor: bo
         if hide and not is_minimized(window):
             minimize(window)
         time.sleep(0.01 if hide else 0.05)
+    report["repaired"] = repair_placement(window)
     return report
 
 

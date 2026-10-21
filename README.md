@@ -7,7 +7,7 @@ ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **Omni
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.18, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.19, Windows 10/11.
 
 ## Requisitos
 
@@ -198,6 +198,11 @@ se o Terminal a reabrir nos primeiros segundos) e devolve o foco do teclado a qu
 de tarefas até o usuário abri-la. Se a janela das sessões já estava à vista (outra aba aberta antes), ela não é
 minimizada: só volta para trás de quem estava na frente. Pela interface, ou com `background=False`, a sessão abre na
 frente como antes.
+
+A minimização grava o retângulo normal da janela junto (`SetWindowPlacement`) e confere se ele é são. Antes, o
+`ShowWindow` repetido enquanto o Terminal se restaurava deixava a janela em -32000 com 480x103: ela não restaurava nem
+maximizava e as abas (Codex ou Claude) nasciam com 48x2. Janela do Terminal já nesse estado é consertada antes de
+abrir a aba (`focus.heal_terminal_windows`) e depois dela (`focus.repair_placement`).
 
 ```python
 from desktop import start_session
