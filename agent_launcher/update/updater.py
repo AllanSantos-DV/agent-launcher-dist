@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -116,10 +117,32 @@ def download(meta: dict, folder: Path, timeout: float = 60) -> Path:
     return package
 
 
+def interpreter(root: Path, windowless: bool = False) -> Path:
+    """Python que roda o instalador/atualizador: o da venv da instalação se ele de fato executa (o pyvenv.cfg aponta para
+    um Python base que ainda existe); senão o que está rodando agora ou o `python` do PATH. Nunca um caminho gravado."""
+    scripts = Path(root) / ".venv" / "Scripts"
+    python = scripts / ("pythonw.exe" if windowless else "python.exe")
+    try:
+        config = (Path(root) / ".venv" / "pyvenv.cfg").read_text(encoding="utf-8")
+        home = next(line.split("=", 1)[1].strip() for line in config.splitlines() if line.split("=", 1)[0].strip() == "home")
+        base_ok = (Path(home) / "python.exe").is_file()
+    except (OSError, StopIteration):
+        base_ok = False
+    if python.is_file() and base_ok:
+        return python
+    running = Path(sys.executable)
+    if running.is_file() and not running.is_relative_to(Path(root) / ".venv"):
+        return running
+    found = shutil.which("python")
+    if found:
+        return Path(found)
+    raise UpdateError("Nenhum Python utilizável: a venv da instalação perdeu o Python de origem e não há `python` no PATH. "
+                      "Reinstale com: " + UPDATE_COMMAND)
+
+
 def apply(package: Path, root: Path = ROOT, timeout: float = 900) -> None:
     """Roda o instalador da versão nova sobre esta instalação (sem atalhos, Terminal nem CLIs: já existem)."""
-    python = Path(root) / ".venv" / "Scripts" / "python.exe"
-    command = [str(python if python.is_file() else Path(sys.executable)), str(Path(package) / "install.py"),
+    command = [str(interpreter(root)), str(Path(package) / "install.py"),
                "--target", str(root), "--skip-tests", "--no-shortcuts", "--no-terminal", "--no-clis"]
     result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -194,8 +217,12 @@ def check_in_background(root: Path = ROOT, enabled: bool = True, stamp: Path | N
         pass
     stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.touch()
-    python = Path(root) / ".venv" / "Scripts" / "pythonw.exe"
-    spawn([str(python if python.is_file() else Path(sys.executable)), str(Path(root) / "updater.py"), "--background"],
+    try:
+        python = interpreter(root, windowless=True)
+    except UpdateError as error:
+        record(f"Atualização em segundo plano não disparada: {error}")
+        return False
+    spawn([str(python), str(Path(root) / "updater.py"), "--background"],
           cwd=root, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0))
     return True

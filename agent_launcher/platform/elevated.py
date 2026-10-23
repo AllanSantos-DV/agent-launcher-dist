@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import html
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -118,9 +120,16 @@ def current_user() -> str:
     return output.strip()
 
 
-def background_python() -> Path:
-    python = Path(sys.executable)
-    return python.with_name("pythonw.exe") if python.with_name("pythonw.exe").is_file() else python
+def task_action(system_root: str | None = None) -> tuple[str, str]:
+    """(comando, argumentos) que a tarefa grava, resolvidos agora e sem caminho de Python fixo: o `pyw.exe` do launcher
+    `py` (em %SystemRoot%, só administrador grava) escolhe o Python instalado a cada disparo, então mover ou trocar o
+    Python não quebra a tarefa. Sem o launcher, cai no pythonw do Python base (nunca o da venv, que o usuário grava)."""
+    launcher = Path(system_root or os.environ.get("SystemRoot") or r"C:\Windows") / "pyw.exe"
+    if launcher.is_file():
+        return str(launcher), "-3 -I"
+    base = Path(getattr(sys, "_base_executable", sys.executable))
+    windowless = base.with_name("pythonw.exe")
+    return str(windowless if windowless.is_file() else base), "-I"
 
 
 def secure(folder: Path) -> None:
@@ -156,7 +165,8 @@ def apply(home: Path, mark: set[str], unmark: set[str], folder: Path | None = No
             import tempfile
             with tempfile.TemporaryDirectory(prefix="agent-launcher-task-", dir=str(folder)) as work:
                 xml = Path(work) / "task.xml"
-                xml.write_text(task_xml(current_user(), str(background_python()), f'-I "{runner}"'), encoding="utf-16")
+                command, flags = task_action()
+                xml.write_text(task_xml(current_user(), command, f'{flags} "{runner}"'), encoding="utf-16")
                 result = subprocess.run(["schtasks.exe", "/create", "/tn", TASK, "/xml", str(xml), "/f"],
                                         capture_output=True, text=True, creationflags=NO_WINDOW)
             if result.returncode:
@@ -277,11 +287,31 @@ def session_note(project: dict) -> str | None:
     return SESSION_NOTE.format(python=f'"{python}"', launcher=f'"{ROOT / "launcher.py"}"')
 
 
+def task_command(run=subprocess.run) -> str | None:
+    """O executável que a tarefa instalada dispara (None se não existe ou o XML não pôde ser lido)."""
+    result = run(["schtasks.exe", "/query", "/tn", TASK, "/xml"], capture_output=True, creationflags=NO_WINDOW)
+    if result.returncode:
+        return None
+    raw = result.stdout
+    text = raw.decode("utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8", "replace") if isinstance(raw, bytes) else raw
+    found = re.search(r"<Command>([^<]*)</Command>", text)
+    return html.unescape(found.group(1)).strip() if found else None
+
+
+def stale_task(run=subprocess.run) -> str | None:
+    """Motivo se a tarefa instalada aponta para um executável que não existe mais (Python movido ou removido)."""
+    command = task_command(run)
+    if command and not Path(os.path.expandvars(command.strip('"'))).is_file():
+        return (f"a tarefa {TASK} aponta para {command}, que não existe mais; rode 'launcher elevated enable' "
+                "(um clique de UAC) para regravá-la")
+    return None
+
+
 def status(store: Store) -> dict:
     task = subprocess.run(["schtasks.exe", "/query", "/tn", TASK], capture_output=True, text=True,
                           creationflags=NO_WINDOW)
     data = listed()
-    return {"task": task.returncode == 0, "admin_now": is_admin(), "folder": str(protected_dir()),
+    return {"task": task.returncode == 0, "task_stale": stale_task() if task.returncode == 0 else None, "admin_now": is_admin(), "folder": str(protected_dir()),
             "projects": [item["name"] for item in data.get("projects", []) if isinstance(item, dict)],
             "stale": [item["name"] for item in data.get("projects", []) if isinstance(item, dict)
                       and not any(project["id"] == item.get("id") and is_marked(project) for project in store.projects)]}

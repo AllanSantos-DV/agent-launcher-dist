@@ -185,9 +185,25 @@ def run_tests(python, root):
     return tests.returncode == 0
 
 
-def install_dependencies(target, python):
+def healthy(python) -> bool:
+    """O Python da venv roda? A venv guarda só um redirecionador para o Python base (pyvenv.cfg): se o base foi movido
+    ou removido, o python.exe continua no disco e não executa."""
     if not python.is_file():
-        print("Criando ambiente virtual…")
+        return False
+    try:
+        return subprocess.run([str(python), "-c", "import sys"], capture_output=True, timeout=60,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def install_dependencies(target, python):
+    if not healthy(python):
+        if python.is_file():
+            print("Ambiente virtual quebrado (o Python de origem sumiu ou mudou de lugar); recriando…")
+            shutil.rmtree(target / ".venv")
+        else:
+            print("Criando ambiente virtual…")
         venv.create(target / ".venv", with_pip=True)
     subprocess.run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "-q", "-r",
                     str(target / "requirements.txt")], check=True)
@@ -303,7 +319,7 @@ def main():
     python, pythonw = python_paths(target)
     if args.skip_tests:
         print("Testes pulados por --skip-tests.")
-    elif not run_tests(python if python.is_file() else Path(sys.executable), SOURCE):
+    elif not run_tests(python if healthy(python) else Path(sys.executable), SOURCE):
         raise SystemExit("Testes falharam; instalação abortada sem tocar na versão instalada.")
     files = source_files()
     previous = read_manifest(target)
@@ -319,7 +335,7 @@ def main():
         print(f"Arquivos alterados: {len(changed)}; removidos por obsolescência: {len(removed)}")
         if not args.skip_deps:
             install_dependencies(target, python)
-        interpreter = python if python.is_file() else Path(sys.executable)
+        interpreter = python if healthy(python) else Path(sys.executable)
         imports = "import core, catalog, connectors, desktop, launcher" + ("" if args.skip_deps else ", gui")
         compiled = subprocess.run([str(interpreter), "-c", imports], cwd=target,
                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
