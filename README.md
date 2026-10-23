@@ -1,13 +1,14 @@
 # Agent Launcher
 
-Abre **Claude Code** e **Codex** nos seus projetos usando o provedor de modelos que você escolher: um proxy LiteLLM
-ou host próprio (inclusive por túnel/VPN), roteadores como **9router**, **OmniRoute** e **OpenRouter**, as APIs da
-**Anthropic** e da **OpenAI**, ou qualquer host compatível com Anthropic Messages ou OpenAI Responses.
+Abre **Claude Code**, **Codex** e **GitHub Copilot CLI** nos seus projetos, e configura o chat do Copilot no
+**VS Code** e o **GitHub Copilot app**, usando o provedor de modelos que você escolher: um proxy LiteLLM ou host próprio
+(inclusive por túnel/VPN), roteadores como **9router**, **OmniRoute** e **OpenRouter**, as APIs da **Anthropic** e da
+**OpenAI**, ou qualquer host compatível com Anthropic Messages, OpenAI Responses ou Chat Completions.
 
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.0.19, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.1.0, Windows 10/11.
 
 ## Requisitos
 
@@ -76,11 +77,65 @@ ou Entra ID, Store removida ou restrita, MSIX por usuário bloqueado, winget des
 `launcher terminal --install [--zip ...]` instala depois. `--no-terminal` pula a etapa.
  Remove o app e os atalhos; seus dados ficam em `~/.agent-launcher`.
 
+## Destinos
+
+| Destino | Como abre | Protocolos | Login no GitHub |
+| --- | --- | --- | --- |
+| Claude Code | aba do Windows Terminal | Anthropic Messages | — |
+| Codex | aba do Windows Terminal | OpenAI Responses | — |
+| GitHub Copilot CLI | aba do Windows Terminal | Messages (Claude), Responses (GPT-5 em diante), Chat Completions (os outros) | não precisa |
+| VS Code | janela do VS Code no perfil **Agent Launcher** | os três, pelo endpoint local | não precisa |
+| GitHub Copilot app | o app, com o provider **Agent Launcher — conexão** | Responses (GPT-5 em diante) e Chat Completions, pelo endpoint local | o app pede conta GitHub |
+
+Os três de terminal recebem a conexão só no ambiente do processo da sessão: nada é gravado na configuração deles. O
+Copilot CLI e o Copilot app não vêm no instalador; a interface oferece **Instalar** para o Copilot CLI (npm ou winget,
+por usuário). Claude Code e Codex têm sessão controlada pelo orquestrador; o Copilot CLI ainda não.
+
+**VS Code e Copilot app guardam a configuração**, então nunca recebem a chave nem o endereço real do host. Eles
+apontam para o **endpoint local** da conexão, um processo oculto do launcher que escuta só em `127.0.0.1` (porta fixa
+por conexão, a partir de 47910), descarta qualquer credencial que o destino mande, acrescenta a da conexão e repassa
+ao host com streaming. Trocar a chave ou o host no launcher vale na próxima requisição, sem mexer no destino. O endpoint
+sobe ao abrir o destino e encerra sozinho após 4 h sem uso; `launcher endpoint autostart --connection NOME` faz ele
+subir com o Windows (sem janela, sem admin), para o VS Code e o app acharem a conexão com o launcher fechado. O log
+(`~/.agent-launcher/endpoint.log`) tem rota, modelo, status e duração; nunca corpo, prompt ou chave.
+
+- **VS Code:** o launcher abre o projeto num perfil próprio, **Agent Launcher** (criado pelo VS Code na primeira
+  vez), e grava nele os modelos da conexão (`chatLanguageModels.json`, provider Custom Endpoint) e o modelo escolhido
+  como padrão do chat. O seu perfil e as suas extensões não são tocados. Escolha o modelo no chat do Copilot.
+- **Copilot app:** o launcher grava o provider **Agent Launcher — conexão** no banco do app
+  (`~/.copilot/data.db`), com backup antes, sem mexer nos seus outros providers. Se já estiver certo, não faz nada; se
+  faltar ou divergir, pergunta, fecha o app (inclusive o ícone da bandeja), grava e abre de novo. Esse banco é interno
+  e sem documentação: se o formato mudar, o launcher não grava e mostra os dados para cadastrar à mão em Settings →
+  Model providers.
+
+## Perfis
+
+Para quem atende clientes diferentes, cada um com a sua LLM autorizada: **perfis** separam projetos e conexões. No
+topo da interface, escolha o perfil ou **Novo perfil…**; trocar mostra só os projetos e as conexões dele. As chaves de
+cada perfil ficam num arquivo próprio. Quem não cria perfil continua no **Padrão**, sem nada diferente.
+
+- A sessão abre com o perfil do projeto; fora do Padrão, o nome do perfil aparece no título da aba e no nome do
+  provider no VS Code e no Copilot app (`Agent Launcher — Cliente A — Minha conexão`).
+- A mesma pasta em dois perfis é permitida, com aviso: os CLIs guardam o histórico por pasta, então **Retomar
+  última** usa só as conversas abertas neste perfil (a interface avisa, sem perguntar).
+- Conectores do usuário (`~/.agent-launcher/connectors`) valem para todos os perfis.
+- **Importar perfil…** (ou duplo clique num arquivo `.alprofile`) cria o perfil pronto, com conexões e conectores;
+  **Exportar perfil…** gera esse arquivo. O arquivo nunca leva chave: se a conexão pede uma, o launcher pergunta.
+- **Remover perfil** (ou conexão) oferece tirar também o provider do Copilot app e do VS Code e parar o endpoint local.
+- **Uso do mês…**: tokens e custo estimado por destino e modelo, lidos das conversas e do endpoint deste perfil.
+  É estimativa local; o custo usa o preço que o host informa no catálogo.
+- Fora do Padrão, a aba do Terminal usa a cor do perfil.
+- Modo texto: `launcher profiles [list|add NOME|rename|remove|use|import ARQUIVO|export REF ARQUIVO]`,
+  `launcher usage [--month AAAA-MM]` e `launcher --profile NOME <comando>`.
+- Os perfis extras ficam em `~/.agent-launcher/profiles/<id>/`; o orquestrador lista e abre projetos de todos.
+
 ## Conexões
 
 Na interface, use **Gerenciar conexões** → **Adicionar**, escolha o tipo e preencha os campos. **Testar e salvar**
 consulta a lista de modelos antes de gravar: conexão que não responde não é salva. Pode haver várias conexões; cada
 projeto lembra a última conexão, o CLI e o modelo usados.
+Conexão usada pelo VS Code ou pelo Copilot app mostra o endpoint local dela: porta, rodando ou parado, requisições,
+**Iniciar/Parar** e **Iniciar com o Windows**.
 
 | Conector | Claude Code | Codex | Modelos | Contexto |
 | --- | --- | --- | --- | --- |
@@ -98,6 +153,12 @@ Anthropic) têm a opção **Tool search de MCP no Claude Code**: fora da Anthrop
 ferramentas MCP de uma vez, e com a opção ligada elas passam a carregar sob demanda (`ENABLE_TOOL_SEARCH=true`), com
 bem menos contexto. Só ligue se o host suportar `tool_reference`; sem esse suporte as requisições falham. O teste da
 conexão do 9router também confere a chave (o `/v1/models` dele responde sem chave).
+
+A conexão LiteLLM (e conectores que a embrulham) tem o campo opcional **Nome da chave no host**: num host que guarda
+a chave de vários clientes, cada conexão (ou perfil por cliente) informa o nome com que a chave foi registrada, e todas
+as URLs da conexão passam a ir para `{endereço}/k/<nome>/...` (catálogo, teste e os destinos de cada CLI). Antes de
+usar o nome, o launcher exige que o `/healthz` do host anuncie `"key_routing": true`; host que não separa chaves é
+recusado em vez de usar a chave padrão. Vazio, nada muda.
 
 Modelos de imagem, áudio, embeddings e os que o host declara sem ferramentas não entram nas listas. Para hosts que não
 listam tudo, os conectores compatíveis aceitam **Modelos extras** (IDs separados por vírgula).
@@ -118,8 +179,10 @@ forma oculta.
 ## Sessões
 
 Selecione projeto, conexão, CLI e modelo; **Nova sessão** ou **Retomar última**. **Retomar última** só fica habilitado
-quando há conversa daquele CLI na pasta: as do terminal e do app contam; as de `claude -p` e do SDK não, porque o
-`--continue` as ignora. Sem conversa anterior (inclusive numa sessão aberta pelo orquestrador), a retomada vira
+quando há conversa daquele CLI na pasta, conferida ao selecionar o projeto: as do terminal e do app contam; as de
+`claude -p`, do SDK e do `codex exec` não, porque o `--continue` e o `codex resume --last` as ignoram. A seta ao lado abre **Escolher conversa…**: a lista das
+conversas do projeto (data, título, mensagens) para retomar qualquer uma, não só a última. Em modo texto:
+`launcher conversations --project X` e `launch --resume --conversation ID`. Sem conversa anterior (inclusive numa sessão aberta pelo orquestrador), a retomada vira
 sessão nova, com um aviso na janela, em vez de parar em "No conversation found to continue". Com o Windows Terminal instalado, cada sessão vira
 uma aba da janela **agent-launcher** (laranja para Claude Code, verde para Codex), com o título
 **Projeto — Claude Code/Codex**; sem ele, cada sessão abre num console próprio. A sessão confere a conexão antes de iniciar. Fechar o launcher não encerra as
@@ -246,7 +309,7 @@ launcher keys --list
 
 | Parâmetro | Significado |
 | --- | --- |
-| `TECLA` | `enter esc up down left right tab shift+tab space backspace ctrl+c home end pageup pagedown delete`, um caractere (`1`, `y`) ou `text:ALGO` (digita ALGO). Enviadas em ordem. |
+| `TECLA` | `enter esc up down left right tab shift+tab space backspace ctrl+c home end pageup pagedown delete`, um caractere (`1`, `y`) ou `text:ALGO` (cola ALGO de uma vez, entre os marcadores de colagem, sem tocar na área de transferência; 20 mil caracteres em poucos segundos; a linha de comando do Windows limita o texto a cerca de 30 mil caracteres). Enviadas em ordem; o `enter` que vem depois do `text:` é uma tecla à parte. |
 | `--project` | Nome, ID ou caminho do projeto da sessão. `--cli` desempata Claude e Codex. |
 | `--pid` | pid da janela da sessão (de `--list`); dispensa `--project`. |
 | `--screen` | Imprime o que a sessão mostra agora (antes das teclas, se houver), para decidir o que enviar. |
@@ -264,7 +327,7 @@ launcher keys --pid 4242 esc                               # dispensar
 ```
 
 Em Python: `keys.sessions()`, `keys.resolve(ids_do_projeto, cli, pid)`, `keys.send(pid, tokens)`,
-`keys.read_screen(pid)`. Como e por quê: `docs/research/teclas-em-sessao.md`.
+`keys.read_screen(pid)`.
 
 **Monitor das sessões:** `launcher preferences --sessions-monitor other` leva as sessões em segundo plano para o
 monitor que não tem a janela marcada (ou para um não principal, sem janela marcada), se houver mais de um.
@@ -310,6 +373,11 @@ Para um host diferente, implemente as três funções: `targets(options)` devolv
 `verify(options)` levanta `connectors.ConnectorError` com um motivo acionável; `models(options)` devolve
 `(lista de catalog.ModelInfo, contexto_confirmado)`. O contrato completo está em `connectors/__init__.py`.
 
+Para um host com várias chaves, `connectors._http` traz o campo pronto `KEY_NAME` (ponha em
+`FIELDS`), `with_key_name(url, options)` (acrescenta `/k/<nome>` à raiz quando há `key_name`) e
+`require_key_routing(raiz_com_prefixo, headers)` (exige `key_routing: true` no `/healthz`). Quem embrulha o conector
+`litellm` só precisa repassar `key_name` nas opções: ele já aplica o prefixo e a checagem.
+
 ## Comandos
 
 O modo texto fica em `%LOCALAPPDATA%\Programs\AgentLauncher\launcher.cmd`; nos exemplos, `launcher` é esse
@@ -324,6 +392,10 @@ launcher projects import "C:\caminho\config.json"   # só nomes e caminhos
 launcher models --connection OpenRouter --cli claude --search sonnet --refresh
 launcher launch --project "Meu app" --connection OpenRouter --cli codex --model "openai/gpt-6" --dry-run
 launcher launch --project "Meu app" --resume
+launcher launch --project "Meu app" --cli copilot --model "vertex_ai.anthropic.claude-sonnet-5-5"
+launcher launch --project "Meu app" --cli vscode --model "azure.gpt-5.4-mini"   # ou --cli copilot_app
+launcher endpoint                # endpoint local de cada conexão (start, stop, autostart [--off])
+launcher cli --install copilot   # Copilot CLI por usuário (npm ou winget)
 launcher update                # atualiza agora pelo npm (--check só consulta)
 launcher topmost on --title "Jarvis"   # janela sempre por cima (off, resume, status)
 launcher front "C:\docs\relatorio.pdf" # abrir por cima, a pedido do usuário
@@ -350,6 +422,10 @@ launcher preferences --sessions-monitor other   # sessões em segundo plano no o
 - A abertura dos CLIs usa argumentos separados, sem `cmd /c` nem scripts temporários. Wrappers `.cmd` desconhecidos
   são recusados em vez de executados.
 - Remover um projeto apaga só o cadastro, nunca a pasta.
+- `~/.agent-launcher/endpoints.json`: porta fixa de cada endpoint local. O endpoint escuta só em `127.0.0.1`; qualquer
+  programa seu pode usá-lo enquanto ele roda, do mesmo jeito que pode ler as chaves cifradas para o seu usuário.
+- `~/.agent-launcher/harnesses/`: adaptadores de destino do usuário (um `.py` com `HARNESS`), no mesmo modelo dos
+  conectores.
 
 ## Licença
 

@@ -2,7 +2,7 @@
 
 O endereço termina onde a API começa, como o base_url do SDK da OpenAI (normalmente em /v1).
 """
-from connectors._http import EXTRA_MODELS, gateway
+from agent_launcher.connectors._http import EXTRA_MODELS, gateway
 
 NAME = "openai_compatible"
 LABEL = "Compatível com OpenAI"

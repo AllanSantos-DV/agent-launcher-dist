@@ -30,6 +30,10 @@ BLOCKED = {"__pycache__", ".git", ".github", ".claude", ".vscode", ".memory", ".
            "AGENTS.md", "CLAUDE.md", "install.py", "package.json", ".gitignore", ".gitattributes", MANIFEST}
 MIN_PYTHON = (3, 10)
 SHORTCUT = f"{APP_NAME}.lnk"
+# Pacote de perfil (.alprofile): associação por usuário, sem admin.
+CLASSES = r"Software\Classes"
+FILE_EXTENSION = ".alprofile"
+FILE_TYPE = "AgentLauncher.Profile"
 # Caminhos passados por variável de ambiente: nada do usuário é interpolado no script PowerShell.
 # System.AppUserModel.ID no atalho: o mesmo id que o app declara ao abrir (gui.create_application). Assim a barra de
 # tarefas mostra o ícone do Agent Launcher, e fixar o app fixa o atalho (não o pythonw.exe). WScript.Shell não grava
@@ -203,10 +207,73 @@ def create_shortcuts(target, pythonw):
                             "AL_APPID": APP_USER_MODEL_ID, "AL_TYPE": _APP_ID_TYPE})
 
 
+class WindowsRegistry:
+    """HKEY_CURRENT_USER pelo winreg (sem admin). Os testes passam um registro falso com a mesma interface."""
+
+    def set(self, path: str, name: str, value: str) -> None:
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+
+    def get(self, path: str, name: str = "") -> str | None:
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
+                return winreg.QueryValueEx(key, name)[0]
+        except OSError:
+            return None
+
+    def delete_tree(self, path: str) -> None:
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_ALL_ACCESS) as key:
+                while True:
+                    try:
+                        child = winreg.EnumKey(key, 0)
+                    except OSError:
+                        break
+                    self.delete_tree(f"{path}\\{child}")
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
+        except FileNotFoundError:
+            pass
+
+    def notify(self) -> None:
+        """Avisa o Explorer (SHChangeNotify SHCNE_ASSOCCHANGED) para o ícone e o duplo clique valerem já."""
+        try:
+            import ctypes
+            ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
+        except (AttributeError, OSError):
+            pass
+
+
+def register_file_type(target, pythonw, registry=None):
+    """Duplo clique num .alprofile abre o launcher e importa o perfil (HKCU\\Software\\Classes, só deste usuário)."""
+    registry = registry or WindowsRegistry()
+    registry.set(f"{CLASSES}\\{FILE_EXTENSION}", "", FILE_TYPE)
+    registry.set(f"{CLASSES}\\{FILE_TYPE}", "", f"Perfil do {APP_NAME}")
+    registry.set(f"{CLASSES}\\{FILE_TYPE}\\DefaultIcon", "", f'"{target / "assets" / "launcher.ico"}"')
+    registry.set(f"{CLASSES}\\{FILE_TYPE}\\shell\\open\\command", "",
+                 f'"{pythonw}" "{target / "launcher.pyw"}" --import "%1"')
+    registry.notify()
+
+
+def unregister_file_type(registry=None):
+    """Tira a associação, mas só a nossa: .alprofile apontando para outro tipo fica como está."""
+    registry = registry or WindowsRegistry()
+    if registry.get(f"{CLASSES}\\{FILE_EXTENSION}") == FILE_TYPE:
+        registry.delete_tree(f"{CLASSES}\\{FILE_EXTENSION}")
+    registry.delete_tree(f"{CLASSES}\\{FILE_TYPE}")
+    registry.notify()
+
+
 def uninstall(target):
     if not (target / MANIFEST).is_file():
         raise SystemExit(f"{target} não contém uma instalação do {APP_NAME} (sem {MANIFEST}); nada foi removido.")
     powershell(_REMOVE_SHORTCUTS, {"AL_NAME": SHORTCUT})
+    try:
+        unregister_file_type()
+    except OSError as error:
+        print(f"Aviso: associação do arquivo {FILE_EXTENSION} não removida ({error}).", file=sys.stderr)
     shutil.rmtree(target)
     print(f"{APP_NAME} removido de {target}. Seus dados continuam em {data_home()}; apague a pasta se não quiser mantê-los.")
 
@@ -220,6 +287,8 @@ def main():
     parser.add_argument("--skip-tests", action="store_true", help="instala sem rodar tests/run.py (só emergência)")
     parser.add_argument("--skip-deps", action="store_true", help="não cria o ambiente virtual nem roda pip")
     parser.add_argument("--no-shortcuts", action="store_true", help="não cria atalhos no Menu Iniciar e na Área de Trabalho")
+    parser.add_argument("--no-file-association", action="store_true",
+                        help=f"não associa os arquivos {FILE_EXTENSION} (perfil) ao launcher")
     parser.add_argument("--no-terminal", action="store_true", help="não instala o Windows Terminal quando ele falta")
     parser.add_argument("--no-clis", action="store_true", help="não instala Claude Code e Codex quando faltam")
     parser.add_argument("--terminal-zip", type=Path,
@@ -260,6 +329,9 @@ def main():
             if not pythonw.is_file():
                 raise RuntimeError("atalhos exigem o ambiente virtual (não use --skip-deps junto com atalhos)")
             create_shortcuts(target, pythonw)
+        # Independente dos atalhos: a atualização automática roda com --no-shortcuts e também precisa do duplo clique.
+        if not (args.no_file_association or os.environ.get("AGENT_LAUNCHER_NO_FILE_ASSOCIATION")) and pythonw.is_file():
+            register_file_type(target, pythonw)
     except BaseException as exc:
         print(f"Falha: {exc}. Restaurando a versão anterior.", file=sys.stderr)
         try:
@@ -278,7 +350,7 @@ def main():
         terminal.ensure(target, args.terminal_zip.resolve() if args.terminal_zip else None)
     if not args.no_clis:
         # Instaladores oficiais por usuário; como o Terminal, a falha avisa e não desfaz a instalação do launcher.
-        for cli in clis.NAMES:
+        for cli in ("claude", "codex"):  # os outros destinos (Copilot CLI, VS Code...) são opcionais: pela interface
             clis.ensure(cli)
     print(f"{APP_NAME} pronto." + ("" if args.no_shortcuts else f" Abra pelo atalho '{APP_NAME}' no Menu Iniciar ou na Área de Trabalho."))
 

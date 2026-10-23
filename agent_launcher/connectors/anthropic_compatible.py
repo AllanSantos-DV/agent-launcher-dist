@@ -2,7 +2,7 @@
 
 A lista vem de {endereço}/v1/models no formato {"data": [{"id": ...}]}; hosts que não listam usam "Modelos extras".
 """
-from connectors._http import EXTRA_MODELS, TOOL_SEARCH, gateway
+from agent_launcher.connectors._http import EXTRA_MODELS, TOOL_SEARCH, gateway
 
 NAME = "anthropic_compatible"
 LABEL = "Compatível com Anthropic"
@@ -17,4 +17,4 @@ FIELDS = (
     TOOL_SEARCH,
     EXTRA_MODELS,
 )
-targets, verify, models = gateway(EXAMPLE, codex=None, listing_optional=True)
+targets, verify, models = gateway(EXAMPLE, codex=None, chat=None, listing_optional=True)

@@ -3,21 +3,26 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import urllib.error
+import re
 import urllib.parse
-import urllib.request
 
-from catalog import MODEL_PATTERN, ModelInfo, base_model, positive_integer
-from connectors import ConnectorError
+from agent_launcher.domain.catalog import MODEL_PATTERN, ModelInfo, base_model, positive_integer
+from agent_launcher.connectors import ConnectorError
 
 LIMIT = 16 * 1024 * 1024
 NO_KEY = "agent-launcher-no-key"
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, response, code, message, headers, new_url):
-        raise ConnectorError(f"O host tentou redirecionar para {new_url}. Conexão interrompida para não vazar a chave; "
-                             "use o endereço final.")
+def _no_redirect():
+    # urllib.request (http.client, email, ssl) só carrega quando há rede de fato: a janela da sessão não paga por ele
+    #.
+    import urllib.request
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, response, code, message, headers, new_url):
+            raise ConnectorError(f"O host tentou redirecionar para {new_url}. Conexão interrompida para não vazar a "
+                                 "chave; use o endereço final.")
+    return NoRedirect()
 
 
 def base_url(value: object, example: str) -> str:
@@ -39,13 +44,16 @@ def is_local_host(host: str) -> bool:
 
 def _opener(url: str):
     # Host local/privado (loopback, LAN, VPN) nunca passa pelo proxy HTTP corporativo; hosts públicos usam o do sistema.
-    handlers = [_NoRedirect()]
+    import urllib.request
+    handlers = [_no_redirect()]
     if is_local_host(urllib.parse.urlparse(url).hostname or ""):
         handlers.append(urllib.request.ProxyHandler({}))
     return urllib.request.build_opener(*handlers)
 
 
 def get_json(url: str, headers: dict | None = None, timeout: float = 15) -> dict:
+    import urllib.error
+    import urllib.request
     request = urllib.request.Request(url, headers={"Accept": "application/json", **(headers or {})})
     try:
         with _opener(url).open(request, timeout=timeout) as response:
@@ -56,10 +64,13 @@ def get_json(url: str, headers: dict | None = None, timeout: float = 15) -> dict
     except urllib.error.HTTPError as error:
         error.close()
         if error.code in (401, 403):
-            raise ConnectorError(f"O host recusou a chave (HTTP {error.code}) em {url}.") from None
-        if error.code == 404:
-            raise ConnectorError(f"{url} não existe (HTTP 404). Confira o endereço base da conexão.") from None
-        raise ConnectorError(f"{url} respondeu HTTP {error.code}.") from None
+            failure = ConnectorError(f"O host recusou a chave (HTTP {error.code}) em {url}.")
+        elif error.code == 404:
+            failure = ConnectorError(f"{url} não existe (HTTP 404). Confira o endereço base da conexão.")
+        else:
+            failure = ConnectorError(f"{url} respondeu HTTP {error.code}.")
+        failure.status = error.code  # require_key_routing distingue 403/404 sem depender do texto
+        raise failure from None
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
         raise ConnectorError(f"Sem resposta de {url}: {getattr(error, 'reason', error)}") from None
     except (ValueError, UnicodeError):
@@ -72,6 +83,8 @@ def get_json(url: str, headers: dict | None = None, timeout: float = 15) -> dict
 def auth_probe(url: str, headers: dict, timeout: float = 15) -> None:
     """Confere a chave com um POST de corpo vazio: o host autentica antes de validar o corpo, então 401/403 é chave
     recusada e qualquer outro status (400 "Missing model"...) é chave aceita, sem gerar nenhuma resposta de modelo."""
+    import urllib.error
+    import urllib.request
     request = urllib.request.Request(url, data=b"{}", headers={"Content-Type": "application/json", **headers},
                                      method="POST")
     try:
@@ -153,12 +166,58 @@ EXTRA_MODELS = {"name": "extra_models", "label": "Modelos extras",
                 "placeholder": "id-1, id-2", "hint": "IDs separados por vírgula para hosts que não listam todos os modelos."}
 
 
-def gateway(example: str, *, claude: str | None = "", codex: str | None = "/v1", models_path: str = "/v1/models",
-            any_model: bool = True, claude_auth: str = "bearer", key_required: bool = False, headers=None,
-            page_limit: int | None = None, listing_optional: bool = False):
-    """targets/verify/models de um host HTTP. `claude`/`codex` são sufixos sobre o endereço (None = CLI não atendido).
+KEY_NAME = {"name": "key_name", "label": "Nome da chave no host",
+            "placeholder": "meu-cliente",
+            "hint": "Opcional: para hosts que guardam várias chaves, o nome com que a chave foi registrada lá (um "
+                    "perfil por cliente no mesmo host). Vazio usa a chave padrão. Letras, números, ponto, hífen e "
+                    "sublinhado (até 64)."}
+KEY_NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
+NO_KEY_ROUTING = ("Este host ainda não separa chaves por nome; atualize-o ou deixe o nome da chave vazio.")
+
+
+def key_name(options: dict) -> str:
+    """Nome da chave no host, validado; "" quando a conexão não usa roteamento de chave."""
+    name = str(options.get("key_name") or "").strip()
+    if name and not KEY_NAME_PATTERN.fullmatch(name):
+        raise ConnectorError(f"Nome da chave inválido: {name!r}. Use só letras, números, ponto, hífen e sublinhado "
+                             "(até 64 caracteres), igual ao registrado no host.")
+    return name
+
+
+def with_key_name(url: str, options: dict) -> str:
+    """Acrescenta /k/<nome> à raiz quando a conexão tem key_name; sem ele, devolve a URL intacta."""
+    name = key_name(options)
+    return f"{url.rstrip('/')}/k/{name}" if name else url
+
+
+def require_key_routing(root_url: str, headers: dict | None = None, timeout: float = 5) -> None:
+    """GET {root_url}/healthz (root_url já com /k/<nome>) e exige key_routing: true. Um host que não separa chaves
+    ignoraria o prefixo e usaria a chave padrão para o cliente errado: conexão recusada."""
+    address = root_url.rstrip("/") + "/healthz"
+    try:
+        health = get_json(address, headers, timeout)
+    except ConnectorError as error:
+        status = getattr(error, "status", None)
+        if status == 404:
+            raise ConnectorError(NO_KEY_ROUTING) from None
+        if status == 403 and "/k/" in address:
+            name = address.rsplit("/k/", 1)[1].split("/", 1)[0]
+            raise ConnectorError(f"O host não tem chave registrada com o nome {name!r} (HTTP 403). Confira o "
+                                 "nome da chave ou registre-o no host.") from None
+        raise
+    if health.get("key_routing") is not True:
+        raise ConnectorError(NO_KEY_ROUTING)
+
+
+def gateway(example: str, *, claude: str | None = "", codex: str | None = "/v1", chat: str | None = "same",
+            models_path: str = "/v1/models", any_model: bool = True, claude_auth: str = "bearer", key_required: bool = False,
+            headers=None, page_limit: int | None = None, listing_optional: bool = False):
+    """targets/verify/models de um host HTTP. `claude` (Anthropic Messages), `codex` (OpenAI Responses) e `chat`
+    (OpenAI Chat Completions) são sufixos sobre o endereço; None = protocolo não servido. `chat="same"` (padrão) usa a
+    mesma base do Responses: hosts OpenAI-compatíveis servem /chat/completions ao lado de /responses.
     `headers(options)` substitui o Bearer padrão; `page_limit` ativa a paginação after_id/has_more da Anthropic.
     `listing_optional`: host sem /models funciona só com os "Modelos extras" digitados (a falha vira erro sem eles)."""
+    chat = codex if chat == "same" else chat
 
     def url(options):
         return base_url(options.get("base_url") or example, example)
@@ -175,8 +234,10 @@ def gateway(example: str, *, claude: str | None = "", codex: str | None = "/v1",
 
     def targets(options):
         root = url(options)
-        return {"claude": None if claude is None else root + claude, "codex": None if codex is None else root + codex,
-                "any_model": any_model, "claude_auth": "api_key" if options.get("x_api_key") else claude_auth}
+        return {"messages": None if claude is None else root + claude,
+                "responses": None if codex is None else root + codex,
+                "chat_completions": None if chat is None else root + chat,
+                "any_model": any_model, "messages_auth": "api_key" if options.get("x_api_key") else claude_auth}
 
     def fetch(options, timeout=15):
         address = url(options) + models_path

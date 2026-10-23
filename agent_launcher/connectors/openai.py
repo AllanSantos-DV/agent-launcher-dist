@@ -1,7 +1,7 @@
 """API da OpenAI direto: só Codex, via Responses em https://api.openai.com/v1. /v1/models não informa contexto;
 o Codex usa os metadados nativos dele para os modelos OpenAI.
 """
-from connectors._http import gateway
+from agent_launcher.connectors._http import gateway
 
 NAME = "openai"
 LABEL = "OpenAI API"

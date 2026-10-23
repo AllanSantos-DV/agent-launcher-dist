@@ -4,7 +4,7 @@ Porta padrão 20128; /v1/models responde sem chave e traz capabilities.contextWi
 As rotas de inferência exigem a chave criada no painel do 9router; como /v1/models não confere a chave, o teste da
 conexão faz um POST vazio em /v1/messages (401 = chave recusada; 400 "Missing model" = chave aceita, nada gerado).
 """
-from connectors._http import TOOL_SEARCH, auth_probe, base_url, bearer, gateway
+from agent_launcher.connectors._http import TOOL_SEARCH, auth_probe, base_url, bearer, gateway
 
 NAME = "9router"
 LABEL = "9router"

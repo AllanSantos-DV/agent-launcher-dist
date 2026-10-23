@@ -3,7 +3,7 @@
 Porta padrão 20128 (a mesma do 9router: não rode os dois na mesma porta). A chave é opcional enquanto
 REQUIRE_API_KEY=false no OmniRoute; /v1/models traz context_length, max_input_tokens e max_output_tokens.
 """
-from connectors._http import TOOL_SEARCH, gateway
+from agent_launcher.connectors._http import TOOL_SEARCH, gateway
 
 NAME = "omniroute"
 LABEL = "OmniRoute"

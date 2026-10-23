@@ -1,0 +1,1 @@
+"""Atualização automática pelo npm."""

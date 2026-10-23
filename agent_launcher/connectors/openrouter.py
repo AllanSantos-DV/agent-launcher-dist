@@ -2,7 +2,7 @@
 e Codex por https://openrouter.ai/api/v1 (Responses). /api/v1/models traz context_length, top_provider e
 supported_parameters (com "tools" quando o modelo aceita ferramentas).
 """
-from connectors._http import TOOL_SEARCH, gateway
+from agent_launcher.connectors._http import TOOL_SEARCH, gateway
 
 NAME = "openrouter"
 LABEL = "OpenRouter"

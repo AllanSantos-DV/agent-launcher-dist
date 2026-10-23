@@ -16,6 +16,9 @@ PATHS = {
     "refresh": '<path d="M20 7v5h-5M4 17v-5h5M5 8a8 8 0 0 1 13-3l2 3M4 16l2 3a8 8 0 0 0 13-3"/>',
     "terminal": '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3M13 15h4"/>',
     "code": '<path d="m8 6-6 6 6 6m8-12 6 6-6 6M14 4l-4 16"/>',
+    "copilot": '<path d="M5 18v-5a7 7 0 0 1 14 0v5"/><rect x="3" y="13" width="18" height="7" rx="3"/><circle cx="9" cy="16.5" r="1"/><circle cx="15" cy="16.5" r="1"/>',
+    "editor": '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 4v16"/>',
+    "app": '<rect x="4" y="4" width="16" height="16" rx="4"/><path d="M9 12h6M12 9v6"/>',
     "resume": '<path d="M4 5v6h6M4 11a8 8 0 1 1 2 7M12 7v5l3 2"/>',
     "arrow": '<path d="M4 12h16m-6-6 6 6-6 6"/>',
     "copy": '<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M15 8V3H3v13h5"/>',
@@ -168,7 +171,7 @@ QMenu::item:selected { background: #dfecda; }
 QToolTip { background: #233e32; color: #ffffff; padding: 6px; border: 0; }
 """
 
-CHECK_ICON = (Path(__file__).resolve().parent / "assets" / "check-white.svg").as_posix()
+CHECK_ICON = (Path(__file__).resolve().parents[2] / "assets" / "check-white.svg").as_posix()
 STYLE += f"""
 QCheckBox {{ spacing: 9px; }}
 QCheckBox::indicator {{ width: 20px; height: 20px; background: #ffffff; border: 1px solid #749965; border-radius: 4px; }}

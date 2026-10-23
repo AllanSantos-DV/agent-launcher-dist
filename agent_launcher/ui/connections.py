@@ -8,7 +8,10 @@ from PySide6.QtWidgets import (
     QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
-from core import Gateway, LauncherError, Store
+from agent_launcher.domain.errors import LauncherError
+from agent_launcher.domain.gateway import Gateway
+from agent_launcher.domain.store import Store
+from agent_launcher.endpoint import registry as endpoint_registry
 
 
 def _label(text: str, role: str = "") -> QLabel:
@@ -18,6 +21,10 @@ def _label(text: str, role: str = "") -> QLabel:
     if role:
         widget.setObjectName(role)
     return widget
+
+
+CLEAN_NOTE = ("Se o Copilot app estiver aberto, ele é fechado e aberto de novo (inclusive o ícone da bandeja). O "
+              "launcher faz backup do banco do app antes e não mexe nos seus outros providers.")
 
 
 class _Signals(QObject):
@@ -165,10 +172,131 @@ class ConnectionForm(QDialog):
         self.accept()
 
 
+class EndpointPanel(QWidget):
+    """Endpoint local da conexão selecionada (porta, estado, requisições, Iniciar/Parar, iniciar com o Windows).
+
+    Só aparece para conexão com porta gravada (já usada por VS Code ou Copilot app). O estado é lido ao abrir a tela,
+    depois de cada ação e no botão Atualizar; sem polling. Tudo que consulta a rede ou espera o processo roda fora da
+    thread da interface (ensure_running espera até 15 s)."""
+
+    def __init__(self, home: Path, parent=None):
+        super().__init__(parent)
+        self.home = home
+        self.states: dict[str, dict] = {}
+        self.connection_id: str | None = None
+        self.busy = False
+        self.tasks: set = set()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(_label("Endpoint local", "section"))
+        self.summary = _label("", "muted")
+        self.summary.setAccessibleName("Estado do endpoint local")
+        layout.addWidget(self.summary)
+        row = QHBoxLayout()
+        self.toggle_button = QPushButton("Iniciar")
+        self.toggle_button.clicked.connect(self.toggle)
+        row.addWidget(self.toggle_button)
+        self.autostart_box = QCheckBox("Iniciar com o Windows")
+        self.autostart_box.clicked.connect(self.set_autostart)  # clicked: só a ação do usuário, não o setChecked
+        row.addWidget(self.autostart_box)
+        row.addStretch()
+        self.refresh_button = QPushButton("Atualizar")
+        self.refresh_button.clicked.connect(self.refresh)
+        row.addWidget(self.refresh_button)
+        layout.addLayout(row)
+        self.notice = _label("", "notice")
+        self.notice.hide()
+        layout.addWidget(self.notice)
+        self.hide()
+
+    def _start(self, job, slot):
+        task = _Task(job)
+        self.tasks.add(task)
+        task.signals.done.connect(slot)
+        task.signals.done.connect(lambda *_args, task=task: self.tasks.discard(task))
+        QThreadPool.globalInstance().start(task)
+
+    def _set_busy(self, busy: bool, text: str = ""):
+        self.busy = busy
+        for widget in (self.toggle_button, self.autostart_box, self.refresh_button):
+            widget.setEnabled(not busy)
+        if busy and text:
+            self.summary.setText(text)
+
+    def refresh(self):
+        home = self.home
+
+        def job():
+            connections = Store(home).connections
+            return {connection["id"]: state
+                    for connection, state in zip(connections, endpoint_registry.status(home, connections))}
+        self._set_busy(True)
+        self._start(job, self.refreshed)
+
+    @Slot(object, str)
+    def refreshed(self, states, error):
+        self._set_busy(False)
+        if error:
+            self.notice.setText(f"Estado do endpoint: {error}")
+            self.notice.show()
+        else:
+            self.states = states or {}
+        self.show_for(self.connection_id)
+
+    def show_for(self, connection_id: str | None):
+        self.connection_id = connection_id
+        state = self.states.get(connection_id) if connection_id else None
+        if not state or not state.get("port"):
+            self.hide()
+            return
+        running = bool(state.get("running"))
+        parts = [f"Porta {state['port']}", "rodando" if running else "parado"]
+        if running and state.get("requests") is not None:
+            parts.append(f"{state['requests']} requisições")
+        if not self.busy:
+            self.summary.setText(" • ".join(parts) + (f"\n{state['url']}" if state.get("url") else ""))
+        self.toggle_button.setText("Parar" if running else "Iniciar")
+        self.autostart_box.setChecked(bool(state.get("autostart")))
+        self.show()
+
+    def toggle(self):
+        connection_id = self.connection_id
+        state = self.states.get(connection_id or "")
+        if not state:
+            return
+        home = self.home
+        self.notice.hide()
+        if state.get("running"):
+            self._set_busy(True, "Parando o endpoint…")
+            self._start(lambda: endpoint_registry.stop(home, connection_id), self.acted)
+        else:
+            self._set_busy(True, "Iniciando o endpoint…")
+            self._start(lambda: endpoint_registry.ensure_running(home, connection_id), self.acted)
+
+    def set_autostart(self, enabled: bool):
+        connection_id = self.connection_id
+        if not connection_id:
+            return
+        home = self.home
+        self.notice.hide()
+        self._set_busy(True)
+        self._start(lambda: endpoint_registry.autostart(home, connection_id, bool(enabled)), self.acted)
+
+    @Slot(object, str)
+    def acted(self, _result, error):
+        if error:
+            self.notice.setText(error)
+            self.notice.show()
+        self.refresh()
+
+
 class ConnectionsDialog(QDialog):
     def __init__(self, home: Path, parent=None):
         super().__init__(parent)
         self.home = home
+        self.cleaning = False
+        self.cleanup_task = None
         self.setWindowTitle("Conexões")
         self.setMinimumSize(620, 420)
         layout = QVBoxLayout(self)
@@ -197,6 +325,8 @@ class ConnectionsDialog(QDialog):
         buttons.addStretch()
         body.addLayout(buttons)
         layout.addLayout(body, 1)
+        self.endpoint = EndpointPanel(home, self)
+        layout.addWidget(self.endpoint)
         self.status = _label("", "muted")
         layout.addWidget(self.status)
         close = QPushButton("Fechar")
@@ -206,6 +336,7 @@ class ConnectionsDialog(QDialog):
         row.addWidget(close)
         layout.addLayout(row)
         self.populate()
+        self.endpoint.refresh()
 
     def populate(self, preferred: str | None = None):
         store = Store(self.home)
@@ -232,6 +363,8 @@ class ConnectionsDialog(QDialog):
     def update_buttons(self, *_args):
         for key in ("edit", "test", "default", "remove"):
             self.buttons[key].setEnabled(self.list.currentItem() is not None)
+        item = self.list.currentItem()
+        self.endpoint.show_for(item.data(Qt.ItemDataRole.UserRole) if item else None)
 
     def add(self):
         form = ConnectionForm(self.home, parent=self)
@@ -262,6 +395,43 @@ class ConnectionsDialog(QDialog):
             Store(self.home).set_default_connection(connection["id"])
             self.populate(connection["id"])
 
+    def done(self, result: int):
+        """Não fecha no meio da limpeza nos destinos (Fechar, Esc ou o X): o fim dela atualiza este diálogo."""
+        if self.cleaning:
+            return
+        super().done(result)
+
+    def _set_cleaning(self, cleaning: bool):
+        """Durante a limpeza nos destinos: lista e botões travados (a conexão ainda existe até o fim)."""
+        self.cleaning = cleaning
+        self.list.setEnabled(not cleaning)
+        for widget in self.buttons.values():
+            widget.setEnabled(not cleaning)
+        if not cleaning:
+            self.update_buttons()
+
+    def clean_destinations(self, connection: dict, then=None) -> None:
+        """Limpeza nos destinos em segundo plano: fechar o Copilot app e esperar o banco pode levar dezenas de
+        segundos. A pergunta já foi feita na thread da interface (remove), então a tarefa confirma sozinha
+        (confirm=lambda *_: True) e nunca abre QMessageBox fora da thread da interface. `then(messages)` roda na
+        thread da interface no fim."""
+        from agent_launcher.harnesses.cleanup import cleanup_destinations
+        home = self.home
+        self._set_cleaning(True)
+        self.status.setText(f"Removendo {connection['name']} do Copilot app e do VS Code… (pode levar alguns segundos)")
+        task = _Task(lambda: cleanup_destinations(Store(home), connection, lambda *_: True))
+        self.cleanup_task = task
+
+        def finished(messages, error):
+            messages = list(messages or []) + ([error] if error else [])
+            self._set_cleaning(False)
+            self.status.setText(" ".join(messages))
+            self.cleanup_task = None
+            if then:
+                then(messages)
+        task.signals.done.connect(finished)
+        QThreadPool.globalInstance().start(task)
+
     def remove(self):
         connection = self.current()
         if not connection:
@@ -271,8 +441,22 @@ class ConnectionsDialog(QDialog):
                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                       QMessageBox.StandardButton.No)
         if answer == QMessageBox.StandardButton.Yes:
-            try:
-                Store(self.home).remove_connection(connection["id"])
-            except LauncherError as error:
-                self.status.setText(str(error))
-            self.populate()
+            clean = QMessageBox.question(self, "Remover conexão", "Remover também do Copilot app e do VS Code (e parar "
+                                         f"o endpoint local desta conexão)?\n\n{CLEAN_NOTE}",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                         QMessageBox.StandardButton.Yes)
+            if clean == QMessageBox.StandardButton.Yes:
+                self.clean_destinations(connection, lambda messages: self.finish_remove(connection, messages))
+            else:
+                self.finish_remove(connection, [])
+
+    def finish_remove(self, connection: dict, messages: list[str]):
+        from agent_launcher.harnesses.cleanup import release_endpoint
+        messages = [*messages, *release_endpoint(self.home, connection["id"])]
+        try:
+            Store(self.home).remove_connection(connection["id"])
+        except LauncherError as error:
+            messages = [*messages, str(error)]
+        self.populate()
+        if messages:
+            self.status.setText(" ".join(messages))
