@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { childEnv, describeError, relaunchArgs } from "./rede.mjs";
 
 const PACKAGE_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const RUNTIME_DIR = join(homedir(), ".agent-launcher", "runtime");
@@ -20,9 +21,12 @@ const USAGE = `Uso: npx @allansantos-dev/agent-launcher@latest install [opções
 Instala ou atualiza o Agent Launcher para este usuário do Windows (sem admin). Rode de novo com @latest para atualizar.
 Opções: --no-clis, --no-terminal, --terminal-zip CAMINHO, --no-shortcuts, --target PASTA, --uninstall`;
 
+class Failure extends Error {}
+
+// Nada de exit explícito: com o fetch ainda fechando, o Node 24 no Windows aborta (Assertion failed: UV_HANDLE_CLOSING).
+// A falha sobe até main(), que grava process.exitCode e deixa o processo terminar sozinho.
 function fail(message) {
-  console.error(`agent-launcher: ${message}`);
-  process.exit(1);
+  throw new Failure(message);
 }
 
 function run(command, args, options = {}) {
@@ -36,7 +40,12 @@ async function ensureUv() {
   if (existsSync(UV_EXE)) return;
   const url = `https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ASSET}`;
   console.log(`Baixando uv ${UV_VERSION} (gerenciador de Python)...`);
-  const response = await fetch(url);
+  let response;
+  try {
+    response = await fetch(url);
+  } catch (error) {
+    fail(`download of ${url} failed: ${describeError(error)}`);
+  }
   if (!response.ok) fail(`download of ${url} failed: HTTP ${response.status}`);
   const archive = Buffer.from(await response.arrayBuffer());
   const digest = createHash("sha256").update(archive).digest("hex");
@@ -54,7 +63,7 @@ async function ensureUv() {
 }
 
 function ensurePython() {
-  const env = { ...process.env, UV_PYTHON_INSTALL_DIR: PYTHON_DIR };
+  const env = { ...childEnv(process.env), UV_PYTHON_INSTALL_DIR: PYTHON_DIR };
   console.log(`Preparando Python ${PYTHON_VERSION} em ${PYTHON_DIR}...`);
   run(UV_EXE, ["python", "install", PYTHON_VERSION, "--no-bin", "--no-registry"], { env });
   const python = run(UV_EXE, ["python", "find", "--managed-python", "--no-python-downloads", PYTHON_VERSION], { env });
@@ -70,18 +79,33 @@ async function main() {
   }
   if (command !== "install") {
     console.log(USAGE);
-    process.exit(command === undefined || command === "--help" || command === "-h" ? 0 : 1);
+    process.exitCode = command === undefined || command === "--help" || command === "-h" ? 0 : 1;
+    return;
   }
   if (process.platform !== "win32" || process.arch !== "x64") fail(`Agent Launcher runs on Windows x64 only (this is ${process.platform}-${process.arch}).`);
+  const flags = relaunchArgs({ version: process.version, execArgv: process.execArgv, env: process.env });
+  if (flags) {
+    // A flag só vale na partida do Node: reexecuta este script com o repositório de certificados do Windows ligado.
+    const again = spawnSync(process.execPath, [...flags, fileURLToPath(import.meta.url), command, ...rest], {
+      stdio: "inherit",
+      env: childEnv(process.env),
+    });
+    if (again.error) fail(`could not restart node with ${flags.join(" ")}: ${again.error.message}`);
+    process.exitCode = again.status ?? 1;
+    return;
+  }
   await ensureUv();
   const python = ensurePython();
   const installer = spawnSync(python, [join(PACKAGE_DIR, "install.py"), "--skip-tests", ...rest], {
     stdio: "inherit",
     cwd: PACKAGE_DIR,
-    env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
+    env: { ...childEnv(process.env), PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
   });
   if (installer.error) fail(`the installer did not start: ${installer.error.message}`);
-  process.exit(installer.status ?? 1);
+  process.exitCode = installer.status ?? 1;
 }
 
-main().catch((error) => fail(error.stack || String(error)));
+main().catch((error) => {
+  console.error(`agent-launcher: ${error instanceof Failure ? error.message : error.stack || describeError(error)}`);
+  process.exitCode = 1;
+});

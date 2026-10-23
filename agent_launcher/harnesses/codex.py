@@ -15,7 +15,7 @@ from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import atomic_json, path_key
 from agent_launcher.harnesses import installers
 from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines, is_exe,
-                                           native_wrapper, node_script, parse_time, same_folder, unrecognized)
+                                           key_mcp_urls, native_wrapper, node_script, parse_time, same_folder, unrecognized)
 from agent_launcher.platform.jobs import close_job, free_port, kill_with_parent, stop_tree
 from agent_launcher.session import controlled as controlled_state
 from agent_launcher.session.plan import LaunchPlan
@@ -156,6 +156,8 @@ class Codex(Harness):
             f"{provider}.wire_api": "responses",
             f"{provider}.requires_openai_auth": False,
         }
+        for name, url in key_mcp_urls(gateway).items():
+            options[f"mcp_servers.{name}.url"] = url  # a chave do perfil vai no caminho; só neste processo
         if context.preserve_terminal_title:
             options["tui.terminal_title"] = []
         context_window, auto_compact_limit = codex_context(selected, catalog.verified)

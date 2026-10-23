@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 NAMES = {"claude": "Claude Code", "codex": "Codex", "copilot": "GitHub Copilot CLI"}
@@ -23,6 +24,13 @@ NPM_PACKAGES = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex",
 NODE_MINIMUM = {"claude": 22, "codex": 18, "copilot": 22}
 WINGET = {"copilot": "GitHub.Copilot"}
 MANUAL = {"claude": OFFICIAL["claude"], "codex": OFFICIAL["codex"], "copilot": "https://github.com/github/copilot-cli"}
+# O npm 11 não roda o postinstall de dependências sem --allow-scripts: o Claude Code deixa bin/claude.exe como script de
+# texto e o Windows recusa abri-lo. O Codex não tem postinstall; o binário vem do pacote opcional da plataforma.
+NPM_FLAGS = {"claude": ["--include=optional", "--allow-scripts=@anthropic-ai/claude-code"], "codex": ["--include=optional"]}
+NPM_REPAIR = {cli: f"npm install -g {NPM_PACKAGES[cli]}@latest {' '.join(flags)}" for cli, flags in NPM_FLAGS.items()}
+CLAUDE_PLATFORM = Path("node_modules") / "@anthropic-ai" / "claude-code-win32-x64" / "claude.exe"
+CODEX_PLATFORM = (Path("node_modules") / "@openai" / "codex-win32-x64" / "vendor" / "x86_64-pc-windows-msvc" / "bin" / "codex.exe")
+LOG_FILE = Path(os.environ.get("USERPROFILE") or Path.home()) / ".agent-launcher" / "cli-install.log"
 
 
 class CliInstallError(Exception):
@@ -56,9 +64,70 @@ def _run(command: list[str], timeout: int, environment: dict | None = None) -> s
                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
-def _tail(result: subprocess.CompletedProcess) -> str:
-    lines = [line for line in (result.stdout + "\n" + result.stderr).splitlines() if line.strip()]
-    return " | ".join(lines[-3:]) or f"código {result.returncode}"
+def _tail(result: subprocess.CompletedProcess, count: int = 8) -> str:
+    lines = [line.strip() for line in (result.stdout + "\n" + result.stderr).splitlines() if line.strip()]
+    return f"código de saída {result.returncode}; " + (" | ".join(lines[-count:]) or "sem saída")
+
+
+def _fail(cli: str, label: str, message: str):
+    """Registra a falha em LOG_FILE (o texto também sobe na exceção) e a levanta."""
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as stream:
+            stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {NAMES[cli]} ({label}): {message}\n")
+    except OSError:
+        pass  # o texto segue na exceção e no log da tela; o arquivo é só o registro
+    raise CliInstallError(message)
+
+
+def is_native(path: Path) -> bool:
+    """Executável do Windows de verdade (cabeçalho MZ); o npm deixa script de texto com o nome .exe."""
+    try:
+        with path.open("rb") as stream:
+            return stream.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
+def _package_roots(path: Path, package: str) -> list[Path]:
+    """Pastas do pacote npm de um CLI a partir do que `find` devolveu (shim .cmd da pasta global, ou o próprio bin/)."""
+    scope, name = package.split("/")
+    roots = [path.parent / "node_modules" / scope / name, path.parent.parent / scope / name]
+    if path.parent.name == "bin" and path.parent.parent.name == name:
+        roots.append(path.parent.parent)
+    return [root for root in dict.fromkeys(roots) if root.is_dir()]
+
+
+def claude_binary(path: Path) -> Path | None:
+    """Binário nativo do Claude Code instalado pelo npm, ou None sem nenhum pacote do npm em volta de `path`.
+    Pula o que não tem cabeçalho MZ, prefere o pacote da plataforma quando bin/claude.exe é o provisório e o repara
+    (copia o binário da plataforma por cima). Sem binário válido, levanta com o comando de reparo."""
+    roots = _package_roots(path, "@anthropic-ai/claude-code")
+    if not roots:
+        return None
+    provisional = [path] if path.suffix.lower() == ".exe" and path.is_file() else []
+    candidates = provisional + [root / "bin" / "claude.exe" for root in roots] + [root / CLAUDE_PLATFORM for root in roots]
+    found = next((candidate for candidate in candidates if is_native(candidate)), None)
+    if found is None:
+        invalid = [str(candidate) for candidate in dict.fromkeys(candidates) if candidate.is_file()]
+        raise CliInstallError((f"{', '.join(invalid)} não é um executável do Windows (cabeçalho MZ ausente). "
+                               if invalid else "Binário nativo do Claude Code não encontrado no pacote do npm. ") +
+                              f"Repare com: {NPM_REPAIR['claude']}")
+    for stub in (candidate for candidate in candidates if candidate.is_file() and candidate != found
+                 and candidate.parent.name == "bin" and not is_native(candidate)):
+        try:
+            partial = stub.with_name(stub.name + ".reparo")
+            shutil.copyfile(found, partial)
+            os.replace(partial, stub)
+        except OSError as error:
+            print(f"  Aviso: não foi possível reparar {stub} ({error}); usando {found}.")
+    return found
+
+
+def codex_platform_binary(path: Path) -> Path | None:
+    """Codex.exe do pacote da plataforma instalado pelo npm (None se o pacote opcional não veio)."""
+    return next((root / CODEX_PLATFORM for root in _package_roots(path, "@openai/codex")
+                 if is_native(root / CODEX_PLATFORM)), None)
 
 
 def install_official(cli: str) -> None:
@@ -68,7 +137,7 @@ def install_official(cli: str) -> None:
     result = _run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
                   timeout=900, environment={"CODEX_NON_INTERACTIVE": "1"})
     if not any(path.is_file() for path in native_paths(cli)):
-        raise CliInstallError(f"instalador oficial ({OFFICIAL[cli]}) não deixou o executável: {_tail(result)}")
+        _fail(cli, "instalador oficial", f"instalador oficial ({OFFICIAL[cli]}) não deixou o executável: {_tail(result)}")
 
 
 def _node_major() -> int | None:
@@ -87,9 +156,16 @@ def install_npm(cli: str) -> None:
     if major is None or major < NODE_MINIMUM[cli]:
         raise CliInstallError(f"{NPM_PACKAGES[cli]} exige Node {NODE_MINIMUM[cli]}+; encontrado: "
                               f"{'nenhum' if major is None else major}.")
-    result = _run([npm, "install", "-g", NPM_PACKAGES[cli]], timeout=900)
-    if result.returncode or not find(cli):
-        raise CliInstallError(f"npm install -g {NPM_PACKAGES[cli]} falhou: {_tail(result)}")
+    result = _run([npm, "install", "-g", NPM_PACKAGES[cli], *NPM_FLAGS[cli]], timeout=900)
+    installed = find(cli)
+    if result.returncode or not installed:
+        _fail(cli, "npm", f"npm install -g {NPM_PACKAGES[cli]} falhou: {_tail(result)}")
+    try:
+        usable = claude_binary(Path(installed)) if cli == "claude" else codex_platform_binary(Path(installed))
+    except CliInstallError as error:
+        _fail(cli, "npm", str(error))
+    if usable is None and cli == "codex" and Path(installed).suffix.lower() != ".exe":
+        _fail(cli, "npm", f"{NPM_PACKAGES[cli]} instalado sem o binário da plataforma. Repare com: {NPM_REPAIR[cli]}")
 
 
 def install_winget(cli: str) -> None:

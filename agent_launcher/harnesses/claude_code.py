@@ -13,7 +13,7 @@ from agent_launcher.domain.catalog import CLAUDE_FAMILIES, Catalog, ModelInfo, b
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.harnesses import installers
 from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines, is_exe,
-                                           native_wrapper, node_script, parse_time, unrecognized)
+                                           key_mcp_urls, native_wrapper, node_script, parse_time, unrecognized)
 from agent_launcher.session.controlled import CONTROLLED_NOTE, UNATTENDED_RESUME_THRESHOLD, delegation_code
 from agent_launcher.session.plan import LaunchPlan
 
@@ -193,17 +193,14 @@ class ClaudeCode(Harness):
             raise LauncherError(f"{self.LABEL} não está instalado. Use 'Instalar' na interface ou "
                                 f"'launcher.py cli --install {self.ID}'.")
         path = Path(executable)
-        if is_exe(path):
-            return [str(path)]
-        # O postinstall do npm copia o binário do pacote da plataforma sobre bin/claude.exe; uma atualização interrompida
-        # (o Claude Code renomeia o exe em uso) deixa só o .old, mas o binário original continua no pacote da plataforma.
-        package_root = (path.parent / "node_modules" / "@anthropic-ai" / "claude-code",
-                        path.parent.parent / "@anthropic-ai" / "claude-code")
-        native_candidates = tuple(root / relative for root in package_root for relative in (
-            Path("bin") / "claude.exe", Path("node_modules") / "@anthropic-ai" / "claude-code-win32-x64" / "claude.exe"))
-        native = next((candidate for candidate in native_candidates if candidate.is_file()), None)
+        try:
+            native = installers.claude_binary(path)
+        except installers.CliInstallError as error:
+            raise LauncherError(str(error)) from error
         if native is not None:
             return [str(native)]
+        if is_exe(path):
+            return [str(path)]
         return node_script(path, "@anthropic-ai/claude-code/cli.js") or native_wrapper(path) or self._fail(path)
 
     @staticmethod
@@ -281,6 +278,11 @@ class ClaudeCode(Harness):
         settings_env = {key: value for key, value in overrides.items() if key != secret_variable}
         settings = json.dumps({"apiKeyHelper": "", "env": settings_env, "availableModels": allowed}, ensure_ascii=True, separators=(",", ":"))
         command += ["--settings", settings, "--model", model]
+        mcp = key_mcp_urls(gateway)
+        if mcp:
+            # Só neste processo (sem --strict-mcp-config, os MCPs do próprio usuário continuam): a chave do perfil vai no caminho.
+            command += ["--mcp-config", json.dumps({"mcpServers": {name: {"type": "http", "url": url}
+                                                                    for name, url in mcp.items()}}, separators=(",", ":"))]
         command += ["--dangerously-skip-permissions"] if context.bypass_permissions else ["--permission-mode", "default"]
         notes = ([CONTROLLED_NOTE.format(code=delegation_code())] if context.controlled else []) + (
             [context.admin_note] if context.admin_note else [])

@@ -18,6 +18,7 @@ COUNT_LIMIT = 4_000_000   # bytes: até aqui as mensagens são contadas linha a 
 SCAN_BLOCK = 4 * 1024 * 1024  # bytes lidos por vez na varredura de arquivo grande
 SCAN_SECONDS = 2.0        # tempo máximo da varredura de um arquivo grande; estourou = messages=None
 TITLE_LENGTH = 80
+KEY_MCP_SERVERS = ("sharepointmcp", "teamsmcp")  # os MCPs do host que seguem a chave do perfil
 
 
 @dataclass
@@ -244,6 +245,14 @@ def native_wrapper(path: Path) -> list[str] | None:
         if target.is_absolute() and target.is_file():
             return [str(target)]
     return None
+
+
+def key_mcp_urls(gateway) -> dict[str, str]:
+    """Servidores MCP que o host atende por chave ({endereço}/k/<nome>/mcp/<servidor>); vazio sem key_name na conexão."""
+    from agent_launcher.connectors._http import key_name
+    if not key_name(gateway.options):
+        return {}
+    return {server: f"{gateway.targets['claude'].rstrip('/')}/mcp/{server}" for server in KEY_MCP_SERVERS}
 
 
 def unrecognized(path: Path) -> LauncherError:
