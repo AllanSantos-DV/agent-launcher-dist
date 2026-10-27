@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import shutil
 import time
 from pathlib import Path
 
@@ -50,6 +51,19 @@ def replace_retrying(source, destination, attempts: int = REPLACE_ATTEMPTS) -> N
             if attempt == attempts:
                 raise
             time.sleep(0.015 * attempt * (0.5 + random.random()))
+
+
+def remove_tree(path, attempts: int = 5) -> None:
+    """shutil.rmtree que repete quando o Windows recusa por arquivo em uso (um pythonw da venv ainda carregado, o
+    antivírus varrendo); esgotadas as tentativas, levanta o último erro."""
+    for attempt in range(1, attempts + 1):
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError:
+            if attempt == attempts:
+                raise
+            time.sleep(0.5 * attempt)
 
 
 def atomic_json(path: Path, data: dict) -> None:

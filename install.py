@@ -18,6 +18,7 @@ from pathlib import Path
 
 import clis
 import terminal
+from agent_launcher.domain.files import remove_tree
 from version import APP_NAME, APP_USER_MODEL_ID, VERSION, data_home
 
 SOURCE = Path(__file__).resolve().parent
@@ -35,6 +36,7 @@ SHORTCUT = f"{APP_NAME}.lnk"
 CLASSES = r"Software\Classes"
 FILE_EXTENSION = ".alprofile"
 FILE_TYPE = "AgentLauncher.Profile"
+RUN_ONCE = r"Software\Microsoft\Windows\CurrentVersion\RunOnce"
 # Caminhos passados por variável de ambiente: nada do usuário é interpolado no script PowerShell.
 # System.AppUserModel.ID no atalho: o mesmo id que o app declara ao abrir (gui.create_application). Assim a barra de
 # tarefas mostra o ícone do Agent Launcher, e fixar o app fixa o atalho (não o pythonw.exe). WScript.Shell não grava
@@ -71,7 +73,9 @@ _SHORTCUTS = (
     "Add-Type -TypeDefinition $env:AL_TYPE; "
     "$shell = New-Object -ComObject WScript.Shell; "
     "foreach ($folder in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))) { "
-    "  $path = Join-Path $folder $env:AL_NAME; $link = $shell.CreateShortcut($path); "
+    "  $path = Join-Path $folder $env:AL_NAME; "
+    "  if ($env:AL_ONLY_EXISTING -and -not (Test-Path -LiteralPath $path)) { continue }; "
+    "  $link = $shell.CreateShortcut($path); "
     "  $link.TargetPath = $env:AL_PYTHONW; $link.Arguments = '\"' + $env:AL_SCRIPT + '\"'; "
     "  $link.WorkingDirectory = $env:AL_DIR; $link.IconLocation = $env:AL_ICON; "
     "  $link.Description = $env:AL_DESCRIPTION; $link.Save(); [LinkAppId]::Set($path, $env:AL_APPID) }"
@@ -198,19 +202,6 @@ def healthy(python) -> bool:
         return False
 
 
-def remove_tree(path, attempts=5):
-    """shutil.rmtree que repete quando o Windows recusa por arquivo em uso (um pythonw da venv ainda carregado, o
-    antivírus varrendo); esgotadas as tentativas, levanta o último erro."""
-    for attempt in range(1, attempts + 1):
-        try:
-            shutil.rmtree(path)
-            return
-        except PermissionError:
-            if attempt == attempts:
-                raise
-            time.sleep(0.5 * attempt)
-
-
 def install_dependencies(target, python):
     if not healthy(python):
         if python.is_file():
@@ -234,8 +225,10 @@ def powershell(script, env):
         raise RuntimeError((result.stderr or result.stdout).strip()[-600:] or f"PowerShell saiu com {result.returncode}")
 
 
-def create_shortcuts(target, pythonw):
-    powershell(_SHORTCUTS, {"AL_NAME": SHORTCUT, "AL_PYTHONW": str(pythonw), "AL_SCRIPT": str(target / "launcher.pyw"),
+def create_shortcuts(target, pythonw, only_existing=False):
+    """Grava os atalhos do menu Iniciar e da área de trabalho. only_existing regrava só os que já existem (a atualização
+    automática renova o ícone e o AppUserModelID sem recriar o que o usuário apagou nem trocar a identidade do fixado)."""
+    powershell(_SHORTCUTS, {"AL_ONLY_EXISTING": "1" if only_existing else "", "AL_NAME": SHORTCUT, "AL_PYTHONW": str(pythonw), "AL_SCRIPT": str(target / "launcher.pyw"),
                             "AL_DIR": str(target), "AL_ICON": str(target / "assets" / "launcher.ico"),
                             "AL_DESCRIPTION": f"{APP_NAME}: Claude Code e Codex em qualquer provedor",
                             "AL_APPID": APP_USER_MODEL_ID, "AL_TYPE": _APP_ID_TYPE})
@@ -248,6 +241,14 @@ class WindowsRegistry:
         import winreg
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+
+    def delete_value(self, path: str, name: str) -> None:
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, name)
+        except FileNotFoundError:
+            pass
 
     def get(self, path: str, name: str = "") -> str | None:
         import winreg
@@ -300,15 +301,53 @@ def unregister_file_type(registry=None):
     registry.notify()
 
 
-def uninstall(target):
+def in_use(target):
+    """Executáveis da instalação que estão rodando agora (o Python da venv que abriu o launcher ou uma sessão, o
+    Terminal portátil): o Windows não deixa abrir um .exe em execução para escrita, nem apagá-lo."""
+    busy = []
+    for executable in [*(target / ".venv" / "Scripts").glob("*.exe"), *terminal.portable_dir(target).rglob("*.exe")]:
+        try:
+            executable.open("ab").close()
+        except PermissionError:
+            busy.append(executable)
+    return busy
+
+
+def schedule_removal(target, registry=None):
+    """Remoção que não coube agora (arquivo preso mesmo depois das tentativas): o Windows apaga a pasta no próximo logon,
+    quando nada da instalação roda, por uma entrada RunOnce do usuário (sem janela, sem admin)."""
+    registry = registry or WindowsRegistry()
+    registry.set(RUN_ONCE, f"{APP_NAME}Removal", f'conhost.exe --headless cmd.exe /c rmdir /s /q "{target}"')
+
+
+def cancel_removal(target, registry=None):
+    """Reinstalar no mesmo caminho cancela a remoção agendada: sem isto o RunOnce apagaria a instalação nova no logon."""
+    registry = registry or WindowsRegistry()
+    name = f"{APP_NAME}Removal"
+    if str(target) in (registry.get(RUN_ONCE, name) or ""):
+        registry.delete_value(RUN_ONCE, name)
+
+
+def uninstall(target, registry=None):
     if not (target / MANIFEST).is_file():
         raise SystemExit(f"{target} não contém uma instalação do {APP_NAME} (sem {MANIFEST}); nada foi removido.")
+    busy = in_use(target)
+    if busy:
+        raise SystemExit(f"{APP_NAME} está aberto ({busy[0].name} em uso): feche a janela e as sessões abertas por ele e "
+                         "rode a desinstalação de novo; nada foi removido.")
     powershell(_REMOVE_SHORTCUTS, {"AL_NAME": SHORTCUT})
     try:
         unregister_file_type()
     except OSError as error:
         print(f"Aviso: associação do arquivo {FILE_EXTENSION} não removida ({error}).", file=sys.stderr)
-    remove_tree(target)
+    try:
+        remove_tree(target)
+    except PermissionError as error:
+        shutil.rmtree(target, ignore_errors=True)
+        if target.exists():
+            schedule_removal(target, registry)
+            print(f"Aviso: parte de {target} está em uso ({error}); o que sobrou será apagado no próximo logon.",
+                  file=sys.stderr)
     print(f"{APP_NAME} removido de {target}. Seus dados continuam em {data_home()}; apague a pasta se não quiser mantê-los.")
 
 
@@ -321,6 +360,8 @@ def main():
     parser.add_argument("--skip-tests", action="store_true", help="instala sem rodar tests/run.py (só emergência)")
     parser.add_argument("--skip-deps", action="store_true", help="não cria o ambiente virtual nem roda pip")
     parser.add_argument("--no-shortcuts", action="store_true", help="não cria atalhos no Menu Iniciar e na Área de Trabalho")
+    parser.add_argument("--refresh-shortcuts", action="store_true",
+                        help="regrava só os atalhos que já existem (usado pela atualização automática)")
     parser.add_argument("--no-file-association", action="store_true",
                         help=f"não associa os arquivos {FILE_EXTENSION} (perfil) ao launcher")
     parser.add_argument("--no-terminal", action="store_true", help="não instala o Windows Terminal quando ele falta")
@@ -360,11 +401,21 @@ def main():
                                   creationflags=NO_WINDOW)
         if compiled.returncode:
             raise RuntimeError("versão instalada não importa: " + compiled.stderr.strip()[-600:])
-        if not args.no_shortcuts:
+        if args.refresh_shortcuts:
+            if pythonw.is_file():
+                try:
+                    create_shortcuts(target, pythonw, only_existing=True)
+                except (RuntimeError, OSError, subprocess.SubprocessError) as error:  # atalho é conforto: falhar aqui não pode desfazer a atualização
+                    print(f"Aviso: atalhos existentes não regravados ({error}).", file=sys.stderr)
+        elif not args.no_shortcuts:
             if not pythonw.is_file():
                 raise RuntimeError("atalhos exigem o ambiente virtual (não use --skip-deps junto com atalhos)")
             create_shortcuts(target, pythonw)
-        # Independente dos atalhos: a atualização automática roda com --no-shortcuts e também precisa do duplo clique.
+        try:
+            cancel_removal(target)
+        except OSError as error:
+            print(f"Aviso: remoção agendada de uma desinstalação anterior não cancelada ({error}).", file=sys.stderr)
+        # Independente dos atalhos: a atualização automática não os cria e também precisa do duplo clique.
         if not (args.no_file_association or os.environ.get("AGENT_LAUNCHER_NO_FILE_ASSOCIATION")) and pythonw.is_file():
             register_file_type(target, pythonw)
     except BaseException as exc:

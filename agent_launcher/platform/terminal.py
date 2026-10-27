@@ -20,7 +20,10 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
+
+from agent_launcher.domain.files import replace_retrying
 
 RELEASE_API = "https://api.github.com/repos/microsoft/terminal/releases/latest"
 MIN_BUILD = 19041
@@ -206,6 +209,16 @@ def portable_version(root: Path) -> tuple[int, ...] | None:
         return None
 
 
+def _free_previous(target: Path) -> Path:
+    """Pasta para onde vai a cópia atual durante a troca. Restos de trocas anteriores (antivírus ou um leitor seguram
+    arquivos de terminal.old) são varridos sem exigir sucesso; se o nome padrão continuar ocupado, a troca usa um nome
+    próprio em vez de falhar e baixar o ZIP de novo a cada abertura."""
+    for leftover in target.parent.glob("terminal.old*"):
+        shutil.rmtree(leftover, ignore_errors=True)
+    previous = target.with_name("terminal.old")
+    return target.with_name(f"terminal.old-{uuid.uuid4().hex[:8]}") if previous.exists() else previous
+
+
 def install_portable(root: Path, zip_path: Path | None = None, verify=signature_ok) -> Path:
     """Extrai o Terminal em <root>/terminal (modo portátil). Substitui uma cópia anterior só depois de validar a nova;
     com o Terminal portátil em uso o Windows recusa renomear a pasta (PermissionError) e a cópia anterior fica intacta."""
@@ -237,16 +250,14 @@ def install_portable(root: Path, zip_path: Path | None = None, verify=signature_
         version = zip_version(zip_path.name)
         if version:
             (extracted / VERSION_FILE).write_text(".".join(map(str, version)), encoding="utf-8")
-        previous = target.with_name("terminal.old")
-        if previous.exists():
-            shutil.rmtree(previous)
+        previous = _free_previous(target)
         if target.exists():
-            target.rename(previous)
+            replace_retrying(target, previous)
         try:
             shutil.move(str(extracted), str(target))
         except OSError:
             if previous.exists() and not target.exists():
-                previous.rename(target)
+                replace_retrying(previous, target)
             raise
         shutil.rmtree(previous, ignore_errors=True)
     return target / "wt.exe"

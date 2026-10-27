@@ -141,9 +141,9 @@ def interpreter(root: Path, windowless: bool = False) -> Path:
 
 
 def apply(package: Path, root: Path = ROOT, timeout: float = 900) -> None:
-    """Roda o instalador da versão nova sobre esta instalação (sem atalhos, Terminal nem CLIs: já existem)."""
+    """Roda o instalador da versão nova sobre esta instalação (sem criar atalhos, Terminal nem CLIs: já existem; os atalhos existentes são regravados)."""
     command = [str(interpreter(root)), str(Path(package) / "install.py"),
-               "--target", str(root), "--skip-tests", "--no-shortcuts", "--no-terminal", "--no-clis"]
+               "--target", str(root), "--skip-tests", "--refresh-shortcuts", "--no-terminal", "--no-clis"]
     result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if result.returncode:
@@ -158,10 +158,12 @@ def _lock(path: Path):
             path.unlink()  # atualização anterior morreu no meio
     except FileNotFoundError:
         pass
+    except PermissionError:
+        return False  # trava velha segura por antivírus ou leitor: não atualiza agora, tenta na próxima verificação
     try:
         os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
         return True
-    except FileExistsError:
+    except (FileExistsError, PermissionError):  # PermissionError: trava com remoção pendente no Windows
         return False
 
 
@@ -186,7 +188,10 @@ def update(root: Path = ROOT, registry: str = REGISTRY, log=lambda message: None
         log(f"Agent Launcher atualizado para {meta['version']}. Reabra para usar a versão nova.")
         return meta["version"]
     finally:
-        lock.unlink(missing_ok=True)
+        try:
+            lock.unlink(missing_ok=True)
+        except PermissionError:
+            log(f"Trava {lock} não removida (arquivo em uso); vale como velha depois de {LOCK_STALE_S // 60} min.")
 
 
 def record(message: str) -> None:
@@ -236,4 +241,6 @@ def background_main() -> int:
                else f"Verificação em segundo plano: {VERSION} já é a mais recente (ou outra atualização em andamento).")
     except UpdateError as error:
         record(f"Atualização em segundo plano falhou: {error}")
+    except Exception as error:  # processo oculto: sem isto morreria sem deixar rastro no update.log
+        record(f"Atualização em segundo plano falhou: {type(error).__name__}: {error}")
     return 0

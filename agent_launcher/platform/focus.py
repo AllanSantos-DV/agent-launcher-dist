@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 from agent_launcher import ROOT
-from agent_launcher.domain.files import replace_retrying
+from agent_launcher.domain.files import atomic_json
 
 STATE_FILE = Path.home() / ".cli-launcher" / "topmost.json"
 MUTEX_NAME = "Local\\agent-launcher-topmost"
@@ -287,11 +287,7 @@ def read_state(path: Path | None = None) -> dict:
 
 
 def write_state(state: dict, path: Path | None = None) -> None:
-    target = path or STATE_FILE
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    replace_retrying(temporary, target)
+    atomic_json(path or STATE_FILE, state)  # temporário de nome próprio: vigia e CLIs gravam ao mesmo tempo
 
 
 def is_topmost(hwnd: int) -> bool:
@@ -366,14 +362,17 @@ def topmost_watch(path: Path | None = None, hotkey: bool = True) -> int:
                 if marked:
                     set_topmost(marked, False)
                 return 0
-            while user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 1):  # PM_REMOVE
-                if message.message == WM_HOTKEY:
-                    topmost_resume(path)
-                    marked = find_window(state.get("title") or "")
-                    if marked:
-                        user32.SetForegroundWindow(marked)  # quem recebeu a tecla pode trazer a janela para a frente
-                    state = read_state(path)
-            topmost_step(state, path)
+            try:
+                while user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 1):  # PM_REMOVE
+                    if message.message == WM_HOTKEY:
+                        topmost_resume(path)
+                        marked = find_window(state.get("title") or "")
+                        if marked:
+                            user32.SetForegroundWindow(marked)  # quem recebeu a tecla pode trazer a janela para a frente
+                        state = read_state(path)
+                topmost_step(state, path)
+            except OSError:
+                pass  # gravação do estado recusada mesmo com retry: o vigia tenta de novo no próximo ciclo
             time.sleep(POLL_SECONDS)
     finally:
         if registered:
