@@ -18,6 +18,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from agent_launcher.domain.files import replace_retrying
+
 NAMES = {"claude": "Claude Code", "codex": "Codex", "copilot": "GitHub Copilot CLI"}
 OFFICIAL = {"claude": "https://claude.ai/install.ps1", "codex": "https://chatgpt.com/codex/install.ps1"}
 NPM_PACKAGES = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex", "copilot": "@github/copilot"}
@@ -118,7 +120,7 @@ def claude_binary(path: Path) -> Path | None:
         try:
             partial = stub.with_name(stub.name + ".reparo")
             shutil.copyfile(found, partial)
-            os.replace(partial, stub)
+            replace_retrying(partial, stub)
         except OSError as error:
             print(f"  Aviso: não foi possível reparar {stub} ({error}); usando {found}.")
     return found

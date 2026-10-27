@@ -141,8 +141,48 @@ def server_command(home: Path, connection_id: str) -> list[str]:
             "--home", str(Path(home).resolve()), "--connection", connection_id]
 
 
+def _command_executable(command: str) -> str:
+    """Primeiro token de uma linha de comando do registro ("C:\\Python\\pythonw.exe" arg ... ou sem aspas)."""
+    command = command.strip()
+    if command.startswith('"'):
+        return command[1:].split('"', 1)[0]
+    return command.split(" ", 1)[0]
+
+
+def _autostart_value(connection_id: str, home: Path | None) -> str | None:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            return winreg.QueryValueEx(key, _run_value(connection_id, home))[0]
+    except (OSError, ImportError):
+        return None
+
+
+def autostart_stale(connection_id: str, home: Path | None = None) -> str | None:
+    """Motivo se o início no logon está ligado com um executável que não existe mais (Python movido ou removido)."""
+    value = _autostart_value(connection_id, home)
+    if value and not Path(os.path.expandvars(_command_executable(value))).is_file():
+        return f"o início no logon aponta para {_command_executable(value)}, que não existe mais"
+    return None
+
+
+def refresh_autostart(home: Path, connection_id: str) -> bool:
+    """Com o início no logon ligado e o comando gravado diferente do de agora (outro Python base, pasta movida),
+    regrava o valor em HKCU\\...\\Run (sem admin). Desligado fica desligado. True se regravou."""
+    current = _autostart_value(connection_id, home)
+    wanted = subprocess.list2cmdline(server_command(home, connection_id))
+    if current is None or current == wanted:
+        return False
+    autostart(home, connection_id, True)
+    return True
+
+
 def ensure_running(home: Path, connection_id: str, timeout: float = 15) -> int:
     """Sobe o endpoint da conexão se ele não responde; devolve a porta. Processo oculto, desligado deste."""
+    try:
+        refresh_autostart(home, connection_id)
+    except OSError as error:  # o endpoint sobe mesmo assim; o registro fica como estava
+        print(f"Aviso: o início no logon do endpoint não foi regravado ({error}).", file=sys.stderr)
     port = port_for(home, connection_id)
     current = health(port)
     if _same(current, home, connection_id):
@@ -227,5 +267,6 @@ def status(home: Path, connections: list[dict]) -> list[dict]:
         current = health(port) if isinstance(port, int) else None
         result.append({"connection": connection["name"], "port": port, "running": bool(current),
                        "url": f"http://127.0.0.1:{port}/v1" if port else None,
-                       "requests": (current or {}).get("requests"), "autostart": autostart_enabled(connection["id"], home)})
+                       "requests": (current or {}).get("requests"), "autostart": autostart_enabled(connection["id"], home),
+                       "autostart_stale": autostart_stale(connection["id"], home)})
     return result

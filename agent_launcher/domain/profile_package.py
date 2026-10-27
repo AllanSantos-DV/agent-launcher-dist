@@ -18,6 +18,7 @@ from pathlib import Path
 
 from agent_launcher import connectors
 from agent_launcher.domain import profiles
+from agent_launcher.domain.files import replace_retrying
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.store import Store
 
@@ -87,7 +88,7 @@ def export_profile(base: Path | None, profile_id: str, out_path: Path, include_c
         archive.writestr(MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=2))
         for name, data in files.items():
             archive.writestr(name, data)
-    partial.replace(out_path)
+    replace_retrying(partial, out_path)
     return {"path": str(out_path), "connections": [entry["name"] for entry in entries],
             "connectors": sorted(files)}
 

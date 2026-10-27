@@ -87,6 +87,7 @@ async function main() {
   if (flags) {
     // A flag só vale na partida do Node: reexecuta este script com o repositório de certificados do Windows ligado.
     const again = spawnSync(process.execPath, [...flags, fileURLToPath(import.meta.url), command, ...rest], {
+      windowsHide: true,
       stdio: "inherit",
       env: childEnv(process.env),
     });
@@ -97,6 +98,7 @@ async function main() {
   await ensureUv();
   const python = ensurePython();
   const installer = spawnSync(python, [join(PACKAGE_DIR, "install.py"), "--skip-tests", ...rest], {
+    windowsHide: true,
     stdio: "inherit",
     cwd: PACKAGE_DIR,
     env: { ...childEnv(process.env), PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },

@@ -413,7 +413,9 @@ def doctor(store: Store, reference: str | None = None) -> int:
         if item["port"]:
             state = f"rodando, {item['requests']} requisições" if item["running"] else "parado (sobe ao abrir o destino)"
             print(f"  [OK] Endpoint local de {item['connection']}: {item['url']} • {state}"
-                  + (" • inicia com o Windows" if item["autostart"] else ""))
+                  + (" • inicia com o Windows" if item["autostart"] else "")
+                  + (f" • AVISO: {item['autostart_stale']} (abrir o destino pelo launcher regrava)"
+                     if item.get("autostart_stale") else ""))
     print("\n  O diagnóstico só lista modelos: não gera tokens. Catálogo acessível não garante inferência.")
     return 1 if failed else 0
 

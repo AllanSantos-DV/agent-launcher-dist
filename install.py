@@ -198,11 +198,24 @@ def healthy(python) -> bool:
         return False
 
 
+def remove_tree(path, attempts=5):
+    """shutil.rmtree que repete quando o Windows recusa por arquivo em uso (um pythonw da venv ainda carregado, o
+    antivírus varrendo); esgotadas as tentativas, levanta o último erro."""
+    for attempt in range(1, attempts + 1):
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError:
+            if attempt == attempts:
+                raise
+            time.sleep(0.5 * attempt)
+
+
 def install_dependencies(target, python):
     if not healthy(python):
         if python.is_file():
             print("Ambiente virtual quebrado (o Python de origem sumiu ou mudou de lugar); recriando…")
-            shutil.rmtree(target / ".venv")
+            remove_tree(target / ".venv")
         else:
             print("Criando ambiente virtual…")
         venv.create(target / ".venv", with_pip=True)
@@ -295,7 +308,7 @@ def uninstall(target):
         unregister_file_type()
     except OSError as error:
         print(f"Aviso: associação do arquivo {FILE_EXTENSION} não removida ({error}).", file=sys.stderr)
-    shutil.rmtree(target)
+    remove_tree(target)
     print(f"{APP_NAME} removido de {target}. Seus dados continuam em {data_home()}; apague a pasta se não quiser mantê-los.")
 
 

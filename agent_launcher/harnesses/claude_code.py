@@ -11,6 +11,7 @@ from pathlib import Path
 
 from agent_launcher.domain.catalog import CLAUDE_FAMILIES, Catalog, ModelInfo, base_model, token_label
 from agent_launcher.domain.errors import LauncherError
+from agent_launcher.domain.files import replace_retrying
 from agent_launcher.harnesses import installers
 from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines, is_exe,
                                            key_mcp_urls, native_wrapper, node_script, parse_time, unrecognized)
@@ -142,7 +143,7 @@ def trust_claude_folder(path: Path, config: Path | None = None, attempts: int = 
                 before_replace()
             now = config.stat()
             if (now.st_mtime_ns, now.st_size) == (before.st_mtime_ns, before.st_size):
-                os.replace(temporary, config)
+                replace_retrying(temporary, config)
                 return True
         finally:
             if os.path.exists(temporary):
