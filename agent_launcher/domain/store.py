@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -12,7 +13,8 @@ from agent_launcher import connectors
 from agent_launcher.connectors import ConnectorError
 from agent_launcher.domain.catalog import CLIS
 from agent_launcher.domain.errors import LauncherError
-from agent_launcher.domain.files import atomic_json, clean_text, path_key, project_path, validate_model
+from agent_launcher.domain.files import (atomic_json, clean_text, path_key, project_path, read_json_state,
+                                         read_text_retrying, validate_model)
 from agent_launcher.domain.vault import Vault
 from version import data_home
 
@@ -55,22 +57,53 @@ class Store:
                      "default_connection": None, "preferences": dict(PREFERENCES)}
         if self.path.exists():
             try:
-                self.data = json.loads(self.path.read_text(encoding="utf-8-sig"))
+                self.data = json.loads(read_text_retrying(self.path))
                 self.validate()
             except (ValueError, TypeError, KeyError, AttributeError, LauncherError) as error:
-                raise LauncherError(
-                    f"Configuração inválida em {self.path}. O arquivo foi preservado; corrija-o ou troque-o pela "
-                    f"cópia mais recente de {self.backups} antes de continuar."
-                ) from error
+                self._restore_from_backup(error)
         if not self.data["projects"]:
             self._recover(legacy_configs() if legacy is None and self.home == DEFAULT_HOME else legacy or [])
+
+    def _restore_from_backup(self, error: Exception) -> None:
+        """config.json inválido (corrompido, ou de uma versão com campos que esta não entende): guarda o arquivo ao lado
+        das cópias, volta a cópia válida mais recente com as preferências do arquivo que ainda valem e avisa em
+        self.recovered. Sem nenhuma cópia válida, levanta (nada é apagado)."""
+        rejected = self.data
+        try:
+            rejected = json.loads(read_text_retrying(self.path))
+        except (OSError, ValueError):
+            rejected = None
+        for copy in sorted(self.backups.glob("config-*.json"), reverse=True):
+            try:
+                self.data = json.loads(read_text_retrying(copy))
+                self.validate()
+            except (OSError, ValueError, TypeError, KeyError, AttributeError, LauncherError):
+                continue
+            kept = shutil.copyfile(self.path, self.backups / f"invalid-config-{time.strftime('%Y-%m-%d-%H%M%S')}.json")
+            newer = rejected.get("preferences") if isinstance(rejected, dict) else None
+            if isinstance(newer, dict):
+                self.data["preferences"].update({key: value for key, value in newer.items()
+                                                 if isinstance(key, str) and type(value) is bool})
+            atomic_json(self.path, self.data)
+            for old in sorted(self.backups.glob("invalid-config-*.json"), reverse=True)[BACKUP_DAYS:]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            self.recovered = (f"Configuração inválida ({error}); restaurada a cópia {copy.name} com as preferências "
+                              f"atuais. O arquivo recusado ficou em {kept}.")
+            return
+        raise LauncherError(
+            f"Configuração inválida em {self.path} ({error}) e nenhuma cópia válida em {self.backups}. "
+            "O arquivo foi preservado; corrija-o antes de continuar."
+        ) from error
 
     def _recover(self, legacy: list[Path]) -> None:
         copies = sorted(self.backups.glob("config-*.json"), reverse=True)
         previous = self.data
         for copy in copies:
             try:
-                self.data = data = json.loads(copy.read_text(encoding="utf-8-sig"))
+                self.data = data = json.loads(read_text_retrying(copy))
                 self.validate()
             except (OSError, ValueError, TypeError, KeyError, AttributeError, LauncherError):
                 self.data = previous
@@ -93,16 +126,17 @@ class Store:
     def validate(self) -> None:
         if not isinstance(self.data, dict) or self.data.get("schema") != 2:
             raise ValueError("schema")
-        if set(self.data) != {"schema", "projects", "last_project", "connections", "default_connection", "preferences"}:
+        if {"schema", "projects", "last_project", "connections", "default_connection", "preferences"} - set(self.data):
             raise ValueError("campos")
+        # Campo e preferência de versão mais nova não derrubam esta: ficam no arquivo e voltam na próxima gravação.
         preferences = self.data["preferences"]
-        if not isinstance(preferences, dict) or set(preferences) - set(PREFERENCES) or not all(
-                type(value) is bool for value in preferences.values()):
+        if not isinstance(preferences, dict) or not all(isinstance(key, str) for key in preferences) or not all(
+                type(value) is bool for key, value in preferences.items() if key in PREFERENCES):
             raise ValueError("preferências")
         connections = set()
         connection_names = set()
         for connection in self.data["connections"]:
-            if not isinstance(connection, dict) or set(connection) != CONNECTION_KEYS:
+            if not isinstance(connection, dict) or CONNECTION_KEYS - set(connection):
                 raise ValueError("conexão")
             identifier = str(uuid.UUID(connection["id"]))
             name = clean_text(connection["name"], "Nome da conexão")
@@ -111,7 +145,7 @@ class Store:
             if not isinstance(connection["connector"], str) or not re.fullmatch(r"[\w-]{1,40}", connection["connector"]):
                 raise ValueError("conector")
             options = connection["options"]
-            if not isinstance(options, dict) or not all(isinstance(key, str) and type(value) in (str, bool)
+            if not isinstance(options, dict) or not all(isinstance(key, str) and type(value) in (str, bool, int, float)
                                                         for key, value in options.items()):
                 raise ValueError("opções")
             connections.add(identifier)
@@ -124,7 +158,7 @@ class Store:
         paths = set()
         names = set()
         for project in self.data["projects"]:
-            if not isinstance(project, dict) or set(project) != PROJECT_KEYS:
+            if not isinstance(project, dict) or PROJECT_KEYS - set(project):
                 raise ValueError("projeto")
             identifier = str(uuid.UUID(project["id"]))
             name = clean_text(project["name"], "Nome")
@@ -141,10 +175,11 @@ class Store:
             if not isinstance(project["models"], dict) or set(project["models"]) - connections:
                 raise ValueError("modelos")
             for chosen in project["models"].values():
-                if not isinstance(chosen, dict) or set(chosen) - set(CLIS):
+                if not isinstance(chosen, dict) or not all(isinstance(key, str) for key in chosen):
                     raise ValueError("modelos")
-                for model in chosen.values():
-                    validate_model(model)
+                for key, model in chosen.items():
+                    if key in CLIS:
+                        validate_model(model)
             if not isinstance(project["last_used"], (int, float)) or not 0 <= project["last_used"] < 1e12:
                 raise ValueError("data")
         if self.data["last_project"] is not None and self.data["last_project"] not in identifiers:
@@ -157,7 +192,10 @@ class Store:
         if self.data["projects"] or backup:
             atomic_json(self.backups / f"config-{time.strftime('%Y-%m-%d')}.json", self.data)
             for old in sorted(self.backups.glob("config-*.json"), reverse=True)[BACKUP_DAYS:]:
-                old.unlink()
+                try:
+                    old.unlink()
+                except OSError:
+                    pass  # cópia velha presa por antivírus: a gravação que já deu certo não falha por isso
 
     # Projetos
 
@@ -222,13 +260,9 @@ class Store:
     # Última escolha por projeto: claude/codex no config.json, os outros destinos em selections.json
 
     def _selections(self) -> dict:
-        try:
-            data = json.loads((self.home / SELECTIONS).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {"projects": {}}
-        if not isinstance(data, dict) or not isinstance(data.get("projects"), dict):
-            return {"projects": {}}
-        return data
+        data = read_json_state(self.home / SELECTIONS,
+                               accept=lambda data: isinstance(data, dict) and isinstance(data.get("projects"), dict))
+        return data or {"projects": {}}
 
     def last_cli(self, project: dict) -> str:
         """Destino da última abertura do projeto (inclusive os que não cabem no config.json da 1.0)."""

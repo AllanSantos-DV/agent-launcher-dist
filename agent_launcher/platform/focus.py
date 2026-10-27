@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 from agent_launcher import ROOT
-from agent_launcher.domain.files import atomic_json
+from agent_launcher.domain.files import atomic_json, read_text_retrying
 
 STATE_FILE = Path.home() / ".cli-launcher" / "topmost.json"
 MUTEX_NAME = "Local\\agent-launcher-topmost"
@@ -281,7 +281,7 @@ def keep_behind(open_window: Callable[[], object], title: str, other_monitor: bo
 
 def read_state(path: Path | None = None) -> dict:
     try:
-        return json.loads((path or STATE_FILE).read_text(encoding="utf-8"))
+        return json.loads(read_text_retrying(path or STATE_FILE))
     except (OSError, ValueError):
         return {}
 

@@ -18,7 +18,7 @@ from pathlib import Path
 from agent_launcher import ROOT
 from agent_launcher.domain import profiles
 from agent_launcher.domain.errors import LauncherError
-from agent_launcher.domain.files import atomic_json
+from agent_launcher.domain.files import atomic_json, read_json_state
 
 # As portas do produto começam em 47910 (as anteriores ficam livres para testes locais).
 PORT_RANGE = range(47910, 48000)
@@ -31,11 +31,8 @@ def state_file(home: Path | None = None) -> Path:
 
 
 def _read_file(path: Path) -> dict:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {"ports": {}}
-    return data if isinstance(data, dict) and isinstance(data.get("ports"), dict) else {"ports": {}}
+    data = read_json_state(path, accept=lambda data: isinstance(data, dict) and isinstance(data.get("ports"), dict))
+    return data or {"ports": {}}
 
 
 def _read(home: Path | None = None) -> dict:

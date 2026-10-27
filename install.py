@@ -18,7 +18,7 @@ from pathlib import Path
 
 import clis
 import terminal
-from agent_launcher.domain.files import remove_tree, replace_retrying
+from agent_launcher.domain.files import atomic_text, remove_tree, replace_retrying
 from version import APP_NAME, APP_USER_MODEL_ID, VERSION, data_home
 
 SOURCE = Path(__file__).resolve().parent
@@ -152,8 +152,8 @@ def copy_files(target, files, backup, changed, removed, previous):
             (backup / rel).parent.mkdir(parents=True, exist_ok=True)
             replace_retrying(target / rel, backup / rel)
             removed.append(rel)
-    (target / MANIFEST).write_text(json.dumps({"installed_at": time.time(), "version": VERSION, "source": str(SOURCE),
-                                               "files": files}, indent=1), encoding="utf-8")
+    atomic_text(target / MANIFEST, json.dumps({"installed_at": time.time(), "version": VERSION, "source": str(SOURCE),
+                                               "files": files}, indent=1))
 
 
 def clear_bytecode(target):

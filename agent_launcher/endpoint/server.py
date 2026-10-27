@@ -30,6 +30,7 @@ from agent_launcher.connectors._http import is_local_host
 from agent_launcher.domain.errors import LauncherError
 
 IDLE_SECONDS = 4 * 60 * 60
+LOG_MAX_BYTES = 1_000_000  # endpoint.log: passando disso, fica a metade mais recente
 BODY_LIMIT = 64 * 1024 * 1024
 ROUTES = {"/v1/messages": "messages", "/v1/messages/count_tokens": "messages", "/v1/responses": "responses",
           "/v1/chat/completions": "chat_completions"}
@@ -408,15 +409,22 @@ class EndpointServer(ThreadingHTTPServer):
             return  # cliente que desistiu (cancelou o stream): rotina, não defeito
         self.note(f"erro no pedido: {type(error).__name__}: {error}")
 
+    def _append(self, line: str) -> None:
+        """Acrescenta ao endpoint.log (sob _log_lock); passando de LOG_MAX_BYTES, fica só a metade mais recente."""
+        try:
+            if self.log.exists() and self.log.stat().st_size > LOG_MAX_BYTES:
+                kept = self.log.read_bytes()[-LOG_MAX_BYTES // 2:].split(b"\n", 1)[-1]
+                self.log.write_bytes(kept)
+            with self.log.open("a", encoding="utf-8") as stream:
+                stream.write(line)
+        except OSError:
+            pass
+
     def note(self, message: str) -> None:
         if not self.log:
             return
         with self._log_lock:
-            try:
-                with self.log.open("a", encoding="utf-8") as stream:
-                    stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
-            except OSError:
-                pass
+            self._append(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
 
     def record(self, protocol: str, path: str, model: str, status: int, seconds: float) -> None:
         self.requests += 1
@@ -425,11 +433,7 @@ class EndpointServer(ThreadingHTTPServer):
         line = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} {self.upstream.connection_id[:8]} POST {path} {protocol} "
                 f"model={model!r} status={status} {seconds:.1f}s\n")
         with self._log_lock:
-            try:
-                with self.log.open("a", encoding="utf-8") as stream:
-                    stream.write(line)
-            except OSError:
-                pass
+            self._append(line)
 
     def record_usage(self, protocol: str, model: str, usage: dict | None, destination: str) -> None:
         """Uma linha por resposta com usage em <raiz>/usage.jsonl (sem corpo, sem prompt). Nunca levanta."""

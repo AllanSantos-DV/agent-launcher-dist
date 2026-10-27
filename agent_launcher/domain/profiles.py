@@ -10,16 +10,19 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unicodedata
 import uuid
 from pathlib import Path
 
 from agent_launcher.domain.errors import LauncherError
-from agent_launcher.domain.files import atomic_json, clean_text, path_key, remove_tree
+from agent_launcher.domain.files import atomic_json, clean_text, path_key, read_json_state, remove_tree
 
 DEFAULT = "default"
 FILE = "profiles.json"
 FOLDER = "profiles"
+BACKUPS = "backups"
+BACKUP_DAYS = 30
 COLORS = ("#5b8def", "#d9822b", "#2f9e77", "#b05fd0", "#d64545", "#3aa0b8", "#a08a2a", "#7a7f8c")
 ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 COLOR_PATTERN = re.compile(r"#[0-9a-fA-F]{6}")
@@ -32,12 +35,7 @@ def root() -> Path:
 
 def _read(base: Path | None = None) -> dict:
     base = base or root()
-    try:
-        data = json.loads((base / FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
+    data = read_json_state(base / FILE, backups=base / BACKUPS, prefix="profiles-") or {}
     profiles = [item for item in data.get("profiles") or [] if isinstance(item, dict)
                 and isinstance(item.get("id"), str) and ID_PATTERN.match(item["id"]) and item["id"] != DEFAULT
                 and isinstance(item.get("name"), str) and item["name"].strip()]
@@ -46,7 +44,15 @@ def _read(base: Path | None = None) -> dict:
 
 
 def _write(data: dict, base: Path | None = None) -> None:
-    atomic_json((base or root()) / FILE, data)
+    base = base or root()
+    atomic_json(base / FILE, data)
+    folder = base / BACKUPS
+    atomic_json(folder / f"profiles-{time.strftime('%Y-%m-%d')}.json", data)
+    for old in sorted(folder.glob("profiles-*.json"), reverse=True)[BACKUP_DAYS:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
 
 def default_profile() -> dict:

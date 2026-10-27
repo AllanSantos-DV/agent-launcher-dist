@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from agent_launcher.domain.errors import LauncherError
-from agent_launcher.domain.files import atomic_json
+from agent_launcher.domain.files import atomic_json, read_text_retrying
 from agent_launcher.platform import secret_store
 
 
@@ -16,9 +16,11 @@ class Vault:
 
     def _read(self) -> dict:
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data = json.loads(read_text_retrying(self.path))
         except FileNotFoundError:
             return {}
+        except OSError as error:
+            raise LauncherError(f"Cofre de chaves recusado pelo sistema em {self.path} ({error}); tente de novo.") from error
         except ValueError as error:
             raise LauncherError(f"Cofre de chaves ilegível em {self.path}; o arquivo foi preservado.") from error
         if not isinstance(data, dict) or not all(isinstance(value, str) for value in data.values()):

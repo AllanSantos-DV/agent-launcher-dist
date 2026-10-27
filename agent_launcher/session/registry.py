@@ -7,7 +7,7 @@ import json
 import os
 import time
 from pathlib import Path
-from agent_launcher.domain.files import atomic_text
+from agent_launcher.domain.files import atomic_text, read_text_retrying
 
 FILE = "sessions.jsonl"
 KEEP = 2000
@@ -44,7 +44,7 @@ def record(home: Path, *, profile: str, project: str, folder, cli: str, connecti
 def entries(home: Path, folder=None, cli: str | None = None) -> list[dict]:
     """Aberturas registradas (mais antigas primeiro), filtradas por pasta e CLI. Linha inválida é ignorada."""
     try:
-        lines = _path(home).read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = read_text_retrying(_path(home), encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
     wanted = _key(folder) if folder is not None else None

@@ -149,7 +149,7 @@ def _validate(manifest) -> None:
                 or not isinstance(entry.get("connector"), str) or not re.fullmatch(r"[\w-]{1,40}", entry["connector"]):
             raise LauncherError(f"{MANIFEST}: conexão inválida {entry!r}.")
         options = entry.get("options", {})
-        if not isinstance(options, dict) or not all(isinstance(key, str) and type(value) in (str, bool)
+        if not isinstance(options, dict) or not all(isinstance(key, str) and type(value) in (str, bool, int, float)
                                                     for key, value in options.items()):
             raise LauncherError(f"{MANIFEST}: opções inválidas na conexão {entry['name']}.")
         for key in options:

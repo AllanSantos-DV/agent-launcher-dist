@@ -53,6 +53,61 @@ def replace_retrying(source, destination, attempts: int = REPLACE_ATTEMPTS) -> N
             time.sleep(0.015 * attempt * (0.5 + random.random()))
 
 
+def read_text_retrying(path, attempts: int = REPLACE_ATTEMPTS, encoding: str = "utf-8-sig", errors: str = "strict") -> str:
+    """read_text que repete quando o Windows recusa a abertura por um replace em andamento no mesmo arquivo (a leitura
+    concorrente com o rename atômico chega como PermissionError); esgotadas as tentativas, levanta."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return Path(path).read_text(encoding=encoding, errors=errors)
+        except PermissionError:
+            if attempt == attempts:
+                raise
+            time.sleep(0.015 * attempt * (0.5 + random.random()))
+
+
+def note_state_recovery(folder: Path, message: str) -> None:
+    """Uma linha em state-recovery.log da pasta: o que foi preservado ou restaurado de um arquivo de estado."""
+    try:
+        with (Path(folder) / "state-recovery.log").open("a", encoding="utf-8") as stream:
+            stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except OSError:
+        pass
+
+
+def read_json_state(path, accept=lambda data: isinstance(data, dict), backups: Path | None = None, prefix: str = ""):
+    """Lê um arquivo de estado JSON. None se não existe. Ilegível ou fora do formato: guarda uma cópia ao lado
+    (<nome>.invalid-<data>) para a próxima gravação não apagar o que sobrou, tenta a cópia mais recente de `backups`
+    (<prefix>*.json) e devolve None só se nenhuma serve. Leitura recusada por gravação em andamento repete; recusa
+    persistente levanta (nunca vira "vazio")."""
+    path = Path(path)
+    try:
+        text = read_text_retrying(path)
+    except FileNotFoundError:
+        return None
+    try:
+        data = json.loads(text)
+        if accept(data):
+            return data
+    except ValueError:
+        pass
+    kept = path.with_name(f"{path.name}.invalid-{time.strftime('%Y%m%d-%H%M%S')}")
+    try:
+        shutil.copyfile(path, kept)
+    except OSError:
+        kept = None
+    note_state_recovery(path.parent, f"{path.name} ilegível ou fora do formato; cópia em {kept}")
+    for copy in sorted(Path(backups).glob(f"{prefix}*.json"), reverse=True) if backups else []:
+        try:
+            data = json.loads(read_text_retrying(copy))
+        except (OSError, ValueError):
+            continue
+        if accept(data):
+            atomic_json(path, data)
+            note_state_recovery(path.parent, f"{path.name} restaurado da cópia {copy.name}")
+            return data
+    return None
+
+
 def remove_tree(path, attempts: int = 5) -> None:
     """shutil.rmtree que repete quando o Windows recusa por arquivo em uso (um pythonw da venv ainda carregado, o
     antivírus varrendo); esgotadas as tentativas, levanta o último erro."""
