@@ -213,6 +213,22 @@ class TerminalTask(QRunnable):
         self.signals.completed.emit(found, "\n".join(lines))
 
 
+class TerminalUpdateTask(QRunnable):
+    """Atualiza o Windows Terminal portátil (a cópia que o launcher instalou) fora da thread da interface."""
+
+    def __init__(self, root: Path):
+        super().__init__()
+        self.root = root
+        self.signals = RefreshSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            self.signals.completed.emit(terminal.update_portable(self.root) or "", "")
+        except Exception as error:  # falha inesperada também precisa voltar para a tela
+            self.signals.completed.emit(error, "")
+
+
 class UpdateTask(QRunnable):
     """Confere o npm e, havendo versão nova, instala por cima (fora da thread da interface)."""
 
@@ -374,6 +390,7 @@ class LauncherWindow(QMainWindow):
         self.refreshing = False
         self.sessions = []
         self.terminal_installing = False
+        self.terminal_updating = False
         self.update_status = "não verificada nesta execução"
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(str(ROOT / "assets" / "launcher.ico")))
@@ -731,7 +748,26 @@ class LauncherWindow(QMainWindow):
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(f"Não foi possível salvar a preferência: {error}")
 
+    def update_portable_terminal(self):
+        if self.terminal_installing or self.terminal_updating or not self.store.preference("auto_update") \
+                or updater.disabled_by_env():
+            return
+        self.terminal_updating = True
+        self.terminal_update_task = TerminalUpdateTask(ROOT)
+        self.terminal_update_task.signals.completed.connect(self.finish_terminal_update)
+        QThreadPool.globalInstance().start(self.terminal_update_task)
+
+    @Slot(object, str)
+    def finish_terminal_update(self, result, _unused=""):
+        self.terminal_updating = False
+        if isinstance(result, Exception):
+            # Sem rede ou sem acesso ao GitHub: não vira faixa a cada abertura; fica no registro do Terminal.
+            record_terminal_problem(self.problem_report(f"Atualização do Windows Terminal portátil falhou: {result}"))
+        elif result and not result.startswith("adiada"):
+            self.show_info(result)
+
     def start_auto_update(self):
+        self.update_portable_terminal()
         if self.update_status == "verificando…":
             return  # o timer periódico não sobrepõe uma verificação em andamento
         if not self.store.preference("auto_update"):

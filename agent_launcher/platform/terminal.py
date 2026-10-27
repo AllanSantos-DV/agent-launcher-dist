@@ -15,15 +15,19 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 RELEASE_API = "https://api.github.com/repos/microsoft/terminal/releases/latest"
 MIN_BUILD = 19041
 DOWNLOAD_LIMIT = 80 * 1024 * 1024
 SIGNER = "CN=Microsoft Corporation"
+VERSION_FILE = ".version"
+UPDATE_CHECK_INTERVAL_S = 4 * 60 * 60  # a API anônima do GitHub aceita 60 consultas por hora por IP
 
 # (descrição, chave sob HKLM/HKCU, valor, valor que bloqueia)
 POLICIES = (
@@ -188,8 +192,23 @@ def signature_ok(executable: Path) -> bool:
     return result.returncode == 0
 
 
+def zip_version(name: str) -> tuple[int, ...] | None:
+    """Versão do nome do asset (Microsoft.WindowsTerminal_1.24.10921.0_x64.zip); None se o nome não traz uma."""
+    found = re.search(r"_(\d+(?:\.\d+)+)_", name)
+    return tuple(int(part) for part in found.group(1).split(".")) if found else None
+
+
+def portable_version(root: Path) -> tuple[int, ...] | None:
+    """Versão gravada na cópia portátil ao instalar; None numa cópia anterior a esse registro."""
+    try:
+        return tuple(int(part) for part in (portable_dir(root) / VERSION_FILE).read_text(encoding="utf-8").strip().split("."))
+    except (OSError, ValueError):
+        return None
+
+
 def install_portable(root: Path, zip_path: Path | None = None, verify=signature_ok) -> Path:
-    """Extrai o Terminal em <root>/terminal (modo portátil). Substitui uma cópia anterior só depois de validar a nova."""
+    """Extrai o Terminal em <root>/terminal (modo portátil). Substitui uma cópia anterior só depois de validar a nova;
+    com o Terminal portátil em uso o Windows recusa renomear a pasta (PermissionError) e a cópia anterior fica intacta."""
     target = portable_dir(root)
     import tempfile
     import zipfile
@@ -215,14 +234,65 @@ def install_portable(root: Path, zip_path: Path | None = None, verify=signature_
             if not verify(extracted / required):
                 raise TerminalError(f"{required} sem assinatura válida da Microsoft; instalação recusada.")
         (extracted / ".portable").touch()
+        version = zip_version(zip_path.name)
+        if version:
+            (extracted / VERSION_FILE).write_text(".".join(map(str, version)), encoding="utf-8")
         previous = target.with_name("terminal.old")
         if previous.exists():
             shutil.rmtree(previous)
         if target.exists():
             target.rename(previous)
-        shutil.move(str(extracted), str(target))
+        try:
+            shutil.move(str(extracted), str(target))
+        except OSError:
+            if previous.exists() and not target.exists():
+                previous.rename(target)
+            raise
         shutil.rmtree(previous, ignore_errors=True)
     return target / "wt.exe"
+
+
+def portable_in_use(root: Path) -> bool:
+    """Algum executável da cópia portátil está rodando? O Windows deixa renomear a pasta com o Terminal aberto (a
+    troca largaria arquivos da cópia velha e o Terminal em uso continuaria carregando DLLs da pasta renomeada), mas
+    não deixa abrir um .exe em execução para escrita: é essa recusa que denuncia o uso."""
+    for executable in portable_dir(root).rglob("*.exe"):
+        try:
+            executable.open("ab").close()
+        except PermissionError:
+            return True
+    return False
+
+
+def update_portable(root: Path, check=latest_zip, install=install_portable, stamp: Path | None = None,
+                    now=time.time) -> str | None:
+    """Atualiza a cópia portátil (a única que o launcher mantém: a da Store ou do winget o Windows atualiza). Devolve o
+    que fez ("atualizado para X", "adiada: em uso") ou None quando não havia o que fazer. No máximo uma consulta por
+    UPDATE_CHECK_INTERVAL_S; consulta ou download que falham levantam TerminalError (a cópia atual segue intacta)."""
+    if not (portable_dir(root) / "wt.exe").is_file() or shutil.which("wt.exe") or os.path.lexists(store_alias()):
+        return None
+    if stamp is None:
+        from version import data_home
+        stamp = data_home() / "terminal-update-check"
+    try:
+        if now() - stamp.stat().st_mtime < UPDATE_CHECK_INTERVAL_S:
+            return None
+    except FileNotFoundError:
+        pass
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    name = check()[0]
+    latest, current = zip_version(name), portable_version(root)
+    if latest and current and latest <= current:
+        return None
+    try:
+        if portable_in_use(root):
+            raise PermissionError("Windows Terminal portátil em uso")
+        install(root)
+    except PermissionError:
+        stamp.unlink(missing_ok=True)  # em uso: tenta de novo na próxima verificação
+        return "adiada: o Windows Terminal portátil está em uso"
+    return f"Windows Terminal portátil atualizado para {'.'.join(map(str, latest)) if latest else name}"
 
 
 def install_winget() -> None:

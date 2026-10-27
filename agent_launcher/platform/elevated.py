@@ -298,12 +298,21 @@ def task_command(run=subprocess.run) -> str | None:
     return html.unescape(found.group(1)).strip() if found else None
 
 
-def stale_task(run=subprocess.run) -> str | None:
-    """Motivo se a tarefa instalada aponta para um executável que não existe mais (Python movido ou removido)."""
+def stale_task(run=subprocess.run, system_root: str | None = None) -> str | None:
+    """Motivo se a tarefa instalada precisa ser regravada: aponta para um executável que não existe mais (Python movido
+    ou removido) ou grava o caminho de um Python quando o `pyw.exe` do Windows já resolveria o Python a cada disparo.
+    Regravar exige o clique de UAC de `launcher elevated enable`; a tarefa antiga segue funcionando enquanto o Python
+    dela existir."""
     command = task_command(run)
-    if command and not Path(os.path.expandvars(command.strip('"'))).is_file():
+    if not command:
+        return None
+    path = Path(os.path.expandvars(command.strip('"')))
+    if not path.is_file():
         return (f"a tarefa {TASK} aponta para {command}, que não existe mais; rode 'launcher elevated enable' "
                 "(um clique de UAC) para regravá-la")
+    if path.name.lower() in ("python.exe", "pythonw.exe") and Path(task_action(system_root)[0]).name.lower() == "pyw.exe":
+        return (f"a tarefa {TASK} grava o caminho de um Python ({command}); rode 'launcher elevated enable' (um clique "
+                "de UAC) para regravá-la pelo pyw.exe, que acha o Python a cada disparo")
     return None
 
 
