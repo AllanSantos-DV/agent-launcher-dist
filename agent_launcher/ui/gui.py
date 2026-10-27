@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 from agent_launcher import ROOT
 from agent_launcher.domain import profiles
 from agent_launcher.domain.catalog import base_model, token_label
-from agent_launcher.domain.errors import LauncherError
+from agent_launcher.domain.errors import LauncherBusy, LauncherError
 from agent_launcher.domain.files import project_path
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
@@ -427,6 +427,7 @@ class LauncherWindow(QMainWindow):
         self.cli_queue = []
         self.cli_checking = False
         self.cli_updating = None
+        self.notice_is_info = False
         self.cli_failed = set()
         self.cli_announced = ()
         self.update_status = "não verificada nesta execução"
@@ -817,31 +818,34 @@ class LauncherWindow(QMainWindow):
         self.cli_checking = False
         if isinstance(result, Exception):
             clis.record(f"verificação das CLIs falhou: {result}")
-            self.show_info(f"Não foi possível verificar as versões das CLIs: {result}")
+            self.show_error(f"Não foi possível verificar as versões das CLIs: {result}")
             return
         self.cli_versions = result
         self.refresh_cli_versions()
-        lines, self.cli_queue = [], []
+        lines, problems, self.cli_queue = [], [], []
         for cli, found in result.items():
             if found["error"] and not found["installed"]:
-                lines.append(f"{clis.NAMES[cli]}: não foi possível verificar a versão ({found['error']}).")
+                problems.append(f"{clis.NAMES[cli]}: não foi possível verificar a versão ({found['error']}).")
                 continue
             if not found["newer"]:
                 continue
             head = f"{clis.NAMES[cli]} {found['latest']} disponível (instalada {found['installed']})"
-            if found["blocked"]:
-                lines.append(f"{head}; adiada: {found['blocked']}. Use Atualizar quando fechar as sessões.")
-            elif self.store.preference("cli_auto_update") and not cli_update.disabled_by_env() \
+            if self.store.preference("cli_auto_update") and not cli_update.disabled_by_env() \
                     and (cli, found["latest"]) not in self.cli_failed:
-                lines.append(f"{head}; atualizando agora.")
+                lines.append(f"{head}; atualizando agora." + self.sessions_note(found["running"]))
                 self.cli_queue.append(cli)
             else:
                 lines.append(f"{head}. Use o botão Atualizar.")
+        lines = problems + lines
         if lines and tuple(lines) != self.cli_announced:
-            self.show_info("\n".join(lines))
+            (self.show_error if problems else self.show_info)("\n".join(lines))
         self.cli_announced = tuple(lines)
         self.run_next_cli_update()
         self.update_actions()
+
+    @staticmethod
+    def sessions_note(count: int) -> str:
+        return (f" {count} sessão(ões) aberta(s) seguem na versão antiga; a nova vale na próxima abertura." if count else "")
 
     def refresh_cli_versions(self):
         for cli, widget in self.cli_buttons.items():
@@ -869,10 +873,10 @@ class LauncherWindow(QMainWindow):
             self.cli_failed.add((cli, found.get("latest")))
             self.show_error(f"Aviso: não foi possível atualizar o {name}: {result}")
         elif result["updated"]:
-            found.update(installed=result["after"], newer=False, blocked=None)
-            self.show_info(f"{name} atualizado: {result['before']} → {result['after']}.")
+            found.update(installed=result["after"], newer=False, running=0)
+            self.show_info(f"{name} atualizado: {result['before']} → {result['after']}." + self.sessions_note(result["sessions"]))
         else:
-            found.update(installed=result["after"], newer=False, blocked=None)
+            found.update(installed=result["after"], newer=False, running=0)
             self.show_info(f"{name} já está em dia ({result['after']}).")
         self.refresh_cli_versions()
         self.run_next_cli_update()
@@ -1202,9 +1206,13 @@ class LauncherWindow(QMainWindow):
             self.catalog = catalog
         elif self.catalog is not None:
             self.catalog.verified = False
-        self.notice.setVisible(bool(error))
-        self.notice.setText(f"Não foi possível acessar a conexão. Verifique o host e clique em Atualizar. {error}" if error else "")
-        self.notice.setToolTip(error)
+        if error:
+            self.show_error(f"Não foi possível acessar a conexão. Verifique o host e clique em Atualizar. {error}")
+            self.notice.setToolTip(error)
+        else:
+            self.notice.hide()
+            self.notice.setText("")
+            self.notice.setToolTip("")
         self.footer.setText(self.catalog.status.replace("atualizar: r", "atualizar: F5") if self.online and self.catalog else error)
         self.populate_providers()
         self.populate_models()
@@ -1222,6 +1230,9 @@ class LauncherWindow(QMainWindow):
             process = start_session(self.store, self.project, self.cli, self.selected_model.id, resume,
                                     bypass_permissions=bypass_permissions, connection=self.gateway.connection["id"],
                                     **({"conversation": conversation} if conversation else {}))
+        except LauncherBusy as error:
+            self.show_info(str(error))
+            return
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(str(error))
             return
@@ -1276,7 +1287,7 @@ class LauncherWindow(QMainWindow):
     def eventFilter(self, watched, event):
         # *ToParent: chegam ao mostrar/esconder a faixa mesmo com a janela ainda invisível (Show/Hide não).
         if watched is self.notice and event.type() in (QEvent.Type.ShowToParent, QEvent.Type.HideToParent):
-            self.copy_error.setVisible(event.type() == QEvent.Type.ShowToParent)
+            self.copy_error.setVisible(event.type() == QEvent.Type.ShowToParent and not self.notice_is_info)
         return super().eventFilter(watched, event)
 
     def problem_report(self, message: str) -> str:
@@ -1327,14 +1338,18 @@ class LauncherWindow(QMainWindow):
         record_terminal_problem(self.problem_report(log or "Instalação do Windows Terminal falhou sem detalhes."))
 
     def show_info(self, message):
-        self.notice.setText(message)
-        self.notice.setToolTip(message)
-        self.notice.show()
+        """Aviso informativo (versão nova, atualizado, adiado): sem o botão Copiar erro."""
+        self.set_notice(message, info=True)
 
     def show_error(self, message):
+        self.set_notice(message, info=False)
+
+    def set_notice(self, message, info):
+        self.notice_is_info = info
         self.notice.setText(message)
         self.notice.setToolTip(message)
         self.notice.show()
+        self.copy_error.setVisible(not info)
 
     def add_project(self):
         folder = QFileDialog.getExistingDirectory(self, "Escolha a pasta do projeto")

@@ -740,11 +740,12 @@ def describe_cli_version(found: dict) -> str:
         return f"{text} (última publicada não consultada: {found['error']})"
     if not found["newer"]:
         return f"{text} (em dia)"
-    return f"{text} → {found['latest']} disponível" + (f"; adiada: {found['blocked']}" if found["blocked"] else "")
+    return f"{text} → {found['latest']} disponível" + (
+        f"; {found['running']} sessão(ões) aberta(s) seguem na versão antiga até reabrir" if found["running"] else "")
 
 
 def update_clis(targets) -> int:
-    """`launcher cli --update`: atualiza e conta o resultado de cada CLI; sessão aberta adia sem contar como falha."""
+    """`launcher cli --update`: atualiza e conta o resultado de cada CLI; arquivo preso adia sem contar como falha."""
     status = 0
     for cli in targets:
         if not clis.find(cli):
@@ -758,7 +759,9 @@ def update_clis(targets) -> int:
             print(f"{clis.NAMES[cli]}: {error}", file=sys.stderr)
             status = 1
         else:
-            print(f"{clis.NAMES[cli]}: {outcome['before']} → {outcome['after']}" if outcome["updated"]
+            print(f"{clis.NAMES[cli]}: {outcome['before']} → {outcome['after']}"
+                  + (f"; {outcome['sessions']} sessão(ões) aberta(s) seguem na versão antiga até reabrir" if outcome["sessions"] else "")
+                  if outcome["updated"]
                   else f"{clis.NAMES[cli]}: já está em dia ({outcome['after']})")
     return status
 

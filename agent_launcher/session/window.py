@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 from agent_launcher import ROOT
-from agent_launcher.domain.errors import LauncherError
+from agent_launcher.domain.errors import LauncherBusy, LauncherError
 from agent_launcher.domain import profiles
 from agent_launcher.domain.files import project_path
 from agent_launcher.domain.gateway import Gateway
@@ -101,7 +101,7 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
         raise LauncherError(f"O {harness.LABEL} não abre em janela de terminal; use a interface.")
     from agent_launcher.harnesses import cli_update  # fora do topo: a janela da sessão tem orçamento de imports
     if cli_update.updating(cli):
-        raise LauncherError(f"O {harness.LABEL} está sendo atualizado agora; abra a sessão quando terminar.")
+        raise LauncherBusy(f"O {harness.LABEL} está sendo atualizado agora; abra a sessão quando terminar.")
     try:  # sessões abertas por outro programa (sem a interface) também mantêm a instalação atualizada
         updater.check_in_background(ROOT, store.preference("auto_update"))
     except OSError as error:

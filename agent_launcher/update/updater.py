@@ -245,9 +245,11 @@ def check_in_background(root: Path = ROOT, enabled: bool = True, stamp: Path | N
 def background_main() -> int:
     """updater.py --background da raiz (processo oculto disparado por check_in_background)."""
     try:
-        installed_version = update(ROOT)
-        record(f"Atualizado em segundo plano para {installed_version}." if installed_version
-               else f"Verificação em segundo plano: {VERSION} já é a mais recente (ou outra atualização em andamento).")
+        notes: list[str] = []
+        installed_version = update(ROOT, log=notes.append)
+        record((f"Atualizado em segundo plano para {installed_version}." if installed_version
+                else f"Verificação em segundo plano: {VERSION} já é a mais recente (ou outra atualização em andamento).")
+               + "".join(f" {note}" for note in notes if "Trava" in note))
     except UpdateError as error:
         record(f"Atualização em segundo plano falhou: {error}")
     except Exception as error:  # processo oculto: sem isto morreria sem deixar rastro no update.log

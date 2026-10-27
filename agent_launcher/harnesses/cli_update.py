@@ -1,7 +1,7 @@
 """Versão instalada, versão publicada e atualização das CLIs de terminal (Claude Code, Codex, Copilot CLI).
 
 O launcher não troca binário: dispara o `update` que a própria CLI já tem (ou o npm de quem a instalou por ele),
-nunca com sessão dela aberta, e devolve o resultado para a tela mostrar. VS Code e o app do Copilot ficam de fora.
+sem esperar pelas sessões abertas (a versão nova vale na próxima abertura), e devolve o resultado para a tela mostrar. VS Code e o app do Copilot ficam de fora.
 Desligar: preferência "Atualizar as CLIs automaticamente" no menu ou AGENT_LAUNCHER_NO_CLI_UPDATE=1.
 """
 from __future__ import annotations
@@ -16,6 +16,7 @@ from pathlib import Path
 
 from agent_launcher.harnesses import installers
 from agent_launcher.harnesses.installers import NAMES, NPM_FLAGS, NPM_PACKAGES, CliInstallError
+from agent_launcher.platform import processes
 from agent_launcher.update import updater
 from version import data_home
 
@@ -24,7 +25,7 @@ UPDATE_TIMEOUT = 900
 
 
 class UpdateDeferred(CliInstallError):
-    """Há sessão da CLI aberta: o npm falharia e o nativo deixaria a sessão na versão velha. Tenta de novo depois."""
+    """A tentativa de atualizar bateu num arquivo preso (sessão aberta no npm, por exemplo). Não é erro: tenta de novo depois."""
 
 
 def disabled_by_env() -> bool:
@@ -83,30 +84,34 @@ def command(cli: str, path: str, origin: str) -> list[str]:
 
 
 def _executables(cli: str, path: str) -> list[Path]:
+    """Os arquivos que o `update` da CLI troca: o .exe do caminho (e o que ele aponta), o binário da plataforma do
+    npm e, no Copilot, as builds que ele guarda em ~/.copilot/pkg."""
     found = [Path(path)] if Path(path).suffix.lower() == ".exe" else []
     try:
         extra = (installers.claude_binary(Path(path)) if cli == "claude"
                  else installers.codex_platform_binary(Path(path)) if cli == "codex" else None)
     except CliInstallError:
         extra = None
+    if cli == "copilot":
+        found += list((Path.home() / ".copilot" / "pkg").glob("**/copilot.exe"))
     return found + ([extra] if extra else [])
 
 
-def blocked_by(cli: str, path: str) -> str | None:
-    """Motivo para adiar (sessão da CLI aberta), ou None. Vale a sessão aberta por este launcher e o .exe em execução
-    por qualquer outro caminho: o Windows não abre um .exe em uso para escrita."""
-    from agent_launcher.platform import keys
-    opened = [item for item in keys.sessions() if item.get("cli") == cli]
-    if opened:
-        return f"há {len(opened)} sessão(ões) do {NAMES[cli]} aberta(s) neste launcher"
-    for executable in _executables(cli, path):
-        try:
-            executable.open("ab").close()
-        except PermissionError:
-            return f"o {executable.name} está em uso por outro processo"
-        except OSError:
-            continue
-    return None
+def running(cli: str, path: str) -> list[tuple[int, str]]:
+    """Processos em execução cujo executável é um dos arquivos que a atualização troca (sessões abertas, por este
+    launcher ou por qualquer outro caminho). Só processo de verdade conta: arquivo aberto por antivírus ou por sonda não."""
+    return processes.running_from(_executables(cli, path))
+
+
+def describe_running(found: list[tuple[int, str]]) -> str:
+    return ", ".join(f"{Path(image).name} (PID {pid})" for pid, image in found[:3]) + (", …" if len(found) > 3 else "")
+
+
+# Sinais inequívocos de arquivo preso; "acesso negado" sozinho (prefixo do npm sem permissão, por exemplo) só adia quando
+# há processo da CLI de verdade rodando, senão é falha e vai para o log.
+LOCKED = re.compile(r"EBUSY|being used by another process|WinError 32\b|resource busy|text file busy|em uso por outro processo",
+                    re.IGNORECASE)
+DENIED = re.compile(r"EPERM|EACCES|Access is denied|WinError 5\b|acesso negado", re.IGNORECASE)
 
 
 def lock_path(cli: str) -> Path:
@@ -122,12 +127,13 @@ def updating(cli: str) -> bool:
 
 
 def check(cli: str, latest=latest_version) -> dict | None:
-    """{installed, latest, newer, source, blocked, error} ou None quando a CLI não está instalada."""
+    """{installed, latest, newer, source, running, error} ou None quando a CLI não está instalada. `running` conta os
+    processos da CLI em execução: a atualização não espera por eles, a versão nova vale na próxima abertura."""
     path = installers.find(cli)
     if not path:
         return None
     entry = {"installed": installed_version(cli, path), "latest": None, "newer": False, "source": source(cli, path),
-             "blocked": None, "error": None}
+             "running": 0, "error": None}
     try:
         entry["latest"] = latest(cli)
     except (updater.UpdateError, OSError) as error:
@@ -135,7 +141,7 @@ def check(cli: str, latest=latest_version) -> dict | None:
         return entry
     entry["newer"] = bool(entry["installed"]) and updater.parts(entry["latest"]) > updater.parts(entry["installed"])
     if entry["newer"]:
-        entry["blocked"] = blocked_by(cli, path)
+        entry["running"] = len(running(cli, path))
     return entry
 
 
@@ -146,7 +152,7 @@ def check_all(latest=latest_version) -> dict:
         try:
             entry = check(cli, latest)
         except (CliInstallError, OSError, subprocess.SubprocessError) as error:
-            entry = {"installed": None, "latest": None, "newer": False, "source": None, "blocked": None,
+            entry = {"installed": None, "latest": None, "newer": False, "source": None, "running": 0,
                      "error": str(error)}
         if entry:
             found[cli] = entry
@@ -154,8 +160,10 @@ def check_all(latest=latest_version) -> dict:
 
 
 def update(cli: str, latest=latest_version) -> dict:
-    """Atualiza uma CLI. {cli, before, after, updated}. Levanta UpdateDeferred com sessão aberta e CliInstallError (texto
-    legível, também em cli-install.log) se o comando falhar ou a CLI não executar depois; no npm volta para a versão anterior."""
+    """Atualiza uma CLI sem esperar pelas sessões abertas (o Windows deixa renomear um .exe em execução: a sessão segue na
+    versão velha e a nova vale na próxima abertura). {cli, before, after, updated, sessions}. Levanta UpdateDeferred só
+    quando a tentativa real bate num arquivo preso, e CliInstallError (texto legível, também em cli-install.log) se o
+    comando falhar ou a CLI não executar depois; no npm volta para a versão anterior."""
     path = installers.find(cli)
     if not path:
         raise CliInstallError(f"{NAMES[cli]} não está instalado.")
@@ -163,19 +171,17 @@ def update(cli: str, latest=latest_version) -> dict:
     target = latest(cli)
     if before and updater.parts(target) <= updater.parts(before):
         return {"cli": cli, "before": before, "after": before, "updated": False}
-    reason = blocked_by(cli, path)
-    if reason:
-        raise UpdateDeferred(f"Atualização do {NAMES[cli]} adiada: {reason}.")
     lock = lock_path(cli)
     if not updater._lock(lock):
         raise UpdateDeferred(f"Atualização do {NAMES[cli]} adiada: outra janela do launcher já está atualizando.")
     try:
-        return _apply(cli, path, before)
+        return _apply(cli, path, before, len(running(cli, path)))
     finally:
         try:
             lock.unlink(missing_ok=True)
         except PermissionError:
-            pass  # vale como velha depois de LOCK_STALE_S
+            installers.record(f"trava {lock} não removida (arquivo em uso); vale como velha depois de "
+                              f"{updater.LOCK_STALE_S // 60} min e nesse tempo as sessões de {NAMES[cli]} não abrem")
 
 
 def _run_logged(cli: str, command: list[str]):
@@ -188,9 +194,16 @@ def _run_logged(cli: str, command: list[str]):
         installers._fail(cli, "atualização", f"a atualização do {NAMES[cli]} não iniciou: {error}")
 
 
-def _apply(cli: str, path: str, before: str | None) -> dict:
+def _apply(cli: str, path: str, before: str | None, sessions: int = 0) -> dict:
     origin = source(cli, path)
     result = _run_logged(cli, command(cli, path, origin))
+    output = result.stdout + "\n" + result.stderr
+    holders = running(cli, path) if result.returncode and (LOCKED.search(output) or DENIED.search(output)) else []
+    if result.returncode and (holders or LOCKED.search(output)):
+        raise UpdateDeferred(f"Atualização do {NAMES[cli]} adiada: "
+                             + (f"{describe_running(holders)} está rodando e o arquivo está preso" if holders else
+                                "um arquivo da CLI está preso por outro processo")
+                             + ". Tento de novo na próxima verificação.")
     if result.returncode:
         installers._fail(cli, "atualização", f"atualização do {NAMES[cli]} ({origin}) falhou: {installers._tail(result)}")
     path = installers.find(cli) or path
@@ -212,4 +225,4 @@ def _apply(cli: str, path: str, before: str | None) -> dict:
                                                  f"voltei para {before} ({'ok' if not back.returncode else 'falhou'}).")
         installers._fail(cli, "atualização", f"o {NAMES[cli]} não executa depois da atualização ({origin}); "
                                              "sem volta automática para esta origem: reinstale pelo launcher.")
-    return {"cli": cli, "before": before, "after": after, "updated": after != before}
+    return {"cli": cli, "before": before, "after": after, "updated": after != before, "sessions": sessions}

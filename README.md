@@ -56,8 +56,10 @@ o modo texto tem `launcher cli --install claude|codex|all`. Não é preciso faze
 **Atualização das CLIs.** Cada botão de CLI mostra a versão instalada (`--version`) e, quando o registro do npm tem uma mais
 nova, a faixa de avisos diz "Codex 0.164.0 disponível (instalada 0.162.1)" e aparece **Atualizar Codex 0.162.1 → 0.164.0**.
 Com **Atualizar as CLIs automaticamente** ligado (padrão), o launcher dispara o `update` da própria CLI (ou o
-`npm install -g …@latest` de quem a instalou pelo npm) e avisa "Codex atualizado: 0.162.1 → 0.164.0". Com
-sessão dela aberta (neste launcher ou em qualquer outro processo) a atualização é adiada e a faixa diz por quê; falha vira
+`npm install -g …@latest` de quem a instalou pelo npm) e avisa "Codex atualizado: 0.162.1 → 0.164.0". Sessão
+aberta não impede: o Windows deixa renomear um .exe em execução, então a sessão segue na versão antiga e a nova vale na próxima
+abertura (a faixa diz quantas sessões estão nessa situação); só quando a tentativa bate num arquivo preso (npm com a CLI
+rodando) a atualização fica adiada, com o nome do processo e o PID, e tenta de novo na próxima verificação. Falha vira
 aviso, nunca derruba o launcher, e no npm uma CLI que deixou de executar volta à versão anterior. Para desligar: o item do
 menu de opções, `launcher preferences --cli-auto-update off` ou `AGENT_LAUNCHER_NO_CLI_UPDATE=1`. Modo texto: `launcher cli`
 mostra as versões e `launcher cli --update claude|codex|copilot|all` atualiza na hora. VS Code e o app do Copilot ficam de

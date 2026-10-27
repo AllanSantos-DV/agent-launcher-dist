@@ -303,14 +303,10 @@ def unregister_file_type(registry=None):
 
 def in_use(target):
     """Executáveis da instalação que estão rodando agora (o Python da venv que abriu o launcher ou uma sessão, o
-    Terminal portátil): o Windows não deixa abrir um .exe em execução para escrita, nem apagá-lo."""
-    busy = []
-    for executable in [*(target / ".venv" / "Scripts").glob("*.exe"), *terminal.portable_dir(target).rglob("*.exe")]:
-        try:
-            executable.open("ab").close()
-        except PermissionError:
-            busy.append(executable)
-    return busy
+    Terminal portátil): o Windows não deixa apagar um .exe em execução. Vale o processo de verdade, não a recusa de abrir."""
+    from agent_launcher.platform import processes
+    executables = [*(target / ".venv" / "Scripts").glob("*.exe"), *terminal.portable_dir(target).rglob("*.exe")]
+    return [Path(image) for _pid, image in processes.running_from(executables)]
 
 
 def schedule_removal(target, registry=None):

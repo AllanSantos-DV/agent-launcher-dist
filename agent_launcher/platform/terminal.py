@@ -265,14 +265,10 @@ def install_portable(root: Path, zip_path: Path | None = None, verify=signature_
 
 def portable_in_use(root: Path) -> bool:
     """Algum executável da cópia portátil está rodando? O Windows deixa renomear a pasta com o Terminal aberto (a
-    troca largaria arquivos da cópia velha e o Terminal em uso continuaria carregando DLLs da pasta renomeada), mas
-    não deixa abrir um .exe em execução para escrita: é essa recusa que denuncia o uso."""
-    for executable in portable_dir(root).rglob("*.exe"):
-        try:
-            executable.open("ab").close()
-        except PermissionError:
-            return True
-    return False
+    troca largaria arquivos da cópia velha e o Terminal em uso continuaria carregando DLLs da pasta renomeada).
+    Vale o processo de verdade: arquivo seguro por antivírus não é Terminal aberto."""
+    from agent_launcher.platform import processes
+    return bool(processes.running_from(portable_dir(root).rglob("*.exe")))
 
 
 def update_portable(root: Path, check=latest_zip, install=install_portable, stamp: Path | None = None,
