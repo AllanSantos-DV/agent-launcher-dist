@@ -20,6 +20,7 @@ from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import project_path
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
+from agent_launcher.harnesses import cli_update
 from agent_launcher.harnesses import installers as clis
 from agent_launcher.harnesses import registry
 from agent_launcher.platform import terminal
@@ -213,6 +214,37 @@ class TerminalTask(QRunnable):
         self.signals.completed.emit(found, "\n".join(lines))
 
 
+class CliCheckTask(QRunnable):
+    """Lê as versões instaladas (`--version`) e as publicadas no npm das CLIs, fora da thread da interface."""
+
+    def __init__(self):
+        super().__init__()
+        self.signals = RefreshSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            self.signals.completed.emit(cli_update.check_all(), "")
+        except Exception as error:  # falha inesperada também precisa voltar para a tela
+            self.signals.completed.emit(error, "")
+
+
+class CliUpdateTask(QRunnable):
+    """Atualiza uma CLI (o `update` dela, npm ou winget) fora da thread da interface; o resultado volta com o id da CLI."""
+
+    def __init__(self, cli: str):
+        super().__init__()
+        self.cli = cli
+        self.signals = RefreshSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            self.signals.completed.emit(cli_update.update(self.cli), self.cli)
+        except Exception as error:  # falha inesperada também precisa voltar para a tela
+            self.signals.completed.emit(error, self.cli)
+
+
 class TerminalUpdateTask(QRunnable):
     """Atualiza o Windows Terminal portátil (a cópia que o launcher instalou) fora da thread da interface."""
 
@@ -391,6 +423,12 @@ class LauncherWindow(QMainWindow):
         self.sessions = []
         self.terminal_installing = False
         self.terminal_updating = False
+        self.cli_versions = {}
+        self.cli_queue = []
+        self.cli_checking = False
+        self.cli_updating = None
+        self.cli_failed = set()
+        self.cli_announced = ()
         self.update_status = "não verificada nesta execução"
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(str(ROOT / "assets" / "launcher.ico")))
@@ -556,6 +594,11 @@ class LauncherWindow(QMainWindow):
         self.update_preference.setChecked(self.store.preference("auto_update"))
         self.update_preference.toggled.connect(self.set_auto_update)
         menu.addAction(self.update_preference)
+        self.cli_update_preference = QAction("Atualizar as CLIs automaticamente", self)
+        self.cli_update_preference.setCheckable(True)
+        self.cli_update_preference.setChecked(self.store.preference("cli_auto_update"))
+        self.cli_update_preference.toggled.connect(self.set_cli_auto_update)
+        menu.addAction(self.cli_update_preference)
         menu.addAction("Abrir instruções", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(ROOT / "README.md"))))
         self.options.setMenu(menu)
         top.addWidget(self.options)
@@ -674,6 +717,11 @@ class LauncherWindow(QMainWindow):
         self.install_cli_button.hide()
         actions.addWidget(self.install_cli_button)
         self.installing_cli = False
+        self.update_cli_button = button("Atualizar", "refresh")
+        self.update_cli_button.setMinimumHeight(44)
+        self.update_cli_button.clicked.connect(self.update_cli_now)
+        self.update_cli_button.hide()
+        actions.addWidget(self.update_cli_button)
         self.resume_button = button("Retomar última", "resume")
         self.resume_button.setMinimumHeight(44)
         self.resume_button.clicked.connect(lambda: self.launch_session(True))
@@ -748,6 +796,94 @@ class LauncherWindow(QMainWindow):
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(f"Não foi possível salvar a preferência: {error}")
 
+    def set_cli_auto_update(self, checked):
+        try:
+            fresh = Store(self.store.home)
+            fresh.set_preference("cli_auto_update", checked)
+            self.store = fresh
+        except (LauncherError, OSError, ValueError) as error:
+            self.show_error(f"Não foi possível salvar a preferência: {error}")
+
+    def start_cli_check(self):
+        if self.cli_checking or self.cli_updating:
+            return
+        self.cli_checking = True
+        self.cli_check_task = CliCheckTask()
+        self.cli_check_task.signals.completed.connect(self.finish_cli_check)
+        QThreadPool.globalInstance().start(self.cli_check_task)
+
+    @Slot(object, str)
+    def finish_cli_check(self, result, _unused=""):
+        self.cli_checking = False
+        if isinstance(result, Exception):
+            clis.record(f"verificação das CLIs falhou: {result}")
+            self.show_info(f"Não foi possível verificar as versões das CLIs: {result}")
+            return
+        self.cli_versions = result
+        self.refresh_cli_versions()
+        lines, self.cli_queue = [], []
+        for cli, found in result.items():
+            if found["error"] and not found["installed"]:
+                lines.append(f"{clis.NAMES[cli]}: não foi possível verificar a versão ({found['error']}).")
+                continue
+            if not found["newer"]:
+                continue
+            head = f"{clis.NAMES[cli]} {found['latest']} disponível (instalada {found['installed']})"
+            if found["blocked"]:
+                lines.append(f"{head}; adiada: {found['blocked']}. Use Atualizar quando fechar as sessões.")
+            elif self.store.preference("cli_auto_update") and not cli_update.disabled_by_env() \
+                    and (cli, found["latest"]) not in self.cli_failed:
+                lines.append(f"{head}; atualizando agora.")
+                self.cli_queue.append(cli)
+            else:
+                lines.append(f"{head}. Use o botão Atualizar.")
+        if lines and tuple(lines) != self.cli_announced:
+            self.show_info("\n".join(lines))
+        self.cli_announced = tuple(lines)
+        self.run_next_cli_update()
+        self.update_actions()
+
+    def refresh_cli_versions(self):
+        for cli, widget in self.cli_buttons.items():
+            found = self.cli_versions.get(cli)
+            widget.set_version("" if not found or not found["installed"] else
+                               f"versão {found['installed']}" + (f" → {found['latest']} disponível" if found["newer"] else ""))
+
+    def run_next_cli_update(self):
+        if self.cli_updating or not self.cli_queue:
+            return
+        self.cli_updating = self.cli_queue.pop(0)
+        self.update_actions()
+        self.cli_update_task = CliUpdateTask(self.cli_updating)
+        self.cli_update_task.signals.completed.connect(self.finish_cli_update)
+        QThreadPool.globalInstance().start(self.cli_update_task)
+
+    @Slot(object, str)
+    def finish_cli_update(self, result, cli):
+        self.cli_updating = None
+        name = clis.NAMES[cli]
+        found = self.cli_versions.get(cli) or {}
+        if isinstance(result, cli_update.UpdateDeferred):
+            self.show_info(str(result))
+        elif isinstance(result, Exception):
+            self.cli_failed.add((cli, found.get("latest")))
+            self.show_error(f"Aviso: não foi possível atualizar o {name}: {result}")
+        elif result["updated"]:
+            found.update(installed=result["after"], newer=False, blocked=None)
+            self.show_info(f"{name} atualizado: {result['before']} → {result['after']}.")
+        else:
+            found.update(installed=result["after"], newer=False, blocked=None)
+            self.show_info(f"{name} já está em dia ({result['after']}).")
+        self.refresh_cli_versions()
+        self.run_next_cli_update()
+        self.update_actions()
+
+    def update_cli_now(self):
+        found = self.cli_versions.get(self.cli)
+        if found and found["newer"] and not self.cli_updating and not self.cli_checking:
+            self.cli_queue.insert(0, self.cli)
+            self.run_next_cli_update()
+
     def update_portable_terminal(self):
         if self.terminal_installing or self.terminal_updating or not self.store.preference("auto_update") \
                 or updater.disabled_by_env():
@@ -768,6 +904,7 @@ class LauncherWindow(QMainWindow):
 
     def start_auto_update(self):
         self.update_portable_terminal()
+        self.start_cli_check()
         if self.update_status == "verificando…":
             return  # o timer periódico não sobrepõe uma verificação em andamento
         if not self.store.preference("auto_update"):
@@ -805,7 +942,8 @@ class LauncherWindow(QMainWindow):
 
     def restart_if_idle(self):
         """Reinicia sozinho, a menos que haja diálogo aberto ou instalação em curso (aí fica a faixa com o link)."""
-        busy = QApplication.activeModalWidget() is not None or self.installing_cli or self.terminal_installing
+        busy = (QApplication.activeModalWidget() is not None or self.installing_cli or self.terminal_installing
+                or self.cli_updating is not None)
         if busy:
             self.update_status = self.update_status.replace("reiniciando a interface", "reabra para usar")
             self.update_notice.setText(f"{APP_NAME} atualizado. Termine o que está fazendo e "
@@ -962,6 +1100,12 @@ class LauncherWindow(QMainWindow):
         self.install_cli_button.setEnabled(not self.installing_cli)
         self.install_cli_button.setText(f"Instalando {harness.LABEL}…" if self.installing_cli
                                         else f"Instalar {harness.LABEL}")
+        found = self.cli_versions.get(self.cli) if harness.KIND == "terminal" else None
+        self.update_cli_button.setVisible(bool(found and found["newer"]) or self.cli_updating == self.cli)
+        self.update_cli_button.setEnabled(not self.cli_updating)
+        self.update_cli_button.setText(
+            f"Atualizando {harness.LABEL}…" if self.cli_updating == self.cli else
+            f"Atualizar {harness.LABEL} {found['installed']} → {found['latest']}" if found else "Atualizar")
         enabled = bool(self.project and self.gateway and self.selected_model and self.online and not self.refreshing
                        and not missing)
         self.launch_button.setEnabled(enabled)
@@ -1346,7 +1490,8 @@ class LauncherWindow(QMainWindow):
         self.connection_picker.clear()
         self.connection_picker.blockSignals(False)
         self.project_search.clear()
-        for action, key in ((self.bypass_preference, "bypass_default"), (self.update_preference, "auto_update")):
+        for action, key in ((self.bypass_preference, "bypass_default"), (self.update_preference, "auto_update"),
+                        (self.cli_update_preference, "cli_auto_update")):
             action.blockSignals(True)
             action.setChecked(self.store.preference(key))
             action.blockSignals(False)

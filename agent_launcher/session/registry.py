@@ -7,7 +7,7 @@ import json
 import os
 import time
 from pathlib import Path
-from agent_launcher.domain.files import replace_retrying
+from agent_launcher.domain.files import atomic_text
 
 FILE = "sessions.jsonl"
 KEEP = 2000
@@ -35,9 +35,7 @@ def record(home: Path, *, profile: str, project: str, folder, cli: str, connecti
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
         if path.stat().st_size > KEEP * 600:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-KEEP:]
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            replace_retrying(temporary, path)
+            atomic_text(path, "\n".join(lines) + "\n")
     except OSError:
         pass
     return entry

@@ -53,6 +53,16 @@ Quando um dos dois falta, o instalador usa o instalador oficial do fabricante, p
 bloqueado, tenta `npm install -g`. Depois disso a interface também oferece **Instalar** ao lado do CLI que faltar, e
 o modo texto tem `launcher cli --install claude|codex|all`. Não é preciso fazer login nos CLIs: a chave vem da conexão.
 
+**Atualização das CLIs.** Cada botão de CLI mostra a versão instalada (`--version`) e, quando o registro do npm tem uma mais
+nova, a faixa de avisos diz "Codex 0.164.0 disponível (instalada 0.162.1)" e aparece **Atualizar Codex 0.162.1 → 0.164.0**.
+Com **Atualizar as CLIs automaticamente** ligado (padrão), o launcher dispara o `update` da própria CLI (ou o
+`npm install -g …@latest` de quem a instalou pelo npm) e avisa "Codex atualizado: 0.162.1 → 0.164.0". Com
+sessão dela aberta (neste launcher ou em qualquer outro processo) a atualização é adiada e a faixa diz por quê; falha vira
+aviso, nunca derruba o launcher, e no npm uma CLI que deixou de executar volta à versão anterior. Para desligar: o item do
+menu de opções, `launcher preferences --cli-auto-update off` ou `AGENT_LAUNCHER_NO_CLI_UPDATE=1`. Modo texto: `launcher cli`
+mostra as versões e `launcher cli --update claude|codex|copilot|all` atualiza na hora. VS Code e o app do Copilot ficam de
+fora: cada um se atualiza sozinho.
+
 ### Windows Terminal
 
 As sessões abrem como abas do Windows Terminal (é nele que Shift+Enter quebra linha no Claude Code e no Codex).
@@ -396,6 +406,7 @@ launcher launch --project "Meu app" --cli copilot --model "vertex_ai.anthropic.c
 launcher launch --project "Meu app" --cli vscode --model "azure.gpt-5.4-mini"   # ou --cli copilot_app
 launcher endpoint                # endpoint local de cada conexão (start, stop, autostart [--off])
 launcher cli --install copilot   # Copilot CLI por usuário (npm ou winget)
+launcher cli --update all        # atualiza as CLIs instaladas (adia com sessão aberta)
 launcher update                # atualiza agora pelo npm (--check só consulta)
 launcher topmost on --title "Jarvis"   # janela sempre por cima (off, resume, status)
 launcher front "C:\docs\relatorio.pdf" # abrir por cima, a pedido do usuário

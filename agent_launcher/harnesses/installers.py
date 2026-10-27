@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -61,9 +62,22 @@ def find(cli: str) -> str | None:
 
 
 def _run(command: list[str], timeout: int, environment: dict | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                          env={**os.environ, **(environment or {})},
-                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    """subprocess.run sem janela. No timeout mata a árvore inteira: o node que o npm.cmd deixa vivo segura os pipes e
+    o `run` comum nunca voltaria do kill."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                               errors="replace", env={**os.environ, **(environment or {})}, creationflags=flags)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True, creationflags=flags)
+        process.kill()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def _tail(result: subprocess.CompletedProcess, count: int = 8) -> str:
@@ -71,14 +85,18 @@ def _tail(result: subprocess.CompletedProcess, count: int = 8) -> str:
     return f"código de saída {result.returncode}; " + (" | ".join(lines[-count:]) or "sem saída")
 
 
-def _fail(cli: str, label: str, message: str):
-    """Registra a falha em LOG_FILE (o texto também sobe na exceção) e a levanta."""
+def record(message: str) -> None:
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LOG_FILE.open("a", encoding="utf-8") as stream:
-            stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {NAMES[cli]} ({label}): {message}\n")
+            stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
     except OSError:
         pass  # o texto segue na exceção e no log da tela; o arquivo é só o registro
+
+
+def _fail(cli: str, label: str, message: str):
+    """Registra a falha em LOG_FILE (o texto também sobe na exceção) e a levanta."""
+    record(f"{NAMES[cli]} ({label}): {message}")
     raise CliInstallError(message)
 
 
@@ -118,7 +136,8 @@ def claude_binary(path: Path) -> Path | None:
     for stub in (candidate for candidate in candidates if candidate.is_file() and candidate != found
                  and candidate.parent.name == "bin" and not is_native(candidate)):
         try:
-            partial = stub.with_name(stub.name + ".reparo")
+            descriptor, partial = tempfile.mkstemp(prefix=stub.name + ".", suffix=".reparo", dir=stub.parent)
+            os.close(descriptor)
             shutil.copyfile(found, partial)
             replace_retrying(partial, stub)
         except OSError as error:

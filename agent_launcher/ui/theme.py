@@ -75,6 +75,7 @@ class CliButton(QAbstractButton):
         self.title = title
         self.subtitle = subtitle
         self.symbol = symbol
+        self.version = ""
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -82,6 +83,11 @@ class CliButton(QAbstractButton):
         self.setAccessibleDescription(subtitle)
         self.setMinimumHeight(76)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_version(self, text: str) -> None:
+        self.version = text
+        self.setAccessibleDescription(f"{self.subtitle}. {text}" if text else self.subtitle)
+        self.update()
 
     def sizeHint(self):
         return QSize(240, 76)
@@ -103,6 +109,10 @@ class CliButton(QAbstractButton):
         painter.setFont(QFont("Segoe UI", 9))
         painter.setPen(QColor(MUTED))
         painter.drawText(58, 51, self.subtitle)
+        if self.version:
+            painter.setFont(QFont("Segoe UI", 8))
+            painter.setPen(QColor(GREEN if "disponível" in self.version else MUTED))
+            painter.drawText(58, 67, self.version)
         if active:
             icon("check", GREEN, 17).paint(painter, self.width() - 32, 17, 17, 17)
 

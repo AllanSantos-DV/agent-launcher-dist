@@ -18,7 +18,8 @@ from version import data_home
 
 PROJECT_KEYS = {"id", "name", "path", "last_cli", "last_connection", "models", "last_used"}
 CONNECTION_KEYS = {"id", "name", "connector", "options"}
-PREFERENCES = {"bypass_default": False, "auto_update": True, "sessions_secondary_monitor": False}
+PREFERENCES = {"bypass_default": False, "auto_update": True, "cli_auto_update": True,
+               "sessions_secondary_monitor": False}
 BACKUP_DAYS = 30
 DEFAULT_HOME = Path.home() / ".agent-launcher"
 # Destinos novos (Copilot CLI, VS Code, Copilot app) guardam a última escolha em selections.json: o config.json

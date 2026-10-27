@@ -10,13 +10,12 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import unicodedata
 import uuid
 from pathlib import Path
 
 from agent_launcher.domain.errors import LauncherError
-from agent_launcher.domain.files import atomic_json, clean_text, path_key
+from agent_launcher.domain.files import atomic_json, clean_text, path_key, remove_tree
 
 DEFAULT = "default"
 FILE = "profiles.json"
@@ -169,9 +168,18 @@ def remove(profile_id: str, delete_data: bool = False, base: Path | None = None)
     data["profiles"] = [item for item in data["profiles"] if item["id"] != profile_id]
     if data["active"] == profile_id:
         data["active"] = DEFAULT
-    _write(data, base)
     if delete_data:
-        shutil.rmtree(base / FOLDER / profile_id, ignore_errors=True)
+        # Antes de tirar da lista: se a pasta (com as chaves cifradas) não puder ser apagada, o perfil continua listado e
+        # o pedido pode ser repetido, em vez de a pasta ficar órfã no disco sem aviso.
+        folder = base / FOLDER / profile_id
+        try:
+            remove_tree(folder)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise LauncherError(f"Não foi possível apagar os dados do perfil ({error}); o perfil continua na lista. "
+                                f"Feche o que usa {folder} e tente de novo.") from error
+    _write(data, base)
 
 
 def base_of(home: Path) -> Path:

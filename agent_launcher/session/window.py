@@ -99,6 +99,9 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
     harness = registry.get(cli)
     if harness.KIND != "terminal":
         raise LauncherError(f"O {harness.LABEL} não abre em janela de terminal; use a interface.")
+    from agent_launcher.harnesses import cli_update  # fora do topo: a janela da sessão tem orçamento de imports
+    if cli_update.updating(cli):
+        raise LauncherError(f"O {harness.LABEL} está sendo atualizado agora; abra a sessão quando terminar.")
     try:  # sessões abertas por outro programa (sem a interface) também mantêm a instalação atualizada
         updater.check_in_background(ROOT, store.preference("auto_update"))
     except OSError as error:

@@ -76,15 +76,31 @@ def typed(char: str) -> tuple[int, str, bool, int]:
     return (vk & 0xFF, char, False, SHIFT_PRESSED if vk & 0x100 else 0)
 
 
+PID_REUSE_TOLERANCE_S = 5  # a sessão se registra segundos depois de o processo nascer
+
 # ---- registro das sessões abertas -------------------------------------------------------------------------------
 
-def alive(pid: int) -> bool:
+def _created_at(handle) -> float | None:
+    """Instante (epoch) em que o processo foi criado; None se o Windows não informa."""
+    created, ignored = wintypes.FILETIME(), wintypes.FILETIME()
+    if not ctypes.windll.kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(ignored),
+                                                  ctypes.byref(ignored), ctypes.byref(ignored)):
+        return None
+    return ((created.dwHighDateTime << 32) | created.dwLowDateTime) / 1e7 - 11644473600
+
+
+def alive(pid: int, registered_at: float | None = None) -> bool:
+    """O processo `pid` roda. Com `registered_at` (quando a sessão foi registrada), um processo criado depois disso é
+    outro que herdou o mesmo PID: o registro é da sessão que já morreu."""
     handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not handle:
         return False
     try:
         code = wintypes.DWORD()
-        return bool(ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+        if not (ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value == 259):
+            return False
+        created = _created_at(handle)
+        return registered_at is None or created is None or created <= registered_at + PID_REUSE_TOLERANCE_S
     finally:
         ctypes.windll.kernel32.CloseHandle(handle)
 
@@ -101,8 +117,15 @@ def register(pid: int, project: str, project_id: str, cli: str, title: str, cont
     return target
 
 
+def _discard(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError:
+        pass  # outro processo está lendo o registro agora; o próximo `sessions()` descarta
+
+
 def unregister(pid: int, folder: Path | None = None) -> None:
-    ((folder or SESSIONS_DIR) / f"{pid}.json").unlink(missing_ok=True)
+    _discard((folder or SESSIONS_DIR) / f"{pid}.json")
 
 
 def sessions(folder: Path | None = None) -> list[dict]:
@@ -114,10 +137,10 @@ def sessions(folder: Path | None = None) -> list[dict]:
             pid = int(item["pid"])
         except (OSError, ValueError, KeyError, TypeError):
             continue
-        if alive(pid):
+        if alive(pid, item.get("startedAt")):
             found.append(item)
         else:
-            path.unlink(missing_ok=True)
+            _discard(path)
     return sorted(found, key=lambda item: item.get("startedAt", 0), reverse=True)
 
 

@@ -67,16 +67,24 @@ def remove_tree(path, attempts: int = 5) -> None:
 
 
 def atomic_json(path: Path, data: dict) -> None:
+    atomic_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def atomic_text(path: Path, text: str) -> None:
+    """Grava por temporário de nome próprio (vários processos escrevem o mesmo arquivo) e rename com retry."""
     path.parent.mkdir(parents=True, exist_ok=True)
     import tempfile
     descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(data, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
+            stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
         replace_retrying(temporary, path)
     finally:
-        if os.path.exists(temporary):
+        try:
             os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass  # temporário preso por antivírus: a exceção do replace (ou o sucesso) não pode ser mascarada

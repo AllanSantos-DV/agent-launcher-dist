@@ -4,6 +4,7 @@ import argparse
 import getpass
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -13,7 +14,9 @@ from agent_launcher.domain.catalog import CLAUDE_FAMILIES, base_model, token_lab
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
+from agent_launcher.harnesses import cli_update
 from agent_launcher.harnesses import installers as clis
+from agent_launcher.harnesses.installers import CliInstallError
 from agent_launcher.harnesses import registry
 from agent_launcher.platform import elevated, focus, keys, terminal
 from agent_launcher.session.conversations import conversations_for, record_session
@@ -656,6 +659,8 @@ def parser() -> argparse.ArgumentParser:
     cli_command = commands.add_parser("cli", help="CLIs de terminal (Claude Code, Codex, Copilot CLI): situação e instalação por usuário, sem admin")
     cli_command.add_argument("--install", choices=(*clis.NAMES, "all"),
                              help="instala o CLI que falta (instalador oficial, npm ou winget)")
+    cli_command.add_argument("--update", choices=(*clis.NAMES, "all"),
+                             help="atualiza o CLI instalado (o `update` da própria CLI, npm ou winget; adia com sessão aberta)")
     endpoint = commands.add_parser("endpoint", help="Endpoint local das conexões (VS Code e Copilot app): situação, "
                                                     "subir, parar, iniciar com o Windows")
     endpoint.add_argument("endpoint_action", nargs="?", choices=("status", "start", "stop", "autostart"), default="status")
@@ -680,6 +685,8 @@ def parser() -> argparse.ArgumentParser:
     preferences = commands.add_parser("preferences", help="Preferências")
     preferences.add_argument("--bypass-default", choices=("on", "off"),
                              help="Bypass de permissões marcado por padrão na interface")
+    preferences.add_argument("--cli-auto-update", choices=("on", "off"),
+                             help="Atualiza Claude Code, Codex e Copilot CLI sozinho (adia com sessão aberta)")
     preferences.add_argument("--auto-update", choices=("on", "off"),
                              help="Interface se atualiza sozinha pelo npm a cada abertura")
     preferences.add_argument("--sessions-monitor", choices=("primary", "other"),
@@ -723,6 +730,37 @@ def parser() -> argparse.ArgumentParser:
     session.add_argument("--dry-run", action="store_true", help="Exibir argumentos sem rede, sem salvar e sem iniciar CLI")
     session.add_argument("--controlled", action="store_true", help="Sessão controlada por orquestrador (implica bypass)")
     return result
+
+
+def describe_cli_version(found: dict) -> str:
+    text = f"versão {found['installed'] or 'não lida'}"
+    if not found["installed"] and not found["error"]:
+        return text + " (a CLI não respondeu a --version)"
+    if found["error"]:
+        return f"{text} (última publicada não consultada: {found['error']})"
+    if not found["newer"]:
+        return f"{text} (em dia)"
+    return f"{text} → {found['latest']} disponível" + (f"; adiada: {found['blocked']}" if found["blocked"] else "")
+
+
+def update_clis(targets) -> int:
+    """`launcher cli --update`: atualiza e conta o resultado de cada CLI; sessão aberta adia sem contar como falha."""
+    status = 0
+    for cli in targets:
+        if not clis.find(cli):
+            print(f"{clis.NAMES[cli]}: não instalado")
+            continue
+        try:
+            outcome = cli_update.update(cli)
+        except cli_update.UpdateDeferred as error:
+            print(error)
+        except (CliInstallError, updater.UpdateError, OSError, subprocess.SubprocessError) as error:
+            print(f"{clis.NAMES[cli]}: {error}", file=sys.stderr)
+            status = 1
+        else:
+            print(f"{clis.NAMES[cli]}: {outcome['before']} → {outcome['after']}" if outcome["updated"]
+                  else f"{clis.NAMES[cli]}: já está em dia ({outcome['after']})")
+    return status
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -818,8 +856,13 @@ def main(arguments: list[str] | None = None) -> int:
             if options.install:
                 targets = tuple(clis.NAMES) if options.install == "all" else (options.install,)
                 return 0 if all(clis.ensure(cli) for cli in targets) else 1
+            if options.update:
+                return update_clis(tuple(clis.NAMES) if options.update == "all" else (options.update,))
             for cli in clis.NAMES:
                 print(f"{clis.NAMES[cli]}: {clis.find(cli) or 'não instalado'}")
+                found = cli_update.check(cli) if clis.find(cli) else None
+                if found:
+                    print("  " + describe_cli_version(found))
         elif options.action == "terminal":
             if options.install or options.zip:
                 return 0 if terminal.ensure(ROOT, options.zip.resolve() if options.zip else None) else 1
@@ -854,10 +897,13 @@ def main(arguments: list[str] | None = None) -> int:
                 store.set_preference("bypass_default", options.bypass_default == "on")
             if options.auto_update:
                 store.set_preference("auto_update", options.auto_update == "on")
+            if options.cli_auto_update:
+                store.set_preference("cli_auto_update", options.cli_auto_update == "on")
             if options.sessions_monitor:
                 store.set_preference("sessions_secondary_monitor", options.sessions_monitor == "other")
             print(f"Bypass marcado por padrão: {'sim' if store.preference('bypass_default') else 'não'}")
             print(f"Atualização automática: {'sim' if store.preference('auto_update') else 'não'}")
+            print(f"Atualização automática das CLIs: {'sim' if store.preference('cli_auto_update') else 'não'}")
             print(f"Sessões em segundo plano: "
                   f"{'no outro monitor, se existir' if store.preference('sessions_secondary_monitor') else 'onde abrirem'}")
         elif options.action == "topmost":

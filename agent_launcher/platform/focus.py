@@ -345,6 +345,15 @@ def mutex_name(path: Path | None = None) -> str:
     return MUTEX_NAME if path is None else f"{MUTEX_NAME}-{hashlib.sha256(str(path).encode()).hexdigest()[:12]}"
 
 
+def note_watch_error(error: Exception, log: Path | None = None) -> None:
+    """O vigia é um processo oculto: o erro vai para topmost.log (só o último), não para o vazio."""
+    target = log or STATE_FILE.with_name("topmost.log")
+    try:
+        target.write_text(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {type(error).__name__}: {error}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def topmost_watch(path: Path | None = None, hotkey: bool = True) -> int:
     """Laço do vigia (processo oculto). Instância única por mutex; sai quando o estado é desligado e tira o "sempre
     por cima" da janela. Ctrl+Alt+J encerra o "abrir por cima" e devolve o foco à janela marcada."""
@@ -371,8 +380,8 @@ def topmost_watch(path: Path | None = None, hotkey: bool = True) -> int:
                             user32.SetForegroundWindow(marked)  # quem recebeu a tecla pode trazer a janela para a frente
                         state = read_state(path)
                 topmost_step(state, path)
-            except OSError:
-                pass  # gravação do estado recusada mesmo com retry: o vigia tenta de novo no próximo ciclo
+            except Exception as error:  # estado recusado mesmo com retry ou erro inesperado: registra e tenta no próximo ciclo
+                note_watch_error(error)
             time.sleep(POLL_SECONDS)
     finally:
         if registered:

@@ -18,6 +18,7 @@ import http.client
 import json
 import socket
 import ssl
+import sys
 import threading
 import time
 import urllib.parse
@@ -400,6 +401,23 @@ class EndpointServer(ThreadingHTTPServer):
     def touch(self):
         self.last = time.monotonic()
 
+    def handle_error(self, request, client_address):
+        """Exceção de um pedido (o stderr deste processo oculto vai para o vazio): só o tipo e a mensagem no endpoint.log."""
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionError, TimeoutError)):
+            return  # cliente que desistiu (cancelou o stream): rotina, não defeito
+        self.note(f"erro no pedido: {type(error).__name__}: {error}")
+
+    def note(self, message: str) -> None:
+        if not self.log:
+            return
+        with self._log_lock:
+            try:
+                with self.log.open("a", encoding="utf-8") as stream:
+                    stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+            except OSError:
+                pass
+
     def record(self, protocol: str, path: str, model: str, status: int, seconds: float) -> None:
         self.requests += 1
         if not self.log:
@@ -462,6 +480,13 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with (options.home / "endpoint.log").open("a", encoding="utf-8") as stream:
                 stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} não iniciou: {error}\n")
+        except OSError:
+            pass
+        return 1
+    except Exception as error:  # processo oculto: sem isto o erro some junto com o stderr
+        try:
+            with (options.home / "endpoint.log").open("a", encoding="utf-8") as stream:
+                stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} caiu: {type(error).__name__}: {error}\n")
         except OSError:
             pass
         return 1

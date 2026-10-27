@@ -1,0 +1,215 @@
+"""Versão instalada, versão publicada e atualização das CLIs de terminal (Claude Code, Codex, Copilot CLI).
+
+O launcher não troca binário: dispara o `update` que a própria CLI já tem (ou o npm de quem a instalou por ele),
+nunca com sessão dela aberta, e devolve o resultado para a tela mostrar. VS Code e o app do Copilot ficam de fora.
+Desligar: preferência "Atualizar as CLIs automaticamente" no menu ou AGENT_LAUNCHER_NO_CLI_UPDATE=1.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+from agent_launcher.harnesses import installers
+from agent_launcher.harnesses.installers import NAMES, NPM_FLAGS, NPM_PACKAGES, CliInstallError
+from agent_launcher.update import updater
+from version import data_home
+
+DISABLE_ENV = "AGENT_LAUNCHER_NO_CLI_UPDATE"
+UPDATE_TIMEOUT = 900
+
+
+class UpdateDeferred(CliInstallError):
+    """Há sessão da CLI aberta: o npm falharia e o nativo deixaria a sessão na versão velha. Tenta de novo depois."""
+
+
+def disabled_by_env() -> bool:
+    """AGENT_LAUNCHER_NO_CLI_UPDATE ligada (diferente de vazio e de 0): nenhuma atualização automática das CLIs."""
+    return os.environ.get(DISABLE_ENV, "").strip() not in ("", "0")
+
+
+def parse_version(text: str) -> str | None:
+    """Primeira versão x.y.z da saída de `--version` ("2.1.311 (Claude Code)", "codex-cli 0.162.1")."""
+    found = re.search(r"\d+\.\d+\.\d+", text or "")
+    return found.group(0) if found else None
+
+
+def installed_version(cli: str, path: str | None = None) -> str | None:
+    """`<exe> --version` sem janela. Só isto vale: `npm ls -g` mente para a Copilot CLI, que baixa builds próprias."""
+    path = path or installers.find(cli)
+    if not path:
+        return None
+    try:
+        result = installers._run([path, "--version"], timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_version(result.stdout + "\n" + result.stderr) if result.returncode == 0 else None
+
+
+def latest_version(cli: str, get=updater._get, registry: str = updater.REGISTRY) -> str:
+    """Última versão publicada no registro npm (o mesmo que o launcher usa para se atualizar)."""
+    url = registry + NPM_PACKAGES[cli].replace("/", "%2F") + "/latest"
+    try:
+        version = json.loads(get(url, 10, 2 * 1024 * 1024)).get("version")
+    except (OSError, ValueError, AttributeError) as error:
+        raise updater.CheckError(f"Não foi possível consultar {url}: {error}") from error
+    if not (isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version)):
+        raise updater.UpdateError(f"Versão publicada de {NAMES[cli]} inválida: {version!r}")
+    return version
+
+
+def source(cli: str, path: str) -> str:
+    """Como a CLI foi instalada: "npm", "winget" ou "native" (instalador oficial). Decide o comando de atualização."""
+    lowered = str(path).lower()
+    if "node_modules" in lowered or Path(lowered).suffix in (".cmd", ".ps1") or Path(lowered).parent.name == "npm":
+        return "npm"
+    if cli == "copilot" and "winget" in lowered:
+        return "winget"
+    return "native"
+
+
+def command(cli: str, path: str, origin: str) -> list[str]:
+    """Comando de atualização pela origem: `update` da própria CLI (nativa, winget e Copilot em qualquer origem) ou npm @latest."""
+    if cli == "copilot" or origin != "npm":
+        return [path, "update"]
+    npm = shutil.which("npm.cmd") or shutil.which("npm")
+    if not npm:
+        raise CliInstallError("npm não encontrado (Node.js não instalado); atualize pelo comando da própria CLI.")
+    return [npm, "install", "-g", f"{NPM_PACKAGES[cli]}@latest", *NPM_FLAGS.get(cli, [])]
+
+
+def _executables(cli: str, path: str) -> list[Path]:
+    found = [Path(path)] if Path(path).suffix.lower() == ".exe" else []
+    try:
+        extra = (installers.claude_binary(Path(path)) if cli == "claude"
+                 else installers.codex_platform_binary(Path(path)) if cli == "codex" else None)
+    except CliInstallError:
+        extra = None
+    return found + ([extra] if extra else [])
+
+
+def blocked_by(cli: str, path: str) -> str | None:
+    """Motivo para adiar (sessão da CLI aberta), ou None. Vale a sessão aberta por este launcher e o .exe em execução
+    por qualquer outro caminho: o Windows não abre um .exe em uso para escrita."""
+    from agent_launcher.platform import keys
+    opened = [item for item in keys.sessions() if item.get("cli") == cli]
+    if opened:
+        return f"há {len(opened)} sessão(ões) do {NAMES[cli]} aberta(s) neste launcher"
+    for executable in _executables(cli, path):
+        try:
+            executable.open("ab").close()
+        except PermissionError:
+            return f"o {executable.name} está em uso por outro processo"
+        except OSError:
+            continue
+    return None
+
+
+def lock_path(cli: str) -> Path:
+    return data_home() / f"cli-update-{cli}.lock"
+
+
+def updating(cli: str) -> bool:
+    """Há atualização desta CLI em andamento (por esta ou outra janela do launcher): nenhuma sessão dela deve abrir agora."""
+    try:
+        return time.time() - lock_path(cli).stat().st_mtime <= updater.LOCK_STALE_S
+    except OSError:
+        return False
+
+
+def check(cli: str, latest=latest_version) -> dict | None:
+    """{installed, latest, newer, source, blocked, error} ou None quando a CLI não está instalada."""
+    path = installers.find(cli)
+    if not path:
+        return None
+    entry = {"installed": installed_version(cli, path), "latest": None, "newer": False, "source": source(cli, path),
+             "blocked": None, "error": None}
+    try:
+        entry["latest"] = latest(cli)
+    except (updater.UpdateError, OSError) as error:
+        entry["error"] = str(error)
+        return entry
+    entry["newer"] = bool(entry["installed"]) and updater.parts(entry["latest"]) > updater.parts(entry["installed"])
+    if entry["newer"]:
+        entry["blocked"] = blocked_by(cli, path)
+    return entry
+
+
+def check_all(latest=latest_version) -> dict:
+    """Uma CLI que não responde vira `error` na própria entrada, sem esconder as outras."""
+    found = {}
+    for cli in NAMES:
+        try:
+            entry = check(cli, latest)
+        except (CliInstallError, OSError, subprocess.SubprocessError) as error:
+            entry = {"installed": None, "latest": None, "newer": False, "source": None, "blocked": None,
+                     "error": str(error)}
+        if entry:
+            found[cli] = entry
+    return found
+
+
+def update(cli: str, latest=latest_version) -> dict:
+    """Atualiza uma CLI. {cli, before, after, updated}. Levanta UpdateDeferred com sessão aberta e CliInstallError (texto
+    legível, também em cli-install.log) se o comando falhar ou a CLI não executar depois; no npm volta para a versão anterior."""
+    path = installers.find(cli)
+    if not path:
+        raise CliInstallError(f"{NAMES[cli]} não está instalado.")
+    before = installed_version(cli, path)
+    target = latest(cli)
+    if before and updater.parts(target) <= updater.parts(before):
+        return {"cli": cli, "before": before, "after": before, "updated": False}
+    reason = blocked_by(cli, path)
+    if reason:
+        raise UpdateDeferred(f"Atualização do {NAMES[cli]} adiada: {reason}.")
+    lock = lock_path(cli)
+    if not updater._lock(lock):
+        raise UpdateDeferred(f"Atualização do {NAMES[cli]} adiada: outra janela do launcher já está atualizando.")
+    try:
+        return _apply(cli, path, before)
+    finally:
+        try:
+            lock.unlink(missing_ok=True)
+        except PermissionError:
+            pass  # vale como velha depois de LOCK_STALE_S
+
+
+def _run_logged(cli: str, command: list[str]):
+    """installers._run com timeout e erro de sistema registrados em cli-install.log (como as falhas de saída)."""
+    try:
+        return installers._run(command, timeout=UPDATE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        installers._fail(cli, "atualização", f"a atualização do {NAMES[cli]} passou de {UPDATE_TIMEOUT // 60} min e foi encerrada.")
+    except (OSError, subprocess.SubprocessError) as error:
+        installers._fail(cli, "atualização", f"a atualização do {NAMES[cli]} não iniciou: {error}")
+
+
+def _apply(cli: str, path: str, before: str | None) -> dict:
+    origin = source(cli, path)
+    result = _run_logged(cli, command(cli, path, origin))
+    if result.returncode:
+        installers._fail(cli, "atualização", f"atualização do {NAMES[cli]} ({origin}) falhou: {installers._tail(result)}")
+    path = installers.find(cli) or path
+    if origin == "npm" and cli != "copilot":
+        try:
+            if cli == "claude":
+                installers.claude_binary(Path(path))  # repara o stub sem cabeçalho MZ que o npm pode deixar
+        except CliInstallError as error:
+            installers._fail(cli, "atualização", str(error))
+        if cli == "codex" and installers.codex_platform_binary(Path(path)) is None and Path(path).suffix.lower() != ".exe":
+            installers._fail(cli, "atualização", f"{NPM_PACKAGES[cli]} atualizado sem o binário da plataforma. "
+                                                 f"Repare com: {installers.NPM_REPAIR[cli]}")
+    after = installed_version(cli, path)
+    if after is None:
+        if origin == "npm" and before and cli != "copilot":
+            back = _run_logged(cli, [shutil.which("npm.cmd") or shutil.which("npm") or "npm", "install", "-g",
+                                     f"{NPM_PACKAGES[cli]}@{before}", *NPM_FLAGS.get(cli, [])])
+            installers._fail(cli, "atualização", f"o {NAMES[cli]} não executa depois da atualização; "
+                                                 f"voltei para {before} ({'ok' if not back.returncode else 'falhou'}).")
+        installers._fail(cli, "atualização", f"o {NAMES[cli]} não executa depois da atualização ({origin}); "
+                                             "sem volta automática para esta origem: reinstale pelo launcher.")
+    return {"cli": cli, "before": before, "after": after, "updated": after != before}

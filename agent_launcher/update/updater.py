@@ -178,12 +178,13 @@ def update(root: Path = ROOT, registry: str = REGISTRY, log=lambda message: None
         return None
     lock = data_home() / "update.lock"
     if not _lock(lock):
-        log("Outra janela já está atualizando o Agent Launcher.")
+        log("Trava do atualizador ocupada (outra janela atualizando, ou arquivo preso por outro processo).")
         return None
     try:
         log(f"Atualizando o Agent Launcher {VERSION} → {meta['version']}…")
         import tempfile
-        with tempfile.TemporaryDirectory(prefix="agent-launcher-update-") as folder:
+        # ignore_cleanup_errors: antivírus segurando um .py extraído não pode transformar uma instalação que deu certo em "falhou".
+        with tempfile.TemporaryDirectory(prefix="agent-launcher-update-", ignore_cleanup_errors=True) as folder:
             apply(download(meta, Path(folder)), root)
         log(f"Agent Launcher atualizado para {meta['version']}. Reabra para usar a versão nova.")
         return meta["version"]
@@ -227,9 +228,17 @@ def check_in_background(root: Path = ROOT, enabled: bool = True, stamp: Path | N
     except UpdateError as error:
         record(f"Atualização em segundo plano não disparada: {error}")
         return False
-    spawn([str(python), str(Path(root) / "updater.py"), "--background"],
-          cwd=root, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0))
+    try:
+        stderr = (data_home() / "update-erro.log").open("ab")  # exceção antes do try de background_main também deixa rastro
+    except OSError:
+        stderr = subprocess.DEVNULL
+    try:
+        spawn([str(python), str(Path(root) / "updater.py"), "--background"],
+              cwd=root, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
+              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0))
+    finally:
+        if stderr is not subprocess.DEVNULL:
+            stderr.close()
     return True
 
 

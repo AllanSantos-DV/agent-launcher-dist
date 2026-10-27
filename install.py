@@ -18,7 +18,7 @@ from pathlib import Path
 
 import clis
 import terminal
-from agent_launcher.domain.files import remove_tree
+from agent_launcher.domain.files import remove_tree, replace_retrying
 from version import APP_NAME, APP_USER_MODEL_ID, VERSION, data_home
 
 SOURCE = Path(__file__).resolve().parent
@@ -127,7 +127,7 @@ def removable(target, rel):
     parts = Path(rel).parts
     if Path(rel).is_absolute() or ".." in parts or any(part in BLOCKED for part in parts):
         return False
-    return (target / rel).resolve().is_relative_to(target)
+    return (target / rel).resolve().is_relative_to(Path(target).resolve())  # temp com nome curto (8.3) ou junção não pode barrar
 
 
 def copy_files(target, files, backup, changed, removed, previous):
@@ -150,7 +150,7 @@ def copy_files(target, files, backup, changed, removed, previous):
             continue
         if (target / rel).is_file():
             (backup / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(target / rel, backup / rel)
+            replace_retrying(target / rel, backup / rel)
             removed.append(rel)
     (target / MANIFEST).write_text(json.dumps({"installed_at": time.time(), "version": VERSION, "source": str(SOURCE),
                                                "files": files}, indent=1), encoding="utf-8")
@@ -328,6 +328,20 @@ def cancel_removal(target, registry=None):
         registry.delete_value(RUN_ONCE, name)
 
 
+def stop_endpoints(target):
+    """Os endpoints locais rodam no Python base (fora da .venv): `in_use` não os vê, e o do logon voltaria sem a instalação.
+    Para os que respondem e tira o início no logon que aponta para esta instalação; falha vira aviso."""
+    from agent_launcher.endpoint import registry as endpoint
+    try:
+        stopped = endpoint.stop_all()
+        removed = endpoint.remove_autostart_entries(target)
+    except (OSError, ImportError) as error:
+        print(f"Aviso: endpoints locais não paralisados ({error}).", file=sys.stderr)
+        return
+    if stopped or removed:
+        print(f"Endpoints locais: {stopped} parado(s), {len(removed)} início(s) no logon removido(s).")
+
+
 def uninstall(target, registry=None):
     if not (target / MANIFEST).is_file():
         raise SystemExit(f"{target} não contém uma instalação do {APP_NAME} (sem {MANIFEST}); nada foi removido.")
@@ -335,6 +349,7 @@ def uninstall(target, registry=None):
     if busy:
         raise SystemExit(f"{APP_NAME} está aberto ({busy[0].name} em uso): feche a janela e as sessões abertas por ele e "
                          "rode a desinstalação de novo; nada foi removido.")
+    stop_endpoints(target)
     powershell(_REMOVE_SHORTCUTS, {"AL_NAME": SHORTCUT})
     try:
         unregister_file_type()

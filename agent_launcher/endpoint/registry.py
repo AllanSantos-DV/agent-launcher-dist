@@ -194,7 +194,8 @@ def ensure_running(home: Path, connection_id: str, timeout: float = 15) -> int:
         raise LauncherError(f"A porta {port} do endpoint local está ocupada por outro programa. Libere a porta ou "
                             f"apague a entrada {_key(home, connection_id)} de {state_file()} para escolher outra (e abra o destino de novo pelo launcher).")
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-    subprocess.Popen(server_command(home, connection_id), cwd=ROOT, close_fds=True, stdin=subprocess.DEVNULL,
+    # cwd na pasta de dados: o processo não segura a pasta da instalação (desinstalar e atualizar precisam apagá-la).
+    subprocess.Popen(server_command(home, connection_id), cwd=Path(home), close_fds=True, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -224,6 +225,48 @@ def stop(home: Path, connection_id: str, timeout: float = 5) -> bool:
     while time.monotonic() < deadline and health(port):
         time.sleep(0.2)
     return not health(port)
+
+
+def stop_all(timeout: float = 5) -> int:
+    """Para todo endpoint deste usuário que responde (portas do endpoints.json, todos os perfis). Devolve quantos pararam."""
+    stopped = 0
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for port in sorted({value for value in _read()["ports"].values() if isinstance(value, int)}):
+        if not health(port):
+            continue
+        try:
+            opener.open(urllib.request.Request(f"http://127.0.0.1:{port}/shutdown", data=b"", method="POST"),
+                        timeout=timeout).close()
+        except OSError:
+            pass
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and health(port):
+            time.sleep(0.2)
+        stopped += not health(port)
+    return stopped
+
+
+def remove_autostart_entries(install_root: Path) -> list[str]:
+    """Tira de HKCU\\...\\Run os valores AgentLauncherEndpoint-* (todos os perfis) cujo comando roda a partir de
+    `install_root`: desinstalar não pode deixar o logon tentando abrir um endpoint que não existe mais."""
+    import winreg
+    removed = []
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
+        names = []
+        index = 0
+        while True:
+            try:
+                name, value, _kind = winreg.EnumValue(key, index)
+            except OSError:
+                break
+            index += 1
+            if name.startswith("AgentLauncherEndpoint-") and isinstance(value, str) \
+                    and str(install_root).lower().rstrip("\\/") + "\\" in value.lower():  # com a barra: AgentLauncher-dev não casa
+                names.append(name)
+        for name in names:
+            winreg.DeleteValue(key, name)
+            removed.append(name)
+    return removed
 
 
 def _run_value(connection_id: str, home: Path | None = None) -> str:
