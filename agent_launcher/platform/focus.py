@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 from agent_launcher import ROOT
+from agent_launcher.domain.files import replace_retrying
 
 STATE_FILE = Path.home() / ".cli-launcher" / "topmost.json"
 MUTEX_NAME = "Local\\agent-launcher-topmost"
@@ -290,7 +291,7 @@ def write_state(state: dict, path: Path | None = None) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(".tmp")
     temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    os.replace(temporary, target)
+    replace_retrying(temporary, target)
 
 
 def is_topmost(hwnd: int) -> bool:

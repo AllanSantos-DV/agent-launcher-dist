@@ -29,6 +29,7 @@ BLOCKED = {"__pycache__", ".git", ".github", ".claude", ".vscode", ".memory", ".
            "terminal.old", "tests", "docs", "site", "release", "npm", "dist", "bin", "node_modules",
            "AGENTS.md", "CLAUDE.md", "install.py", "package.json", ".gitignore", ".gitattributes", MANIFEST}
 MIN_PYTHON = (3, 10)
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # instalador iniciado por processo sem console não abre janela
 SHORTCUT = f"{APP_NAME}.lnk"
 # Pacote de perfil (.alprofile): associação por usuário, sem admin.
 CLASSES = r"Software\Classes"
@@ -179,7 +180,7 @@ def restore(target, backup, changed, removed):
 
 def run_tests(python, root):
     tests = subprocess.run([str(python), str(root / "tests" / "run.py")], capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
+                           encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
     output = (tests.stdout + tests.stderr).strip()
     print(output[-4000:])
     return tests.returncode == 0
@@ -192,7 +193,7 @@ def healthy(python) -> bool:
         return False
     try:
         return subprocess.run([str(python), "-c", "import sys"], capture_output=True, timeout=60,
-                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
+                              creationflags=NO_WINDOW).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -205,13 +206,17 @@ def install_dependencies(target, python):
         else:
             print("Criando ambiente virtual…")
         venv.create(target / ".venv", with_pip=True)
-    subprocess.run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "-q", "-r",
-                    str(target / "requirements.txt")], check=True)
+    result = subprocess.run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "-q", "-r",
+                             str(target / "requirements.txt")], capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", creationflags=NO_WINDOW)
+    if result.returncode:  # sem console visível, a saída do pip só chega por aqui
+        raise RuntimeError("pip install falhou: " + (result.stderr or result.stdout).strip()[-600:])
 
 
 def powershell(script, env):
     result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                            env={**os.environ, **env}, capture_output=True, text=True, timeout=60)
+                            env={**os.environ, **env}, capture_output=True, text=True, timeout=60,
+                            creationflags=NO_WINDOW)
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout).strip()[-600:] or f"PowerShell saiu com {result.returncode}")
 
@@ -338,7 +343,8 @@ def main():
         interpreter = python if healthy(python) else Path(sys.executable)
         imports = "import core, catalog, connectors, desktop, launcher" + ("" if args.skip_deps else ", gui")
         compiled = subprocess.run([str(interpreter), "-c", imports], cwd=target,
-                                  capture_output=True, text=True, encoding="utf-8", errors="replace")
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  creationflags=NO_WINDOW)
         if compiled.returncode:
             raise RuntimeError("versão instalada não importa: " + compiled.stderr.strip()[-600:])
         if not args.no_shortcuts:

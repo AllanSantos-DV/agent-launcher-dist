@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
 from pathlib import Path
 
 from agent_launcher.domain.catalog import MODEL_PATTERN
@@ -34,6 +36,22 @@ def validate_model(model: str) -> str:
     return model
 
 
+REPLACE_ATTEMPTS = 10
+
+
+def replace_retrying(source, destination, attempts: int = REPLACE_ATTEMPTS) -> None:
+    """os.replace que repete quando o Windows recusa por um leitor ou outro escritor com o destino aberto (EPERM,
+    EACCES e EBUSY chegam como PermissionError); espera crescente com variação. Esgotadas as tentativas, levanta."""
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == attempts:
+                raise
+            time.sleep(0.015 * attempt * (0.5 + random.random()))
+
+
 def atomic_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     import tempfile
@@ -44,7 +62,7 @@ def atomic_json(path: Path, data: dict) -> None:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        replace_retrying(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)

@@ -18,6 +18,7 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
+from agent_launcher.domain.files import replace_retrying
 
 SESSIONS_DIR = Path.home() / ".cli-launcher" / "sessions"
 KEY_DELAY = 0.05  # entre uma tecla e outra: o CLI lê cada uma como um evento separado
@@ -96,7 +97,7 @@ def register(pid: int, project: str, project_id: str, cli: str, title: str, cont
     temporary.write_text(json.dumps({"pid": pid, "project": project, "project_id": project_id, "cli": cli,
                                      "title": title, "controlled": controlled, "startedAt": time.time()},
                                     ensure_ascii=False), encoding="utf-8")
-    os.replace(temporary, target)
+    replace_retrying(temporary, target)
     return target
 
 

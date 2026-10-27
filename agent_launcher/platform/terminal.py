@@ -231,7 +231,8 @@ def install_winget() -> None:
         raise TerminalError("winget não está disponível nesta máquina.")
     result = subprocess.run([winget, "install", "--id", "Microsoft.WindowsTerminal", "-e", "--source", "winget",
                              "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity",
-                             "--silent"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+                             "--silent"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if result.returncode or not shutil.which("wt.exe"):
         tail = (result.stdout + result.stderr).strip().splitlines()[-3:]
         raise TerminalError("winget não instalou o Windows Terminal: " + " | ".join(tail))

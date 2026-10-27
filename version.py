@@ -4,7 +4,7 @@ from pathlib import Path
 
 APP_NAME = "Agent Launcher"
 APP_ID = "agent-launcher"
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 # Identidade na barra de tarefas: sem ela o Windows agrupa o app sob o pythonw.exe, com o ícone do Python.
 APP_USER_MODEL_ID = "AgentLauncher.App"
 
