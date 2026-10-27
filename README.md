@@ -54,7 +54,7 @@ bloqueado, tenta `npm install -g`. Depois disso a interface também oferece **In
 o modo texto tem `launcher cli --install claude|codex|all`. Não é preciso fazer login nos CLIs: a chave vem da conexão.
 
 **Atualização das CLIs.** Cada botão de CLI mostra a versão instalada (`--version`) e, quando o registro do npm tem uma mais
-nova, a faixa de avisos diz "Codex 0.164.0 disponível (instalada 0.162.1)" e aparece **Atualizar Codex 0.162.1 → 0.164.0**.
+nova, a faixa de avisos (informativa, separada da de erros) diz "Codex 0.164.0 disponível (instalada 0.162.1)" e aparece **Atualizar Codex 0.162.1 → 0.164.0**.
 Com **Atualizar as CLIs automaticamente** ligado (padrão), o launcher dispara o `update` da própria CLI (ou o
 `npm install -g …@latest` de quem a instalou pelo npm) e avisa "Codex atualizado: 0.162.1 → 0.164.0". Sessão
 aberta não impede: o Windows deixa renomear um .exe em execução, então a sessão segue na versão antiga e a nova vale na próxima

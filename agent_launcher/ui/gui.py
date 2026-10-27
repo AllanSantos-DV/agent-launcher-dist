@@ -312,7 +312,8 @@ class CleanupTask(QRunnable):
             from agent_launcher.harnesses.cleanup import cleanup_profile
             self.signals.completed.emit((self.cleanup or cleanup_profile)(self.home, lambda *_: True), "")
         except Exception as error:  # volta para a tela como aviso, nunca derruba a thread
-            self.signals.completed.emit([str(error)], "")
+            from agent_launcher.harnesses.cleanup import failure
+            self.signals.completed.emit([failure("Limpeza nos destinos", error)], "")
 
 
 class UsageTask(QRunnable):
@@ -405,6 +406,9 @@ class UsageDialog(QDialog):
         self.table.resizeColumnsToContents()
 
 
+GENERAL_ERROR = "geral"  # origem do erro avulso de uma ação; os erros persistentes têm origem própria
+
+
 class LauncherWindow(QMainWindow):
     def __init__(self, store: Store | None = None, auto_refresh: bool = True):
         super().__init__()
@@ -427,9 +431,10 @@ class LauncherWindow(QMainWindow):
         self.cli_queue = []
         self.cli_checking = False
         self.cli_updating = None
-        self.notice_is_info = False
+        self.errors: dict[str, str] = {}  # origem -> erro ativo; cada um some só quando a sua origem se resolve
         self.cli_failed = set()
         self.cli_announced = ()
+        self.update_notice_failed = False
         self.update_status = "não verificada nesta execução"
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(str(ROOT / "assets" / "launcher.ico")))
@@ -691,6 +696,10 @@ class LauncherWindow(QMainWindow):
         notice_row.addWidget(self.copy_error, 0, Qt.AlignmentFlag.AlignTop)
         body.addLayout(notice_row)
         self.notice.installEventFilter(self)  # o botão aparece e some junto com a faixa
+        self.info_notice = label("", "notice")  # faixa própria do informativo: nunca ocupa o lugar de um erro
+        self.info_notice.setWordWrap(True)
+        self.info_notice.hide()
+        body.addWidget(self.info_notice)
         self.update_notice = label("", "notice")
         self.update_notice.setWordWrap(True)
         self.update_notice.setTextFormat(Qt.TextFormat.RichText)
@@ -818,12 +827,14 @@ class LauncherWindow(QMainWindow):
         self.cli_checking = False
         if isinstance(result, Exception):
             clis.record(f"verificação das CLIs falhou: {result}")
-            self.show_error(f"Não foi possível verificar as versões das CLIs: {result}")
+            self.show_error(f"Não foi possível verificar as versões das CLIs: {result}", origin="cli:verificacao")
             return
         self.cli_versions = result
         self.refresh_cli_versions()
         lines, problems, self.cli_queue = [], [], []
         for cli, found in result.items():
+            if not found["newer"]:
+                self.clear_error(f"cli:{cli}")  # em dia (atualizada por fora, inclusive): a falha de atualizar não vale mais
             if found["error"] and not found["installed"]:
                 problems.append(f"{clis.NAMES[cli]}: não foi possível verificar a versão ({found['error']}).")
                 continue
@@ -836,9 +847,12 @@ class LauncherWindow(QMainWindow):
                 self.cli_queue.append(cli)
             else:
                 lines.append(f"{head}. Use o botão Atualizar.")
-        lines = problems + lines
+        if problems:
+            self.show_error("\n".join(problems), origin="cli:verificacao")
+        else:
+            self.clear_error("cli:verificacao")
         if lines and tuple(lines) != self.cli_announced:
-            (self.show_error if problems else self.show_info)("\n".join(lines))
+            self.show_info("\n".join(lines))
         self.cli_announced = tuple(lines)
         self.run_next_cli_update()
         self.update_actions()
@@ -868,14 +882,17 @@ class LauncherWindow(QMainWindow):
         name = clis.NAMES[cli]
         found = self.cli_versions.get(cli) or {}
         if isinstance(result, cli_update.UpdateDeferred):
+            self.clear_error(f"cli:{cli}")
             self.show_info(str(result))
         elif isinstance(result, Exception):
             self.cli_failed.add((cli, found.get("latest")))
-            self.show_error(f"Aviso: não foi possível atualizar o {name}: {result}")
+            self.show_error(f"Aviso: não foi possível atualizar o {name}: {result}", origin=f"cli:{cli}")
         elif result["updated"]:
+            self.clear_error(f"cli:{cli}")
             found.update(installed=result["after"], newer=False, running=0)
             self.show_info(f"{name} atualizado: {result['before']} → {result['after']}." + self.sessions_note(result["sessions"]))
         else:
+            self.clear_error(f"cli:{cli}")
             found.update(installed=result["after"], newer=False, running=0)
             self.show_info(f"{name} já está em dia ({result['after']}).")
         self.refresh_cli_versions()
@@ -904,6 +921,7 @@ class LauncherWindow(QMainWindow):
             # Sem rede ou sem acesso ao GitHub: não vira faixa a cada abertura; fica no registro do Terminal.
             record_terminal_problem(self.problem_report(f"Atualização do Windows Terminal portátil falhou: {result}"))
         elif result and not result.startswith("adiada"):
+            self.clear_error("terminal")
             self.show_info(result)
 
     def start_auto_update(self):
@@ -930,6 +948,7 @@ class LauncherWindow(QMainWindow):
             self.update_status = f"falhou: {result}"
         elif isinstance(result, Exception):
             self.update_status = f"falhou: {result}"
+            self.update_notice_failed = True
             self.update_notice.setText(f"Atualização automática falhou: {result}".replace("<", "&lt;"))
             self.update_notice.show()
         elif result:
@@ -942,6 +961,9 @@ class LauncherWindow(QMainWindow):
             QTimer.singleShot(RESTART_DELAY_MS, self.restart_if_idle)
         else:
             self.update_status = f"em dia ({VERSION})"
+            if self.update_notice_failed:  # só o aviso de falha sai; o de "atualizado, reinicie" continua
+                self.update_notice_failed = False
+                self.update_notice.hide()
         updater.record(self.update_status)
 
     def restart_if_idle(self):
@@ -990,7 +1012,7 @@ class LauncherWindow(QMainWindow):
     def select_connection(self, *_args):
         identifier = self.connection_picker.currentData()
         self.gateway, self.catalog, self.online = None, None, False
-        self.notice.hide()
+        self.clear_transient("connection")
         try:
             if identifier:
                 self.gateway = Gateway(self.store, self.store.find_connection(identifier))
@@ -1196,7 +1218,7 @@ class LauncherWindow(QMainWindow):
         if not self.gateway or connection != self.gateway.connection["id"]:
             self.update_actions()
             return  # resposta de uma conexão que já foi trocada
-        catalog, error = (None, str(result)) if isinstance(result, Exception) else (result, "")
+        catalog, error = (None, str(result) or type(result).__name__) if isinstance(result, Exception) else (result, "")
         self.online = not error
         self.connection.setText(f"Conectado - {self.gateway.name}" if self.online else f"Indisponível - {self.gateway.name}")
         self.connection.setProperty("offline", not self.online)
@@ -1207,12 +1229,10 @@ class LauncherWindow(QMainWindow):
         elif self.catalog is not None:
             self.catalog.verified = False
         if error:
-            self.show_error(f"Não foi possível acessar a conexão. Verifique o host e clique em Atualizar. {error}")
-            self.notice.setToolTip(error)
+            self.show_error(f"Não foi possível acessar a conexão. Verifique o host e clique em Atualizar. {error}",
+                            origin="connection")
         else:
-            self.notice.hide()
-            self.notice.setText("")
-            self.notice.setToolTip("")
+            self.clear_error("connection")
         self.footer.setText(self.catalog.status.replace("atualizar: r", "atualizar: F5") if self.online and self.catalog else error)
         self.populate_providers()
         self.populate_models()
@@ -1220,7 +1240,7 @@ class LauncherWindow(QMainWindow):
     def launch_session(self, resume=False, conversation=None):
         if not self.project or not self.gateway or not self.selected_model or not self.online or self.refreshing:
             return
-        self.notice.hide()
+        self.clear_transient()
         harness = registry.get(self.cli)
         if harness.KIND != "terminal":
             self.open_outside_terminal(harness)
@@ -1272,10 +1292,10 @@ class LauncherWindow(QMainWindow):
     def finish_install_cli(self, found, log):
         self.installing_cli = False
         if found:
-            self.notice.hide()
+            self.clear_error("cli:instalacao")
             self.footer.setText(f"Instalado: {found}")
         else:
-            self.show_error(log or "Não foi possível instalar o CLI.")
+            self.show_error(log or "Não foi possível instalar o CLI.", origin="cli:instalacao")
         self.update_actions()
 
     def check_sessions(self):
@@ -1287,7 +1307,7 @@ class LauncherWindow(QMainWindow):
     def eventFilter(self, watched, event):
         # *ToParent: chegam ao mostrar/esconder a faixa mesmo com a janela ainda invisível (Show/Hide não).
         if watched is self.notice and event.type() in (QEvent.Type.ShowToParent, QEvent.Type.HideToParent):
-            self.copy_error.setVisible(event.type() == QEvent.Type.ShowToParent and not self.notice_is_info)
+            self.copy_error.setVisible(event.type() == QEvent.Type.ShowToParent)
         return super().eventFilter(watched, event)
 
     def problem_report(self, message: str) -> str:
@@ -1313,6 +1333,7 @@ class LauncherWindow(QMainWindow):
     def ensure_terminal(self, opened_in_console: bool = False):
         """Sem Terminal: instala sozinho em segundo plano; só avisa de erro se todas as formas falharem."""
         if terminal.find(ROOT):
+            self.clear_error("terminal")
             return
         record_terminal_problem(self.problem_report("Windows Terminal não encontrado pela interface."))
         if opened_in_console:
@@ -1328,28 +1349,56 @@ class LauncherWindow(QMainWindow):
     @Slot(object, str)
     def finish_terminal(self, found, log):
         self.terminal_installing = False
+        self.clear_info()  # o "instalando…" acabou; o resultado vem a seguir
         if found:
+            self.clear_error("terminal")
             self.show_info(f"Windows Terminal pronto ({found}). As próximas sessões abrem nele.")
             return
         details = "\n".join(line.strip() for line in log.splitlines() if "[falhou]" in line or "ambiente:" in line)
         self.show_error("Windows Terminal indisponível: nenhuma forma de instalação funcionou nesta máquina, então as "
                         "sessões abrem em consoles separados. Use \"Copiar erro\" para ver o motivo."
-                        + (f"\n{details}" if details else ""))
+                        + (f"\n{details}" if details else ""), origin="terminal")
         record_terminal_problem(self.problem_report(log or "Instalação do Windows Terminal falhou sem detalhes."))
 
     def show_info(self, message):
         """Aviso informativo (versão nova, atualizado, adiado): sem o botão Copiar erro."""
-        self.set_notice(message, info=True)
+        self.info_notice.setText(message)
+        self.info_notice.setToolTip(message)
+        self.info_notice.show()
 
-    def show_error(self, message):
-        self.set_notice(message, info=False)
+    def show_error(self, message, origin=GENERAL_ERROR):
+        """Erro na faixa de erros. Origens diferentes convivem; a mesma origem substitui o seu erro anterior."""
+        self.errors[origin] = message
+        self.render_errors()
 
-    def set_notice(self, message, info):
-        self.notice_is_info = info
-        self.notice.setText(message)
-        self.notice.setToolTip(message)
-        self.notice.show()
-        self.copy_error.setVisible(not info)
+    def render_errors(self):
+        text = "\n".join(self.errors.values())
+        self.notice.setText(text)
+        self.notice.setToolTip(text)
+        self.notice.setVisible(bool(text))
+
+    def clear_error(self, origin=None):
+        """Sem origem, apaga todos os erros; com origem, só o que ela causou (o resto continua valendo)."""
+        if origin is None:
+            self.errors.clear()
+        else:
+            self.errors.pop(origin, None)
+        self.render_errors()
+
+    def clear_transient(self, *origins):
+        """Ação do usuário que não resolve os erros persistentes: some o erro avulso, o informativo e as origens
+        que a ação refaz (ex.: trocar de conexão refaz o erro da conexão)."""
+        self.errors.pop(GENERAL_ERROR, None)
+        for origin in origins:
+            self.errors.pop(origin, None)
+        self.render_errors()
+        self.clear_info()
+
+    def clear_info(self):
+        self.cli_announced = ()  # o mesmo aviso de versão volta a aparecer na próxima verificação
+        self.info_notice.hide()
+        self.info_notice.setText("")
+        self.info_notice.setToolTip("")
 
     def add_project(self):
         folder = QFileDialog.getExistingDirectory(self, "Escolha a pasta do projeto")
@@ -1369,7 +1418,7 @@ class LauncherWindow(QMainWindow):
             self.store = fresh
             self.project_search.clear()
             self.populate_projects(project["id"])
-            self.notice.hide()
+            self.clear_transient()
             warning = self.shared_warning(project["path"])
             if warning:
                 self.show_info(warning)
@@ -1410,7 +1459,7 @@ class LauncherWindow(QMainWindow):
                 project = fresh.update(self.project["id"], dialog.name.text(), dialog.path.text())
                 self.store = fresh
                 self.populate_projects(project["id"])
-                self.notice.hide()
+                self.clear_transient()
                 return
             except (LauncherError, OSError, ValueError) as error:
                 QMessageBox.warning(dialog, "Editar projeto", str(error))
@@ -1500,7 +1549,7 @@ class LauncherWindow(QMainWindow):
             return
         self.store = store
         self.project, self.gateway, self.catalog, self.online, self.selected_model = None, None, None, False, None
-        self.notice.hide()
+        self.clear_transient("connection", "perfil")
         self.connection_picker.blockSignals(True)
         self.connection_picker.clear()
         self.connection_picker.blockSignals(False)
@@ -1605,20 +1654,30 @@ class LauncherWindow(QMainWindow):
         self.profile_options.setEnabled(not busy)
 
     def finish_remove_profile(self, current: dict, delete_data: bool, messages):
-        messages = [str(messages)] if isinstance(messages, Exception) else list(messages or [])
+        from agent_launcher.harnesses.cleanup import Failure, failure
+        messages = [failure("Limpeza nos destinos", messages)] if isinstance(messages, Exception) else list(messages or [])
         self.set_profile_busy(False)
         self.cleanup_task = None
         from agent_launcher.harnesses.cleanup import release_profile_endpoints
-        messages += release_profile_endpoints(profiles.home_of(current["id"], self.profile_base))
+        try:
+            messages += release_profile_endpoints(profiles.home_of(current["id"], self.profile_base))
+        except (LauncherError, OSError) as error:
+            messages.append(failure("Endpoints do perfil", error))
         try:
             profiles.remove(current["id"], delete_data, self.profile_base)
         except (LauncherError, OSError) as error:
-            self.show_error(" ".join([*messages, str(error)]))
+            self.show_error(" ".join([*(m for m in messages if isinstance(m, Failure)), str(error)]), origin="perfil")
+            if any(not isinstance(m, Failure) for m in messages):
+                self.show_info(" ".join(m for m in messages if not isinstance(m, Failure)))
             return
         self.switch_profile(profiles.DEFAULT)
-        if messages:  # o que foi feito e os avisos de cada passo (ex.: "VS Code: arquivo preso"), sem bloquear
+        if messages:  # o que foi feito (informativo) e o que falhou (erro, ex.: "VS Code: arquivo preso"), sem bloquear
             self.footer.setText(" ".join(messages))
-            self.show_info(" ".join(messages))
+            failed = [message for message in messages if isinstance(message, Failure)]
+            if failed:
+                self.show_error(" ".join(failed), origin="perfil")
+            if len(failed) < len(messages):
+                self.show_info(" ".join(message for message in messages if not isinstance(message, Failure)))
 
     def ask_clean_profile_destinations(self, current: dict) -> bool | None:
         """Pergunta se tira as conexões do perfil do Copilot app, do VS Code e do endpoint local.

@@ -9,6 +9,15 @@ from types import SimpleNamespace
 from agent_launcher.domain.errors import LauncherError
 
 
+class Failure(str):
+    """Mensagem de um passo que falhou (o resto das mensagens só conta o que foi feito): a interface a mostra como erro."""
+
+
+def failure(label: str, error: Exception) -> Failure:
+    """Falha de um passo, nomeada; mensagem vazia (ex.: RuntimeError("")) ainda diz de que erro se trata."""
+    return Failure(f"{label}: {str(error) or type(error).__name__}")
+
+
 def provider_name(store, connection: dict) -> str:
     """Nome do provider que o VS Code e o Copilot app receberam para esta conexão (o mesmo dos dois adaptadores)."""
     from agent_launcher.harnesses.copilot_app import CopilotApp
@@ -34,28 +43,28 @@ def cleanup_destinations(store, connection: dict, confirm=lambda question: True,
         message = copilot_remove(name, confirm)
         if message:
             messages.append(message)
-    except (LauncherError, OSError, Exception) as error:  # sqlite3.Error e afins: vira aviso
-        messages.append(f"Copilot app: {error}")
+    except Exception as error:  # sqlite3.Error e afins: vira aviso
+        messages.append(failure("Copilot app", error))
     try:
         if vscode_remove(name):
             messages.append(f"Provider \"{name}\" removido do VS Code (perfil Agent Launcher).")
-    except (OSError, ValueError) as error:
-        messages.append(f"VS Code: {error}")
+    except Exception as error:
+        messages.append(failure("VS Code", error))
     try:
         if stop(store.home, connection["id"]):
             messages.append("Endpoint local parado.")
-    except (LauncherError, OSError) as error:
-        messages.append(f"Endpoint local: {error}")
+    except Exception as error:
+        messages.append(failure("Endpoint local", error))
     try:
         autostart(store.home, connection["id"], False)
-    except (OSError, ImportError) as error:
-        messages.append(f"Iniciar com o Windows: {error}")
+    except Exception as error:
+        messages.append(failure("Iniciar com o Windows", error))
     try:
         port = forget(store.home, connection["id"])
         if port:
             messages.append(f"Porta {port} do endpoint local liberada.")
-    except OSError as error:
-        messages.append(f"Porta do endpoint: {error}")
+    except Exception as error:
+        messages.append(failure("Porta do endpoint", error))
     return messages
 
 
@@ -71,8 +80,8 @@ def release_endpoint(home, connection_id: str) -> list[str]:
                         ("Porta do endpoint", lambda: registry.forget(home, connection_id))):
         try:
             step()
-        except (LauncherError, OSError, ImportError) as error:
-            messages.append(f"{label}: {error}")
+        except Exception as error:
+            messages.append(failure(label, error))
     return messages
 
 

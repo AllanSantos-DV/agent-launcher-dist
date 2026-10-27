@@ -208,7 +208,15 @@ class EndpointPanel(QWidget):
         self.notice = _label("", "notice")
         self.notice.hide()
         layout.addWidget(self.notice)
+        self.state_error = ""  # leitura do estado: vale para todas as conexões até a próxima leitura que der certo
+        self.action_errors: dict[str, str] = {}  # erro de Iniciar/Parar/autostart, por conexão
         self.hide()
+
+    def render_notice(self):
+        """Erros ativos desta conexão: o da leitura do estado e o da última ação nela (o de outra conexão não aparece)."""
+        text = "\n".join(filter(None, [self.state_error, self.action_errors.get(self.connection_id or "", "")]))
+        self.notice.setText(text)
+        self.notice.setVisible(bool(text))
 
     def _start(self, job, slot):
         task = _Task(job)
@@ -238,14 +246,15 @@ class EndpointPanel(QWidget):
     def refreshed(self, states, error):
         self._set_busy(False)
         if error:
-            self.notice.setText(f"Estado do endpoint: {error}")
-            self.notice.show()
+            self.state_error = f"Estado do endpoint: {error}"
         else:
+            self.state_error = ""
             self.states = states or {}
         self.show_for(self.connection_id)
 
     def show_for(self, connection_id: str | None):
         self.connection_id = connection_id
+        self.render_notice()
         state = self.states.get(connection_id) if connection_id else None
         if not state or not state.get("port"):
             self.hide()
@@ -266,28 +275,35 @@ class EndpointPanel(QWidget):
         if not state:
             return
         home = self.home
-        self.notice.hide()
+        self.action_errors.pop(connection_id, None)
+        self.render_notice()
         if state.get("running"):
             self._set_busy(True, "Parando o endpoint…")
-            self._start(lambda: endpoint_registry.stop(home, connection_id), self.acted)
+            self._start(lambda: endpoint_registry.stop(home, connection_id), self._acted_for(connection_id))
         else:
             self._set_busy(True, "Iniciando o endpoint…")
-            self._start(lambda: endpoint_registry.ensure_running(home, connection_id), self.acted)
+            self._start(lambda: endpoint_registry.ensure_running(home, connection_id), self._acted_for(connection_id))
 
     def set_autostart(self, enabled: bool):
         connection_id = self.connection_id
         if not connection_id:
             return
         home = self.home
-        self.notice.hide()
+        self.action_errors.pop(connection_id, None)
+        self.render_notice()
         self._set_busy(True)
-        self._start(lambda: endpoint_registry.autostart(home, connection_id, bool(enabled)), self.acted)
+        self._start(lambda: endpoint_registry.autostart(home, connection_id, bool(enabled)), self._acted_for(connection_id))
+
+    def _acted_for(self, connection_id):
+        """A resposta chega depois: o erro é da conexão que disparou a ação, não da que está selecionada agora."""
+        return lambda result, error: self.acted(result, error, connection_id)
 
     @Slot(object, str)
-    def acted(self, _result, error):
-        if error:
-            self.notice.setText(error)
-            self.notice.show()
+    def acted(self, _result, error, connection_id=None):
+        connection_id = connection_id or self.connection_id
+        if error and connection_id:
+            self.action_errors[connection_id] = error
+            self.render_notice()
         self.refresh()
 
 
@@ -327,6 +343,11 @@ class ConnectionsDialog(QDialog):
         layout.addLayout(body, 1)
         self.endpoint = EndpointPanel(home, self)
         layout.addWidget(self.endpoint)
+        self.errors: dict[str, str] = {}  # origem ("limpeza", "teste") -> erro; some só quando a origem se resolve
+        self.error_notice = _label("", "notice")  # não some com a lista que recarrega nem com a linha de status
+        self.error_notice.setWordWrap(True)
+        self.error_notice.hide()
+        layout.addWidget(self.error_notice)
         self.status = _label("", "muted")
         layout.addWidget(self.status)
         close = QPushButton("Fechar")
@@ -385,9 +406,22 @@ class ConnectionsDialog(QDialog):
         home = self.home
         self.status.setText(f"Testando {connection['name']}…")
         self.task = _Task(lambda: Gateway(Store(home), Store(home).find_connection(connection["id"])).verify())
-        self.task.signals.done.connect(lambda _result, error: self.status.setText(
-            f"{connection['name']}: {error}" if error else f"{connection['name']}: conexão respondeu."))
+        self.task.signals.done.connect(lambda _result, error: self.show_test_result(connection["name"], error))
         QThreadPool.globalInstance().start(self.task)
+
+    def show_test_result(self, name: str, error: str):
+        if error:
+            self.errors["teste"] = f"{name}: {error}"
+            self.status.setText("")
+        else:
+            self.errors.pop("teste", None)
+            self.status.setText(f"{name}: conexão respondeu.")
+        self.render_errors()
+
+    def render_errors(self):
+        text = "\n".join(self.errors.values())
+        self.error_notice.setText(text)
+        self.error_notice.setVisible(bool(text))
 
     def make_default(self):
         connection = self.current()
@@ -423,14 +457,28 @@ class ConnectionsDialog(QDialog):
         self.cleanup_task = task
 
         def finished(messages, error):
-            messages = list(messages or []) + ([error] if error else [])
+            from agent_launcher.harnesses.cleanup import Failure
+            messages = list(messages or []) + ([Failure(error)] if error else [])
             self._set_cleaning(False)
-            self.status.setText(" ".join(messages))
+            self.show_cleanup_result(messages)
             self.cleanup_task = None
             if then:
                 then(messages)
         task.signals.done.connect(finished)
         QThreadPool.globalInstance().start(task)
+
+    def show_cleanup_result(self, messages):
+        """O que foi feito vai para a linha de status; o que falhou, para a faixa própria, até a próxima limpeza."""
+        from agent_launcher.harnesses.cleanup import Failure
+        failed = [message for message in messages if isinstance(message, Failure)]
+        done = [message for message in messages if not isinstance(message, Failure)]
+        if failed:
+            self.errors["limpeza"] = " ".join(failed)
+        else:
+            self.errors.pop("limpeza", None)
+        self.render_errors()
+        if done:
+            self.status.setText(" ".join(done))
 
     def remove(self):
         connection = self.current()
@@ -452,11 +500,11 @@ class ConnectionsDialog(QDialog):
 
     def finish_remove(self, connection: dict, messages: list[str]):
         from agent_launcher.harnesses.cleanup import release_endpoint
+        from agent_launcher.harnesses.cleanup import Failure
         messages = [*messages, *release_endpoint(self.home, connection["id"])]
         try:
             Store(self.home).remove_connection(connection["id"])
         except LauncherError as error:
-            messages = [*messages, str(error)]
+            messages = [*messages, Failure(str(error))]
         self.populate()
-        if messages:
-            self.status.setText(" ".join(messages))
+        self.show_cleanup_result(messages)
