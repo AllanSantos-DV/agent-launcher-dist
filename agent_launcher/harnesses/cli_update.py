@@ -194,6 +194,40 @@ def _run_logged(cli: str, command: list[str]):
         installers._fail(cli, "atualização", f"a atualização do {NAMES[cli]} não iniciou: {error}")
 
 
+def _signed_targets(cli: str, path: str) -> list[Path]:
+    """Binários que o `update` nativo deixou: o .exe do caminho e, no Copilot, o runtime da build mais nova de ~/.copilot/pkg."""
+    found = [Path(path)] if Path(path).suffix.lower() == ".exe" and Path(path).is_file() else []
+    if cli == "copilot":
+        builds = [item for item in (Path.home() / ".copilot" / "pkg" / "win32-x64").glob("*")
+                  if re.fullmatch(r"\d+(\.\d+)+", item.name)]
+        if builds:
+            newest = max(builds, key=lambda item: tuple(int(part) for part in item.name.split(".")))
+            found += list(newest.glob("prebuilds/win32-x64/copilot-runtime.exe"))
+    return found
+
+
+def _verify_signature(cli: str, path: str, origin: str) -> None:
+    """Assinatura Authenticode do fabricante nos binários que ficaram depois do `update` nativo (como install_official).
+    Sem assinatura válida o executável é apagado e a atualização recusada; nunca roda um binário não conferido."""
+    targets = _signed_targets(cli, path)
+    if not targets:
+        if origin != "npm":
+            installers._fail(cli, "atualização", f"não achei o executável do {NAMES[cli]} ({path}) para conferir a assinatura "
+                                                 "depois da atualização; reinstale pelo launcher.")
+        return
+    unsigned = [item for item in targets if not installers._signed(item, installers.SIGNERS[cli])]
+    for item in unsigned:
+        try:
+            item.unlink()
+        except OSError as error:
+            installers._fail(cli, "atualização", f"{item} sem assinatura válida de {installers.SIGNERS[cli]} e não pôde ser "
+                                                 f"apagado ({error}); apague-o à mão.")
+    if unsigned:
+        installers._fail(cli, "atualização", f"{', '.join(map(str, unsigned))} sem assinatura Authenticode válida de "
+                                             f"{installers.SIGNERS[cli]} depois da atualização; o executável foi apagado "
+                                             "e a atualização recusada.")
+
+
 def _apply(cli: str, path: str, before: str | None, sessions: int = 0) -> dict:
     origin = source(cli, path)
     result = _run_logged(cli, command(cli, path, origin))
@@ -207,6 +241,8 @@ def _apply(cli: str, path: str, before: str | None, sessions: int = 0) -> dict:
     if result.returncode:
         installers._fail(cli, "atualização", f"atualização do {NAMES[cli]} ({origin}) falhou: {installers._tail(result)}")
     path = installers.find(cli) or path
+    if origin != "npm" or cli == "copilot":  # o `update` nativo troca o binário sem passar pelo npm: confere antes de executá-lo
+        _verify_signature(cli, path, origin)
     if origin == "npm" and cli != "copilot":
         try:
             if cli == "claude":

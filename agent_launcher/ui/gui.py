@@ -374,6 +374,10 @@ class UsageDialog(QDialog):
         layout = QVBoxLayout(self)
         self.status = QLabel("Calculando…")
         layout.addWidget(self.status)
+        self.error = label("", "notice")  # erro no estilo de erro da janela principal, nunca na linha de status
+        self.error.setWordWrap(True)
+        self.error.hide()
+        layout.addWidget(self.error)
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Destino", "Modelo", "Entrada", "Saída", "Custo"])
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -392,8 +396,11 @@ class UsageDialog(QDialog):
 
     def show_report(self, report, _text: str = ""):
         if isinstance(report, Exception):
-            self.status.setText(f"Não foi possível calcular o uso: {report}")
+            self.status.setText("")
+            self.error.setText(f"Não foi possível calcular o uso: {report}")
+            self.error.show()
             return
+        self.error.hide()
         rows = usage_rows(report)
         self.status.setText(f"Mês {report['month']}" + ("" if rows else ": nenhum uso encontrado."))
         self.table.setRowCount(len(rows))
@@ -432,6 +439,7 @@ class LauncherWindow(QMainWindow):
         self.cli_checking = False
         self.cli_updating = None
         self.errors: dict[str, str] = {}  # origem -> erro ativo; cada um some só quando a sua origem se resolve
+        self.infos: dict[str, str] = {}  # origem -> informativo; a mesma origem substitui o seu, origens diferentes convivem
         self.cli_failed = set()
         self.cli_announced = ()
         self.update_notice_failed = False
@@ -852,7 +860,7 @@ class LauncherWindow(QMainWindow):
         else:
             self.clear_error("cli:verificacao")
         if lines and tuple(lines) != self.cli_announced:
-            self.show_info("\n".join(lines))
+            self.show_info("\n".join(lines), origin="cli:verificacao")
         self.cli_announced = tuple(lines)
         self.run_next_cli_update()
         self.update_actions()
@@ -883,18 +891,19 @@ class LauncherWindow(QMainWindow):
         found = self.cli_versions.get(cli) or {}
         if isinstance(result, cli_update.UpdateDeferred):
             self.clear_error(f"cli:{cli}")
-            self.show_info(str(result))
+            self.show_info(str(result), origin=f"cli:{cli}")
         elif isinstance(result, Exception):
             self.cli_failed.add((cli, found.get("latest")))
             self.show_error(f"Aviso: não foi possível atualizar o {name}: {result}", origin=f"cli:{cli}")
         elif result["updated"]:
             self.clear_error(f"cli:{cli}")
             found.update(installed=result["after"], newer=False, running=0)
-            self.show_info(f"{name} atualizado: {result['before']} → {result['after']}." + self.sessions_note(result["sessions"]))
+            self.show_info(f"{name} atualizado: {result['before']} → {result['after']}." + self.sessions_note(result["sessions"]),
+                           origin=f"cli:{cli}")
         else:
             self.clear_error(f"cli:{cli}")
             found.update(installed=result["after"], newer=False, running=0)
-            self.show_info(f"{name} já está em dia ({result['after']}).")
+            self.show_info(f"{name} já está em dia ({result['after']}).", origin=f"cli:{cli}")
         self.refresh_cli_versions()
         self.run_next_cli_update()
         self.update_actions()
@@ -922,7 +931,7 @@ class LauncherWindow(QMainWindow):
             record_terminal_problem(self.problem_report(f"Atualização do Windows Terminal portátil falhou: {result}"))
         elif result and not result.startswith("adiada"):
             self.clear_error("terminal")
-            self.show_info(result)
+            self.show_info(result, origin="terminal:atualizacao")
 
     def start_auto_update(self):
         self.update_portable_terminal()
@@ -1191,7 +1200,7 @@ class LauncherWindow(QMainWindow):
             return
         found = self.conversation_list()
         if not found:
-            self.show_info(f"Ainda não há conversa do {registry.get(self.cli).LABEL} nesta pasta.")
+            self.show_info(f"Ainda não há conversa do {registry.get(self.cli).LABEL} nesta pasta.", origin="conversa")
             return
         dialog = ConversationsDialog(found, self, registry.get(self.cli).LABEL)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected():
@@ -1251,7 +1260,7 @@ class LauncherWindow(QMainWindow):
                                     bypass_permissions=bypass_permissions, connection=self.gateway.connection["id"],
                                     **({"conversation": conversation} if conversation else {}))
         except LauncherBusy as error:
-            self.show_info(str(error))
+            self.show_info(str(error), origin="sessao")
             return
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(str(error))
@@ -1274,7 +1283,7 @@ class LauncherWindow(QMainWindow):
         self.footer.setText(f"Janela aberta: {title}{mode}. A janela verifica a conexão antes de iniciar.")
         note = self.shared_resume_note() if resume else None
         if note:
-            self.show_info(note)
+            self.show_info(note, origin="pasta")
         if terminal.find(ROOT) is None:
             self.ensure_terminal(opened_in_console=True)
 
@@ -1295,6 +1304,7 @@ class LauncherWindow(QMainWindow):
             self.clear_error("cli:instalacao")
             self.footer.setText(f"Instalado: {found}")
         else:
+            self.footer.setText("A instalação não terminou; o motivo está no aviso acima.")
             self.show_error(log or "Não foi possível instalar o CLI.", origin="cli:instalacao")
         self.update_actions()
 
@@ -1338,7 +1348,7 @@ class LauncherWindow(QMainWindow):
         record_terminal_problem(self.problem_report("Windows Terminal não encontrado pela interface."))
         if opened_in_console:
             self.show_info("Esta sessão abriu em um console separado porque o Windows Terminal não foi encontrado. "
-                           "Instalando o Terminal agora, sem admin; as próximas sessões abrem nele.")
+                           "Instalando o Terminal agora, sem admin; as próximas sessões abrem nele.", origin="console")
         if self.terminal_installing:
             return
         self.terminal_installing = True
@@ -1349,10 +1359,10 @@ class LauncherWindow(QMainWindow):
     @Slot(object, str)
     def finish_terminal(self, found, log):
         self.terminal_installing = False
-        self.clear_info()  # o "instalando…" acabou; o resultado vem a seguir
+        self.clear_info("console")  # o "instalando…" acabou; o resultado vem a seguir
         if found:
             self.clear_error("terminal")
-            self.show_info(f"Windows Terminal pronto ({found}). As próximas sessões abrem nele.")
+            self.show_info(f"Windows Terminal pronto ({found}). As próximas sessões abrem nele.", origin="console")
             return
         details = "\n".join(line.strip() for line in log.splitlines() if "[falhou]" in line or "ambiente:" in line)
         self.show_error("Windows Terminal indisponível: nenhuma forma de instalação funcionou nesta máquina, então as "
@@ -1360,14 +1370,23 @@ class LauncherWindow(QMainWindow):
                         + (f"\n{details}" if details else ""), origin="terminal")
         record_terminal_problem(self.problem_report(log or "Instalação do Windows Terminal falhou sem detalhes."))
 
-    def show_info(self, message):
+    def show_info(self, message, origin=GENERAL_ERROR):
         """Aviso informativo (versão nova, atualizado, adiado): sem o botão Copiar erro."""
-        self.info_notice.setText(message)
-        self.info_notice.setToolTip(message)
-        self.info_notice.show()
+        self.infos[origin] = message
+        self.render_infos()
+
+    def render_infos(self):
+        text = "\n".join(self.infos.values())
+        self.info_notice.setText(text)
+        self.info_notice.setToolTip(text)
+        self.info_notice.setVisible(bool(text))
 
     def show_error(self, message, origin=GENERAL_ERROR):
-        """Erro na faixa de erros. Origens diferentes convivem; a mesma origem substitui o seu erro anterior."""
+        """Erro na faixa de erros. Origens diferentes convivem; a mesma origem substitui o seu erro anterior. O erro avulso
+        (origem geral) é de ações diferentes: acumula, sem repetir, e só some quando uma nova ação o limpa."""
+        previous = self.errors.get(origin)
+        if origin == GENERAL_ERROR and previous:
+            message = previous if message in previous.split("\n") else f"{previous}\n{message}"
         self.errors[origin] = message
         self.render_errors()
 
@@ -1394,11 +1413,14 @@ class LauncherWindow(QMainWindow):
         self.render_errors()
         self.clear_info()
 
-    def clear_info(self):
+    def clear_info(self, origin=None):
+        """Sem origem, apaga todos os informativos; com origem, só o dela."""
         self.cli_announced = ()  # o mesmo aviso de versão volta a aparecer na próxima verificação
-        self.info_notice.hide()
-        self.info_notice.setText("")
-        self.info_notice.setToolTip("")
+        if origin is None:
+            self.infos.clear()
+        else:
+            self.infos.pop(origin, None)
+        self.render_infos()
 
     def add_project(self):
         folder = QFileDialog.getExistingDirectory(self, "Escolha a pasta do projeto")
@@ -1421,7 +1443,7 @@ class LauncherWindow(QMainWindow):
             self.clear_transient()
             warning = self.shared_warning(project["path"])
             if warning:
-                self.show_info(warning)
+                self.show_info(warning, origin="pasta")
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(str(error))
 
@@ -1668,7 +1690,7 @@ class LauncherWindow(QMainWindow):
         except (LauncherError, OSError) as error:
             self.show_error(" ".join([*(m for m in messages if isinstance(m, Failure)), str(error)]), origin="perfil")
             if any(not isinstance(m, Failure) for m in messages):
-                self.show_info(" ".join(m for m in messages if not isinstance(m, Failure)))
+                self.show_info(" ".join(m for m in messages if not isinstance(m, Failure)), origin="perfil")
             return
         self.switch_profile(profiles.DEFAULT)
         if messages:  # o que foi feito (informativo) e o que falhou (erro, ex.: "VS Code: arquivo preso"), sem bloquear
@@ -1677,7 +1699,7 @@ class LauncherWindow(QMainWindow):
             if failed:
                 self.show_error(" ".join(failed), origin="perfil")
             if len(failed) < len(messages):
-                self.show_info(" ".join(message for message in messages if not isinstance(message, Failure)))
+                self.show_info(" ".join(message for message in messages if not isinstance(message, Failure)), origin="perfil")
 
     def ask_clean_profile_destinations(self, current: dict) -> bool | None:
         """Pergunta se tira as conexões do perfil do Copilot app, do VS Code e do endpoint local.

@@ -219,7 +219,7 @@ def install_dependencies(target, python):
 
 def powershell(script, env):
     result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                            env={**os.environ, **env}, capture_output=True, text=True, timeout=60,
+                            env=terminal.powershell_env(env), capture_output=True, text=True, timeout=60,
                             creationflags=NO_WINDOW)
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout).strip()[-600:] or f"PowerShell saiu com {result.returncode}")

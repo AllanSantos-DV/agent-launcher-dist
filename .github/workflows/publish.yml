@@ -16,6 +16,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Só publica uma tag (push ou workflow_dispatch escolhendo uma tag) cujo commit está na main do -dist.
+      - name: A ref é uma tag vX.Y.Z da main
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then echo "::error::ref $GITHUB_REF não é uma tag; nada publicado."; exit 1; fi
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::o commit da tag $GITHUB_REF_NAME não está na main; nada publicado."; exit 1; }
 
       # Node 24 traz npm 11.5+, exigido pelo trusted publishing; sem registry-url, para usar OIDC.
       - uses: actions/setup-node@v7

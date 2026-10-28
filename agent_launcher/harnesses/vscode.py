@@ -123,10 +123,12 @@ def remove_provider(name: str, folder: Path | None = None) -> bool:
     models_file = folder / "chatLanguageModels.json"
     try:
         current = json.loads(models_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return False
+    except (OSError, ValueError) as error:  # ilegível não é "nada a remover": o provider pode continuar lá
+        raise LauncherError(f"Não foi possível ler {models_file} para remover o provider \"{name}\": {error}") from error
     if not isinstance(current, list):
-        return False
+        raise LauncherError(f"{models_file} não é uma lista de providers; o provider \"{name}\" não foi removido.")
     removed = [item for item in current if isinstance(item, dict) and item.get("name") == name]
     if not removed:
         return False

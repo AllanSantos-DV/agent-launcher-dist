@@ -26,7 +26,8 @@ from agent_launcher.platform import terminal
 NAMES = {"claude": "Claude Code", "codex": "Codex", "copilot": "GitHub Copilot CLI"}
 OFFICIAL = {"claude": "https://claude.ai/install.ps1", "codex": "https://chatgpt.com/codex/install.ps1"}
 # Início do Subject do certificado Authenticode dos binários nativos de cada fabricante (lidos dos pacotes oficiais).
-SIGNERS = {"claude": 'CN="Anthropic, PBC"', "codex": 'CN="OpenAI OpCo, LLC"'}
+SIGNERS = {"claude": 'CN="Anthropic, PBC"', "codex": 'CN="OpenAI OpCo, LLC"',
+           "copilot": 'CN="GitHub, Inc."'}
 NPM_PACKAGES = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex", "copilot": "@github/copilot"}
 NODE_MINIMUM = {"claude": 22, "codex": 18, "copilot": 22}
 WINGET = {"copilot": "GitHub.Copilot"}
@@ -168,7 +169,8 @@ def install_official(cli: str) -> None:
     # não está fixada por GPO, e o erro volta legível nesse caso.
     script = f"$ProgressPreference = 'SilentlyContinue'; irm '{OFFICIAL[cli]}' | iex"
     result = _run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
-                  timeout=900, environment={"CODEX_NON_INTERACTIVE": "1"})
+                  timeout=900,
+                  environment={"CODEX_NON_INTERACTIVE": "1", "PSModulePath": terminal.powershell_env()["PSModulePath"]})
     installed = [path for path in native_paths(cli) if path.is_file()]
     if not installed:
         _fail(cli, "instalador oficial", f"instalador oficial ({OFFICIAL[cli]}) não deixou o executável: {_tail(result)}")

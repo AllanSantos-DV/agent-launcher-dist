@@ -57,10 +57,27 @@ def disabled_by_env() -> bool:
     return os.environ.get(DISABLE_ENV, "").strip() not in ("", "0")
 
 
+# Hosts que o GitHub usa para servir release e arquivo bruto: um redirecionamento só pode ir para eles ou para o host pedido.
+REDIRECT_HOSTS = ("github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com",
+                  "raw.githubusercontent.com")
+
+
 def _get(url: str, timeout: float, limit: int) -> bytes:
+    import urllib.parse
     import urllib.request  # só quando há rede
+
+    class SameHostRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            target = urllib.parse.urlsplit(newurl)
+            origin = urllib.parse.urlsplit(url).hostname
+            if target.hostname not in {origin, *REDIRECT_HOSTS} or (target.scheme != "https" and target.hostname != origin):
+                raise UpdateError(f"{url} redirecionou para {newurl}, fora do host da release e dos hosts de download do "
+                                  "GitHub; atualização recusada.")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
     request = urllib.request.Request(url, headers={"User-Agent": f"agent-launcher/{VERSION}", "Accept": "*/*"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # proxy do sistema: host público
+    opener = urllib.request.build_opener(SameHostRedirect)  # proxy do sistema: host público
+    with opener.open(request, timeout=timeout) as response:
         data = response.read(limit + 1)
     if len(data) > limit:
         raise UpdateError(f"Resposta de {url} passou de {limit // (1024 * 1024)} MB; atualização recusada.")
@@ -201,15 +218,48 @@ def apply(package: Path, root: Path = ROOT, timeout: float = 900) -> None:
                           + (result.stderr or result.stdout).strip()[-600:])
 
 
+def _stale(path: Path) -> bool:
+    return time.time() - path.stat().st_mtime > LOCK_STALE_S
+
+
+def _take_over(path: Path) -> bool:
+    """Remove a trava velha sem corrida: só quem segura a guarda (criação exclusiva) apaga, e confere a idade de novo sob a
+    guarda, senão dois processos veriam a mesma trava velha e o segundo apagaria a trava nova do primeiro."""
+    guard = path.with_name(path.name + ".takeover")
+    try:
+        os.close(os.open(guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except (FileExistsError, PermissionError):
+        try:
+            if _stale(guard):
+                guard.unlink()  # guarda deixada por processo que morreu no meio
+        except OSError:
+            pass
+        return False
+    try:
+        if _stale(path):
+            path.unlink()  # atualização anterior morreu no meio
+        return True
+    except FileNotFoundError:
+        return True
+    except PermissionError:
+        return False  # trava velha segura por antivírus ou leitor: não atualiza agora, tenta na próxima verificação
+    finally:
+        try:
+            guard.unlink(missing_ok=True)
+        except PermissionError:
+            pass
+
+
 def _lock(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        if time.time() - path.stat().st_mtime > LOCK_STALE_S:
-            path.unlink()  # atualização anterior morreu no meio
+        stale = _stale(path)
     except FileNotFoundError:
-        pass
+        stale = False
     except PermissionError:
-        return False  # trava velha segura por antivírus ou leitor: não atualiza agora, tenta na próxima verificação
+        return False
+    if stale and not _take_over(path):
+        return False
     try:
         os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
         return True

@@ -19,6 +19,7 @@ from pathlib import Path
 from agent_launcher.domain.catalog import Catalog, ModelInfo, prefers_responses, token_label
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.harnesses.base import Harness
+from agent_launcher.platform import terminal
 
 PROVIDER_PREFIX = "Agent Launcher"
 MODELS_LIMIT = 60
@@ -87,10 +88,18 @@ def is_current(provider, models: set, base: str, rows: list[tuple]) -> bool:
 
 
 def app_processes() -> list[int]:
+    """PIDs do Copilot app em execução. Falha da consulta levanta: lista vazia faria o launcher gravar no banco com o app aberto."""
     script = ("Get-CimInstance Win32_Process | ? { $_.ExecutablePath -like '*\\GitHub Copilot\\github.exe' } "
               "| % ProcessId")
-    result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True,
-                            text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True,
+                                text=True, env=terminal.powershell_env(), timeout=60,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise LauncherError(f"Não foi possível listar os processos do Copilot app: {error}") from error
+    if result.returncode:
+        raise LauncherError("Não foi possível listar os processos do Copilot app: "
+                            f"{(result.stderr or result.stdout).strip()[-300:] or 'código ' + str(result.returncode)}")
     return [int(value) for value in result.stdout.split() if value.isdigit()]
 
 

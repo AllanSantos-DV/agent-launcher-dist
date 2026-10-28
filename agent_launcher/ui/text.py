@@ -100,6 +100,19 @@ def warn_shared(store: Store, project: dict, resume: bool = False) -> None:
         print(f"Aviso: {warning}{extra}", file=sys.stderr)
 
 
+def report_cleanup(messages) -> int:
+    """O que foi feito vai para a saída; o que falhou, para o erro padrão. Devolve 1 se algum passo falhou (a remoção segue)."""
+    from agent_launcher.harnesses.cleanup import Failure
+    failed = False
+    for message in messages:
+        if isinstance(message, Failure):
+            print(f"Falha na limpeza: {message}", file=sys.stderr)
+            failed = True
+        else:
+            print(message)
+    return 1 if failed else 0
+
+
 def profiles_command(options) -> int:
     action = options.profile_action or "list"
     if action == "add":
@@ -120,16 +133,16 @@ def profiles_command(options) -> int:
               f"conexão(ões)" + (f", conectores {', '.join(result['connectors'])}" if result["connectors"] else "") + ".")
     elif action == "remove":
         profile = profiles.find(options.reference)
+        status = 0
         if options.clean_destinations:
             from agent_launcher.harnesses.cleanup import cleanup_profile
-            for message in cleanup_profile(profiles.home_of(profile["id"]), confirm=confirm_flagged):
-                print(message)
+            status |= report_cleanup(cleanup_profile(profiles.home_of(profile["id"]), confirm=confirm_flagged))
         from agent_launcher.harnesses.cleanup import release_profile_endpoints
-        for message in release_profile_endpoints(profiles.home_of(profile["id"])):
-            print(message)
+        status |= report_cleanup(release_profile_endpoints(profiles.home_of(profile["id"])))
         profiles.remove(profile["id"], options.delete_data)
         print(f"Perfil removido: {profile['name']}" + (" (dados apagados)" if options.delete_data else
                                                         f" (dados preservados em {profiles.root() / profiles.FOLDER / profile['id']})"))
+        return status
     elif action == "use":
         profile = profiles.find(options.reference)
         profiles.set_active(profile["id"])
@@ -771,6 +784,7 @@ def main(arguments: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     options = parser().parse_args(arguments)
+    cleanup_status = 0  # 1 quando a remoção de conexão funcionou mas um passo da limpeza falhou
     try:
         if options.action == "profiles":
             return profiles_command(options)
@@ -813,12 +827,10 @@ def main(arguments: list[str] | None = None) -> int:
             elif action == "remove":
                 if options.clean_destinations:
                     from agent_launcher.harnesses.cleanup import cleanup_destinations
-                    for message in cleanup_destinations(store, store.find_connection(options.reference),
-                                                        confirm=confirm_flagged):
-                        print(message)
+                    cleanup_status |= report_cleanup(cleanup_destinations(
+                        store, store.find_connection(options.reference), confirm=confirm_flagged))
                 from agent_launcher.harnesses.cleanup import release_endpoint
-                for message in release_endpoint(store.home, store.find_connection(options.reference)["id"]):
-                    print(message)
+                cleanup_status |= report_cleanup(release_endpoint(store.home, store.find_connection(options.reference)["id"]))
                 store.remove_connection(options.reference)
                 print("Conexão removida, com a chave salva.")
             elif action == "default":
@@ -973,7 +985,7 @@ def main(arguments: list[str] | None = None) -> int:
         elif options.action == "conversations":
             print(json.dumps(list_conversations(store, store.find(options.project), options.cli), ensure_ascii=False,
                              indent=2))
-        return 0
+        return cleanup_status
     except (LauncherError, OSError) as error:
         print(f"Erro: {error}", file=sys.stderr)
         return 1
