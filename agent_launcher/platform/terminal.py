@@ -185,12 +185,16 @@ def _download(url: str, destination: Path, expected_sha256: str) -> None:
         raise TerminalError("SHA-256 do ZIP baixado não confere com o publicado na release; arquivo descartado.")
 
 
-def signature_ok(executable: Path) -> bool:
-    """Assinatura Authenticode válida da Microsoft (Get-AuthenticodeSignature não exige admin)."""
+def signature_ok(executable: Path, signer: str = SIGNER) -> bool:
+    """Assinatura Authenticode válida do `signer` (início do Subject do certificado; padrão: a Microsoft).
+    Get-AuthenticodeSignature não exige admin. O PSModulePath herdado de quem instalou o PowerShell 7 põe módulos dele
+    na frente do Windows PowerShell 5.1, que então não carrega o Microsoft.PowerShell.Security e recusaria até um binário
+    válido: o filho roda só com os módulos do 5.1."""
     script = ("$s = Get-AuthenticodeSignature -LiteralPath $env:AL_FILE; "
               "if ($s.Status -eq 'Valid' -and $s.SignerCertificate.Subject -like ($env:AL_SIGNER + ',*')) { exit 0 }; exit 1")
+    modules = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "Modules"
     result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                            env={**os.environ, "AL_FILE": str(executable), "AL_SIGNER": SIGNER},
+                            env={**os.environ, "AL_FILE": str(executable), "AL_SIGNER": signer, "PSModulePath": str(modules)},
                             capture_output=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return result.returncode == 0
 

@@ -714,7 +714,7 @@ def parser() -> argparse.ArgumentParser:
     send.add_argument("--screen", action="store_true", help="Mostrar o que a sessão exibe agora (antes das teclas)")
     usage = commands.add_parser("usage", help="Uso do mês do perfil: tokens e custo estimado por destino e modelo (JSON)")
     usage.add_argument("--month", metavar="AAAA-MM", help="Mês (padrão: o atual)")
-    update = commands.add_parser("update", help="Atualizar agora pela última versão publicada no npm")
+    update = commands.add_parser("update", help="Atualizar agora pela última versão publicada no registry")
     update.add_argument("--check", action="store_true", help="só mostra se há versão nova, sem instalar")
     talks = commands.add_parser("conversations", help="Conversas dos CLIs de terminal na pasta do projeto (JSON, mais "
                                 "recente primeiro; pasta em outro perfil: só as deste perfil)")
@@ -949,7 +949,7 @@ def main(arguments: list[str] | None = None) -> int:
             try:
                 if options.check:
                     meta = updater.latest()
-                    print(f"Instalada: {VERSION} · publicada no npm: {meta['version']}"
+                    print(f"Instalada: {VERSION} · publicada no registry: {meta['version']}"
                           + (" (há versão nova)" if updater.newer(meta) else " (em dia)"))
                     return 0
                 updater.update(ROOT, log=print)

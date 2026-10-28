@@ -262,7 +262,7 @@ class TerminalUpdateTask(QRunnable):
 
 
 class UpdateTask(QRunnable):
-    """Confere o npm e, havendo versão nova, instala por cima (fora da thread da interface)."""
+    """Confere o engine-registry e, havendo versão nova, instala por cima (fora da thread da interface)."""
 
     def __init__(self, root: Path):
         super().__init__()

@@ -210,8 +210,8 @@ def install_dependencies(target, python):
         else:
             print("Criando ambiente virtual…")
         venv.create(target / ".venv", with_pip=True)
-    result = subprocess.run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "-q", "-r",
-                             str(target / "requirements.txt")], capture_output=True, text=True, encoding="utf-8",
+    result = subprocess.run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "-q",
+                             "--require-hashes", "-r", str(target / "requirements.txt")], capture_output=True, text=True, encoding="utf-8",
                             errors="replace", creationflags=NO_WINDOW)
     if result.returncode:  # sem console visível, a saída do pip só chega por aqui
         raise RuntimeError("pip install falhou: " + (result.stderr or result.stdout).strip()[-600:])

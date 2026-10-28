@@ -1,15 +1,15 @@
-"""Atualização automática pelo npm: a interface confere a versão publicada a cada abertura e se atualiza sozinha.
+"""Atualização automática pelo engine-registry: a interface confere a versão publicada a cada abertura e se atualiza sozinha.
 
-Fluxo: /latest do registro → pacote baixado só do próprio registro, conferido pelo sha512 publicado (dist.integrity) →
-install.py DO PACOTE NOVO roda sobre esta instalação (cópia por manifesto, backup e rollback; .venv e terminal/ são
-preservados). Os arquivos trocam no lugar: a janela aberta segue com o código já carregado e a versão nova vale ao
-reabrir. Só a cópia instalada se atualiza (tem o manifesto do instalador); um checkout de desenvolvimento nunca.
+Fluxo: manifest do registry → entrada apps[name=agent-launcher] → pacote (.tgz, .sha256, .sig) baixado só de
+.../releases/download/agent-launcher-v<versão>/ e conferido por verificar.mjs (sha256 + assinatura Ed25519) contra a chave
+fixada em version.REGISTRY_PUBLIC_KEY, nunca só a do manifest → install.py DO PACOTE NOVO roda sobre esta instalação
+(cópia por manifesto, backup e rollback; .venv e terminal/ são preservados). Os arquivos trocam no lugar: a janela aberta
+segue com o código já carregado e a versão nova vale ao reabrir. Só a cópia instalada se atualiza (tem o manifesto do
+instalador); um checkout de desenvolvimento nunca. Toda recusa é erro visível; não há queda para o npm.
 Desligar: preferência "Atualizar automaticamente" no menu ou AGENT_LAUNCHER_NO_AUTO_UPDATE=1.
 """
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import os
 import re
@@ -20,10 +20,15 @@ import time
 from pathlib import Path
 
 from agent_launcher import ROOT  # a pasta instalada (onde fica o updater.py da raiz), não a deste módulo
-from version import VERSION, data_home
+from version import APP_ID, REGISTRY_PUBLIC_KEY, VERSION, data_home
 
 PACKAGE = "@allansantos-dev/agent-launcher"
-REGISTRY = "https://registry.npmjs.org/"
+REGISTRY = "https://registry.npmjs.org/"  # só as CLIs (cli_update); o próprio launcher se atualiza pelo engine-registry
+REGISTRY_REPO = "AllanSantos-DV/engine-registry"
+MANIFEST_URL = "https://raw.githubusercontent.com/AllanSantos-DV/engine-registry/main/manifest.json"
+DOWNLOAD_BASE = f"https://github.com/{REGISTRY_REPO}/releases/download/"
+PLATFORM = "win32-x64"
+VERIFIER = Path(__file__).with_name("verificar.mjs")
 MANIFEST = ".install-manifest.json"  # o mesmo do install.py
 DOWNLOAD_LIMIT = 20 * 1024 * 1024
 LOCK_STALE_S = 30 * 60
@@ -36,7 +41,7 @@ class UpdateError(Exception):
 
 
 class CheckError(UpdateError):
-    """Não deu para consultar o registro (sem rede, proxy): nada foi tocado."""
+    """Não deu para consultar o registry (sem rede, proxy): nada foi tocado."""
 
 
 def parts(value: str) -> tuple[int, ...]:
@@ -62,56 +67,98 @@ def _get(url: str, timeout: float, limit: int) -> bytes:
     return data
 
 
-def latest(registry: str = REGISTRY, timeout: float = 10) -> dict:
-    """{version, tarball, integrity} da última versão publicada."""
-    url = registry + PACKAGE.replace("/", "%2F") + "/latest"
+def latest(manifest_url: str = MANIFEST_URL, key: str = REGISTRY_PUBLIC_KEY, timeout: float = 10) -> dict:
+    """{version, tag, asset} da entrada do Agent Launcher no manifest do registry, já conferida contra a chave fixada."""
     try:
-        meta = json.loads(_get(url, timeout, 2 * 1024 * 1024))
+        manifest = json.loads(_get(manifest_url, timeout, 2 * 1024 * 1024))
     except (OSError, ValueError) as error:
-        raise CheckError(f"Não foi possível consultar {url}: {error}") from error
-    dist = meta.get("dist") or {}
-    version, tarball, integrity = meta.get("version"), dist.get("tarball"), dist.get("integrity")
+        raise CheckError(f"Não foi possível consultar {manifest_url}: {error}") from error
+    apps = manifest.get("apps") if isinstance(manifest, dict) else None
+    entry = next((app for app in apps or [] if isinstance(app, dict) and app.get("name") == APP_ID), None)
+    if entry is None:
+        raise UpdateError(f"O manifest do registry não tem a entrada {APP_ID}; atualização recusada.")
+    version, release = entry.get("version"), entry.get("release")
+    if not isinstance(release, dict):
+        raise UpdateError("A entrada do manifest não tem release; atualização recusada.")
     if not (isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version)):
         raise UpdateError(f"Versão publicada inválida: {version!r}")
-    if not (isinstance(tarball, str) and tarball.startswith(registry)):
-        raise UpdateError(f"Pacote fora do registro ({tarball!r}); atualização recusada.")
-    if not (isinstance(integrity, str) and integrity.startswith("sha512-")):
-        raise UpdateError("O registro não publicou o sha512 do pacote; atualização recusada.")
-    return {"version": version, "tarball": tarball, "integrity": integrity}
+    if parts(version) < parts(VERSION):
+        raise UpdateError(f"O registry anuncia a {version}, menor que a instalada ({VERSION}); atualização recusada.")
+    if release.get("publicKey") != key:
+        raise UpdateError("A chave pública do manifest difere da fixada no Agent Launcher; atualização recusada.")
+    if release.get("repo") != REGISTRY_REPO:
+        raise UpdateError(f"Release fora de {REGISTRY_REPO} ({release.get('repo')!r}); atualização recusada.")
+    tag = str(release.get("tag", "")).replace("{version}", version)
+    if tag != f"{APP_ID}-v{version}":
+        raise UpdateError(f"Tag da release inesperada ({tag!r}); atualização recusada.")
+    asset = next((item for item in release.get("assets") or [] if isinstance(item, dict) and item.get("platform") == PLATFORM), None)
+    if asset is None:
+        raise UpdateError(f"O manifest não traz asset para {PLATFORM}; atualização recusada.")
+    name = str(asset.get("name", "")).replace("{version}", version)
+    if name != f"{APP_ID}-{version}-{PLATFORM}.tgz":
+        raise UpdateError(f"Asset fora da release ({name!r}); atualização recusada.")
+    return {"version": version, "tag": tag, "asset": name}
 
 
 def newer(meta: dict) -> bool:
     return parts(meta["version"]) > parts(VERSION)
 
 
-def download(meta: dict, folder: Path, timeout: float = 60) -> Path:
-    """Baixa, confere o sha512 e extrai; devolve a pasta do pacote (com install.py da versão anunciada)."""
+def verify(asset: Path, key: str, node: str | None = None) -> None:
+    """Confere sha256 e assinatura Ed25519 do asset (e dos seus .sha256/.sig ao lado) com verificar.mjs; sem node falha alto."""
+    executable = node if node is not None else shutil.which("node")
+    if not executable:
+        raise UpdateError("`node` não encontrado: sem ele não dá para conferir a assinatura do pacote; atualização recusada. "
+                          "Instale o Node.js 18 ou mais novo.")
+    try:
+        result = subprocess.run([executable, str(VERIFIER), str(asset), key], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=60,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise UpdateError(f"Não foi possível rodar o verificador com {executable}: {error}; atualização recusada.") from error
+    try:
+        verdict = json.loads(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        verdict = {}
+    if result.returncode or verdict.get("ok") is not True:
+        reason = verdict.get("reason") or (result.stderr or result.stdout).strip()[-300:] or "sem resposta do verificador"
+        raise UpdateError(f"Pacote recusado pela conferência de assinatura: {reason}")
+
+
+def download(meta: dict, folder: Path, timeout: float = 60, download_base: str = DOWNLOAD_BASE,
+             key: str = REGISTRY_PUBLIC_KEY, node: str | None = None) -> Path:
+    """Baixa asset, .sha256 e .sig só da release anunciada, confere e extrai; devolve a pasta do pacote."""
     import tarfile
     import urllib.error
+    prefix = f"{download_base}{meta['tag']}/"
+    archive = Path(folder) / meta["asset"]
+    for suffix in ("", ".sha256", ".sig"):
+        url = prefix + meta["asset"] + suffix
+        try:
+            data = _get(url, timeout, DOWNLOAD_LIMIT)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                raise UpdateError(f"{url} não existe (404): a release {meta['version']} não está completa no registry; "
+                                  "atualização recusada.") from error
+            raise UpdateError(f"Não foi possível baixar {url}: {error}") from error
+        except OSError as error:
+            raise UpdateError(f"Não foi possível baixar {url}: {error}") from error
+        Path(str(archive) + suffix).write_bytes(data)
+    verify(archive, key, node)
     try:
-        data = _get(meta["tarball"], timeout, DOWNLOAD_LIMIT)
-    except urllib.error.HTTPError as error:
-        if error.code == 404:  # logo após publicar, /latest já anuncia a versão e a CDN ainda não tem o pacote
-            raise CheckError(f"Pacote {meta['version']} ainda propagando no npm; tenta de novo na próxima abertura.") from error
-        raise UpdateError(f"Não foi possível baixar {meta['tarball']}: {error}") from error
-    except OSError as error:
-        raise UpdateError(f"Não foi possível baixar {meta['tarball']}: {error}") from error
-    expected = meta["integrity"].removeprefix("sha512-")
-    if base64.b64encode(hashlib.sha512(data).digest()).decode() != expected:
-        raise UpdateError("O pacote baixado não confere com o sha512 publicado no registro; atualização recusada.")
-    archive = Path(folder) / "package.tgz"
-    archive.write_bytes(data)
-    with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():  # o pacote npm só tem arquivos e pastas sob package/
-            name = Path(member.name)
-            if not (member.isfile() or member.isdir()) or name.is_absolute() or ".." in name.parts:
-                raise UpdateError(f"Entrada inesperada no pacote ({member.name}); atualização recusada.")
-        if hasattr(tarfile, "data_filter"):
-            tar.extractall(folder, filter="data")
-        else:  # Python 3.10 sem o filtro: as entradas já foram conferidas acima
-            tar.extractall(folder)
-    package = Path(folder) / "package"
-    version = re.search(r'^VERSION = "([^"]+)"', (package / "version.py").read_text(encoding="utf-8"), re.M)
+        with tarfile.open(archive, "r:gz") as tar:
+            for member in tar.getmembers():  # o pacote só tem arquivos e pastas sob package/
+                name = Path(member.name)
+                if not (member.isfile() or member.isdir()) or name.is_absolute() or ".." in name.parts:
+                    raise UpdateError(f"Entrada inesperada no pacote ({member.name}); atualização recusada.")
+            if hasattr(tarfile, "data_filter"):
+                tar.extractall(folder, filter="data")
+            else:  # Python 3.10 sem o filtro: as entradas já foram conferidas acima
+                tar.extractall(folder)
+        package = Path(folder) / "package"
+        version = re.search(r'^VERSION = "([^"]+)"', (package / "version.py").read_text(encoding="utf-8"), re.M)
+    except (OSError, tarfile.TarError) as error:
+        raise UpdateError(f"Pacote baixado ilegível ({error}); atualização recusada.") from error
     if not (package / "install.py").is_file() or not version or version.group(1) != meta["version"]:
         raise UpdateError(f"O pacote baixado não é o Agent Launcher {meta['version']}; atualização recusada.")
     return package
@@ -144,8 +191,11 @@ def apply(package: Path, root: Path = ROOT, timeout: float = 900) -> None:
     """Roda o instalador da versão nova sobre esta instalação (sem criar atalhos, Terminal nem CLIs: já existem; os atalhos existentes são regravados)."""
     command = [str(interpreter(root)), str(Path(package) / "install.py"),
                "--target", str(root), "--skip-tests", "--refresh-shortcuts", "--no-terminal", "--no-clis"]
-    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise UpdateError(f"Não foi possível rodar o instalador da versão nova ({error}).") from error
     if result.returncode:
         raise UpdateError("O instalador da versão nova falhou e restaurou a anterior: "
                           + (result.stderr or result.stdout).strip()[-600:])
@@ -167,12 +217,14 @@ def _lock(path: Path):
         return False
 
 
-def update(root: Path = ROOT, registry: str = REGISTRY, log=lambda message: None) -> str | None:
-    """Atualiza se houver versão nova; devolve a versão instalada, ou None quando não havia o que fazer."""
+def update(root: Path = ROOT, manifest_url: str = MANIFEST_URL, log=lambda message: None,
+           download_base: str = DOWNLOAD_BASE, key: str = REGISTRY_PUBLIC_KEY, node: str | None = None) -> str | None:
+    """Atualiza se houver versão nova; devolve a versão instalada, ou None quando não havia o que fazer. Manifest, base
+    de download, chave e `node` são parâmetros para o teste usar um servidor local; os padrões são os do registry."""
     if not installed(root):
         log("Atualização automática só vale para a cópia instalada (sem manifesto do instalador aqui).")
         return None
-    meta = latest(registry)
+    meta = latest(manifest_url, key)
     if not newer(meta):
         log(f"Agent Launcher {VERSION} já é a versão mais recente.")
         return None
@@ -185,7 +237,7 @@ def update(root: Path = ROOT, registry: str = REGISTRY, log=lambda message: None
         import tempfile
         # ignore_cleanup_errors: antivírus segurando um .py extraído não pode transformar uma instalação que deu certo em "falhou".
         with tempfile.TemporaryDirectory(prefix="agent-launcher-update-", ignore_cleanup_errors=True) as folder:
-            apply(download(meta, Path(folder)), root)
+            apply(download(meta, Path(folder), download_base=download_base, key=key, node=node), root)
         log(f"Agent Launcher atualizado para {meta['version']}. Reabra para usar a versão nova.")
         return meta["version"]
     finally:

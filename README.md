@@ -30,8 +30,10 @@ Trabalho. O atalho abre a interface direto, sem janela de console. Opções úte
 
 ### Atualização automática
 
-A partir da 1.0.5, a interface confere o npm a cada abertura e, havendo versão nova, se atualiza sozinha em segundo
-plano. O pacote só é aceito se vier do próprio registro e bater com o sha512 publicado nele. A troca é feita pelo
+A partir da 1.0.5, a interface confere a cada abertura o manifest do engine-registry (a partir da versão publicada com a entrada do
+launcher lá) e, havendo versão nova, se atualiza sozinha em segundo plano. O pacote só é aceito se vier da release
+`agent-launcher-vX.Y.Z` do registry e a assinatura Ed25519 dele conferir com a chave fixada no código do launcher (precisa
+do Node.js); qualquer recusa é erro visível e nada é aplicado, sem queda para o npm. A troca é feita pelo
 instalador da versão nova, com backup e rollback se algo falhar. Em seguida a interface se reinicia sozinha em 5 s,
 porque a janela aberta segue com o código antigo na memória. As sessões abertas continuam. Se houver uma caixa de
 diálogo aberta ou uma instalação em curso, ela espera e mostra **reinicie**. Janela que fica aberta por dias também
@@ -409,7 +411,7 @@ launcher launch --project "Meu app" --cli vscode --model "azure.gpt-5.4-mini"   
 launcher endpoint                # endpoint local de cada conexão (start, stop, autostart [--off])
 launcher cli --install copilot   # Copilot CLI por usuário (npm ou winget)
 launcher cli --update all        # atualiza as CLIs instaladas (adia com sessão aberta)
-launcher update                # atualiza agora pelo npm (--check só consulta)
+launcher update                # atualiza agora pelo engine-registry (--check só consulta)
 launcher topmost on --title "Jarvis"   # janela sempre por cima (off, resume, status)
 launcher front "C:\docs\relatorio.pdf" # abrir por cima, a pedido do usuário
 launcher keys --project "Meu app" --screen      # ver e responder um diálogo aberto (keys ... down enter)

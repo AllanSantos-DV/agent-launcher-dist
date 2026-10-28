@@ -1,7 +1,8 @@
 """CLIs de terminal: onde ficam as instalações por usuário e como instalá-los sem admin.
 
 Ordem (nenhuma exige admin):
-  1. Instalador oficial do fabricante, por usuário e conferindo o SHA-256 do binário:
+  1. Instalador oficial do fabricante, por usuário; o script confere o SHA-256 do binário e o launcher confere de novo a
+     assinatura Authenticode do executável que ficou (SIGNERS), apagando o que não for do fabricante:
      Claude Code: https://claude.ai/install.ps1 -> ~/.local/bin/claude.exe (code.claude.com/docs/en/setup)
      Codex: https://chatgpt.com/codex/install.ps1 -> %LOCALAPPDATA%\\Programs\\OpenAI\\Codex\\bin\\codex.exe
   2. npm install -g (quem instalou o launcher pelo npm tem Node; o pacote do Claude exige Node 22+).
@@ -20,9 +21,12 @@ import time
 from pathlib import Path
 
 from agent_launcher.domain.files import replace_retrying
+from agent_launcher.platform import terminal
 
 NAMES = {"claude": "Claude Code", "codex": "Codex", "copilot": "GitHub Copilot CLI"}
 OFFICIAL = {"claude": "https://claude.ai/install.ps1", "codex": "https://chatgpt.com/codex/install.ps1"}
+# Início do Subject do certificado Authenticode dos binários nativos de cada fabricante (lidos dos pacotes oficiais).
+SIGNERS = {"claude": 'CN="Anthropic, PBC"', "codex": 'CN="OpenAI OpCo, LLC"'}
 NPM_PACKAGES = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex", "copilot": "@github/copilot"}
 NODE_MINIMUM = {"claude": 22, "codex": 18, "copilot": 22}
 WINGET = {"copilot": "GitHub.Copilot"}
@@ -151,14 +155,33 @@ def codex_platform_binary(path: Path) -> Path | None:
                  if is_native(root / CODEX_PLATFORM)), None)
 
 
+def _signed(path: Path, signer: str) -> bool:
+    """signature_ok sem exceção: PowerShell travado ou ausente conta como não assinado (o binário é apagado, nunca aceito)."""
+    try:
+        return terminal.signature_ok(path, signer)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def install_official(cli: str) -> None:
     # O script do fabricante roda como texto (irm | iex); -ExecutionPolicy Bypass só vale onde a política da empresa
     # não está fixada por GPO, e o erro volta legível nesse caso.
     script = f"$ProgressPreference = 'SilentlyContinue'; irm '{OFFICIAL[cli]}' | iex"
     result = _run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
                   timeout=900, environment={"CODEX_NON_INTERACTIVE": "1"})
-    if not any(path.is_file() for path in native_paths(cli)):
+    installed = [path for path in native_paths(cli) if path.is_file()]
+    if not installed:
         _fail(cli, "instalador oficial", f"instalador oficial ({OFFICIAL[cli]}) não deixou o executável: {_tail(result)}")
+    unsigned = [path for path in installed if not _signed(path, SIGNERS[cli])]
+    for path in unsigned:  # fica no lugar onde `find` o acharia depois: apaga antes de recusar
+        try:
+            path.unlink()
+        except OSError as error:
+            _fail(cli, "instalador oficial", f"{path} sem assinatura válida de {SIGNERS[cli]} e não pôde ser apagado ({error}); "
+                                              "apague-o à mão.")
+    if unsigned:
+        _fail(cli, "instalador oficial", f"{', '.join(map(str, unsigned))} sem assinatura Authenticode válida de "
+                                         f"{SIGNERS[cli]}; o executável foi apagado e a instalação recusada.")
 
 
 def _node_major() -> int | None:

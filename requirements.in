@@ -1,0 +1,2 @@
+# Versão em que a suíte roda; para subir, troque aqui, rode release/pin_requirements.py e a suíte.
+PySide6==6.11.1

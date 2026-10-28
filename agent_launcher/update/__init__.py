@@ -1,1 +1,1 @@
-"""Atualização automática pelo npm."""
+"""Atualização automática pelo engine-registry."""

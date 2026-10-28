@@ -1,1 +1,18 @@
-PySide6>=6.6,<7
+# Gerado por release/pin_requirements.py a partir de requirements.in; não edite à mão.
+# pip install --require-hashes -r requirements.txt
+
+PySide6==6.11.1 \
+    --hash=sha256:0968877ab1fb4ef3587a284da6fe05e8647ada56a6a3750b6395188e01f4aba6 \
+    --hash=sha256:acee467cb5f256cc47ebb9d815a054c1d8416da380c191b247a76d164aa3f805
+
+PySide6_Addons==6.11.1 \
+    --hash=sha256:0d13c4dfd671b050a48e4f8d8ddc724b7248f9c0437e7fc47fdf316278572923 \
+    --hash=sha256:3494f480dee92f415be2f2d989c0b3f4755ac332b28045cbf4ba0f5c5a22ba37
+
+PySide6_Essentials==6.11.1 \
+    --hash=sha256:11253ea52aabecefe9febddbbe78b43a824129e3af1cec98431028fba7fa954f \
+    --hash=sha256:63311bd48e32c584599ab04b9ef7c324082374cd2c9fa533f978fb893bb47e40
+
+shiboken6==6.11.1 \
+    --hash=sha256:7c8d9af17db4495d4fa5b1c393f218311c4855546b9dfa6a0bd21bcd66b55e9d \
+    --hash=sha256:c2c6863aa80ec18c0f82cea3417837b279cdc60024ac17123461dc9042577df7
