@@ -348,7 +348,9 @@ class ConnectionsDialog(QDialog):
         self.error_notice.setWordWrap(True)
         self.error_notice.hide()
         layout.addWidget(self.error_notice)
+        self.statuses: dict[str, str] = {}  # origem ("lista", "teste", "limpeza") -> linha; convivem, a mesma substitui a sua
         self.status = _label("", "muted")
+        self.status.setWordWrap(True)
         layout.addWidget(self.status)
         close = QPushButton("Fechar")
         close.clicked.connect(self.accept)
@@ -374,7 +376,7 @@ class ConnectionsDialog(QDialog):
                 self.list.setCurrentItem(item)
         if self.list.currentItem() is None and self.list.count():
             self.list.setCurrentRow(0)
-        self.status.setText("" if self.list.count() else "Nenhuma conexão ainda. Clique em Adicionar.")
+        self.set_status("lista", "" if self.list.count() else "Nenhuma conexão ainda. Clique em Adicionar.")
         self.update_buttons()
 
     def current(self) -> dict | None:
@@ -404,7 +406,7 @@ class ConnectionsDialog(QDialog):
         if not connection:
             return
         home = self.home
-        self.status.setText(f"Testando {connection['name']}…")
+        self.set_status("teste", f"Testando {connection['name']}…")
         self.task = _Task(lambda: Gateway(Store(home), Store(home).find_connection(connection["id"])).verify())
         self.task.signals.done.connect(lambda _result, error: self.show_test_result(connection["name"], error))
         QThreadPool.globalInstance().start(self.task)
@@ -412,11 +414,19 @@ class ConnectionsDialog(QDialog):
     def show_test_result(self, name: str, error: str):
         if error:
             self.errors["teste"] = f"{name}: {error}"
-            self.status.setText("")
+            self.set_status("teste", "")
         else:
             self.errors.pop("teste", None)
-            self.status.setText(f"{name}: conexão respondeu.")
+            self.set_status("teste", f"{name}: conexão respondeu.")
         self.render_errors()
+
+    def set_status(self, origin: str, text: str):
+        """Linha de status: cada origem tem a sua (o fim de uma não apaga a das outras)."""
+        if text:
+            self.statuses[origin] = text
+        else:
+            self.statuses.pop(origin, None)
+        self.status.setText("\n".join(self.statuses.values()))
 
     def render_errors(self):
         text = "\n".join(self.errors.values())
@@ -452,7 +462,7 @@ class ConnectionsDialog(QDialog):
         from agent_launcher.harnesses.cleanup import cleanup_destinations
         home = self.home
         self._set_cleaning(True)
-        self.status.setText(f"Removendo {connection['name']} do Copilot app e do VS Code… (pode levar alguns segundos)")
+        self.set_status("limpeza", f"Removendo {connection['name']} do Copilot app e do VS Code… (pode levar alguns segundos)")
         task = _Task(lambda: cleanup_destinations(Store(home), connection, lambda *_: True))
         self.cleanup_task = task
 
@@ -477,8 +487,7 @@ class ConnectionsDialog(QDialog):
         else:
             self.errors.pop("limpeza", None)
         self.render_errors()
-        if done:
-            self.status.setText(" ".join(done))
+        self.set_status("limpeza", " ".join(done))
 
     def remove(self):
         connection = self.current()

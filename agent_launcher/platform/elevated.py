@@ -288,10 +288,13 @@ def session_note(project: dict) -> str | None:
 
 
 def task_command(run=subprocess.run) -> str | None:
-    """O executável que a tarefa instalada dispara (None se não existe ou o XML não pôde ser lido)."""
+    """O executável que a tarefa instalada dispara (None se o XML não traz o comando). Só se chama com a tarefa já
+    confirmada; se o schtasks falha ao ler o XML levanta LauncherError em vez de dizer "sem tarefa"."""
     result = run(["schtasks.exe", "/query", "/tn", TASK, "/xml"], capture_output=True, creationflags=NO_WINDOW)
     if result.returncode:
-        return None
+        detail = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else (result.stderr or "")
+        raise LauncherError(f"schtasks /query /xml da tarefa {TASK} saiu com código {result.returncode}: "
+                            f"{detail.strip()[-200:] or 'sem mensagem'}")
     raw = result.stdout
     text = raw.decode("utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8", "replace") if isinstance(raw, bytes) else raw
     found = re.search(r"<Command>([^<]*)</Command>", text)
@@ -303,7 +306,10 @@ def stale_task(run=subprocess.run, system_root: str | None = None) -> str | None
     ou removido) ou grava o caminho de um Python quando o `pyw.exe` do Windows já resolveria o Python a cada disparo.
     Regravar exige o clique de UAC de `launcher elevated enable`; a tarefa antiga segue funcionando enquanto o Python
     dela existir."""
-    command = task_command(run)
+    try:
+        command = task_command(run)
+    except LauncherError as error:
+        return f"não foi possível ler a tarefa {TASK} para saber se está atual: {error}"
     if not command:
         return None
     path = Path(os.path.expandvars(command.strip('"')))

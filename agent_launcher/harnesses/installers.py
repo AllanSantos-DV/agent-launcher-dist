@@ -20,11 +20,14 @@ import tempfile
 import time
 from pathlib import Path
 
+from agent_launcher.domain.downloads import restricted_redirects
 from agent_launcher.domain.files import replace_retrying
 from agent_launcher.platform import terminal
 
 NAMES = {"claude": "Claude Code", "codex": "Codex", "copilot": "GitHub Copilot CLI"}
 OFFICIAL = {"claude": "https://claude.ai/install.ps1", "codex": "https://chatgpt.com/codex/install.ps1"}
+# Hosts por onde o script oficial pode redirecionar (medido: claude.ai e chatgpt.com respondem 302 para o segundo host).
+OFFICIAL_HOSTS = {"claude": ("downloads.claude.ai",), "codex": ("releases.openai.com",)}
 # Início do Subject do certificado Authenticode dos binários nativos de cada fabricante (lidos dos pacotes oficiais).
 SIGNERS = {"claude": 'CN="Anthropic, PBC"', "codex": 'CN="OpenAI OpCo, LLC"',
            "copilot": 'CN="GitHub, Inc."'}
@@ -156,34 +159,82 @@ def codex_platform_binary(path: Path) -> Path | None:
                  if is_native(root / CODEX_PLATFORM)), None)
 
 
+class SignatureUnchecked(Exception):
+    """O PowerShell não conseguiu conferir a assinatura (travou, não iniciou ou falhou): diferente de "sem assinatura"."""
+
+
 def _signed(path: Path, signer: str) -> bool:
-    """signature_ok sem exceção: PowerShell travado ou ausente conta como não assinado (o binário é apagado, nunca aceito)."""
     try:
         return terminal.signature_ok(path, signer)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    except (OSError, subprocess.SubprocessError, terminal.TerminalError) as error:
+        raise SignatureUnchecked(str(error)) from error
+
+
+def reject_unsigned(cli: str, paths, step: str, noun: str, after: str = "") -> None:
+    """Todo executável de `paths` precisa da assinatura do fabricante. O que não tem, e o que não deu para conferir, é
+    apagado (fica onde `find` o acharia) e o passo `step` é recusado com a causa certa; nunca roda um binário não conferido."""
+    unsigned, unchecked = [], {}
+    for path in dict.fromkeys(paths):
+        try:
+            if not _signed(path, SIGNERS[cli]):
+                unsigned.append(path)
+        except SignatureUnchecked as error:
+            unchecked[path] = error
+    for path in [*unsigned, *unchecked]:
+        try:
+            path.unlink()
+        except OSError as error:
+            _fail(cli, step, f"{path} sem assinatura válida de {SIGNERS[cli]} e não pôde ser apagado ({error}); "
+                             "apague-o à mão.")
+    if unsigned:
+        _fail(cli, step, f"{', '.join(map(str, unsigned))} sem assinatura Authenticode válida de {SIGNERS[cli]}{after}; "
+                         f"o executável foi apagado e a {noun} recusada.")
+    if unchecked:
+        _fail(cli, step, f"não foi possível conferir a assinatura de {', '.join(map(str, unchecked))}{after}: "
+                         f"{next(iter(unchecked.values()))}; o executável foi apagado e a {noun} recusada.")
+
+
+def official_auxiliary_executables(cli: str) -> list[Path]:
+    """Executáveis que o instalador oficial do Codex deixa ao lado do codex.exe na release corrente (command-runner,
+    sandbox, hosts), todos assinados pela OpenAI; o rg.exe é do ripgrep e vem sem assinatura da OpenAI."""
+    if cli != "codex":
+        return []
+    home = Path(os.environ.get("CODEX_HOME") or Path(os.environ.get("USERPROFILE") or Path.home()) / ".codex")
+    try:
+        release = (home / "packages" / "standalone" / "current").resolve(strict=True)
+    except OSError:
+        return []
+    return sorted(path for path in release.rglob("*.exe") if path.name.lower() != "rg.exe")
+
+
+def _resolve_official(cli: str) -> str:
+    """URL final do script oficial, conferida: só o host dele e OFFICIAL_HOSTS; o PowerShell baixa exatamente essa URL."""
+    import urllib.parse
+    import urllib.request
+    url = OFFICIAL[cli]
+    host = urllib.parse.urlsplit(url).hostname
+    opener = urllib.request.build_opener(restricted_redirects(url, CliInstallError, (host, *OFFICIAL_HOSTS[cli])))
+    try:
+        with opener.open(urllib.request.Request(url, headers={"User-Agent": "agent-launcher"}), timeout=30) as response:
+            final = response.geturl()
+    except OSError as error:
+        raise CliInstallError(f"não foi possível consultar o instalador oficial ({url}): {error}") from error
+    if urllib.parse.urlsplit(final).hostname not in (host, *OFFICIAL_HOSTS[cli]) or not final.startswith("https://"):
+        raise CliInstallError(f"o instalador oficial ({url}) resolveu para {final}, fora dos hosts esperados; recusado.")
+    return final
 
 
 def install_official(cli: str) -> None:
     # O script do fabricante roda como texto (irm | iex); -ExecutionPolicy Bypass só vale onde a política da empresa
     # não está fixada por GPO, e o erro volta legível nesse caso.
-    script = f"$ProgressPreference = 'SilentlyContinue'; irm '{OFFICIAL[cli]}' | iex"
+    script = f"$ProgressPreference = 'SilentlyContinue'; irm '{_resolve_official(cli)}' -MaximumRedirection 0 | iex"
     result = _run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
                   timeout=900,
                   environment={"CODEX_NON_INTERACTIVE": "1", "PSModulePath": terminal.powershell_env()["PSModulePath"]})
     installed = [path for path in native_paths(cli) if path.is_file()]
     if not installed:
         _fail(cli, "instalador oficial", f"instalador oficial ({OFFICIAL[cli]}) não deixou o executável: {_tail(result)}")
-    unsigned = [path for path in installed if not _signed(path, SIGNERS[cli])]
-    for path in unsigned:  # fica no lugar onde `find` o acharia depois: apaga antes de recusar
-        try:
-            path.unlink()
-        except OSError as error:
-            _fail(cli, "instalador oficial", f"{path} sem assinatura válida de {SIGNERS[cli]} e não pôde ser apagado ({error}); "
-                                              "apague-o à mão.")
-    if unsigned:
-        _fail(cli, "instalador oficial", f"{', '.join(map(str, unsigned))} sem assinatura Authenticode válida de "
-                                         f"{SIGNERS[cli]}; o executável foi apagado e a instalação recusada.")
+    reject_unsigned(cli, [*installed, *official_auxiliary_executables(cli)], "instalador oficial", "instalação")
 
 
 def _node_major() -> int | None:

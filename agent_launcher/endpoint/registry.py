@@ -18,7 +18,7 @@ from pathlib import Path
 from agent_launcher import ROOT
 from agent_launcher.domain import profiles
 from agent_launcher.domain.errors import LauncherError
-from agent_launcher.domain.files import atomic_json, read_json_state
+from agent_launcher.domain.files import atomic_json, file_lock, read_json_state
 
 # As portas do produto começam em 47910 (as anteriores ficam livres para testes locais).
 PORT_RANGE = range(47910, 48000)
@@ -78,7 +78,12 @@ def _free(port: int) -> bool:
 
 def port_for(home: Path, connection_id: str, reserve: bool = True) -> int:
     """Porta da conexão: a já gravada (estável: o VS Code e o Copilot app guardam a URL); senão a preferida pelo hash
-    do id, ou a próxima livre da faixa."""
+    do id, ou a próxima livre da faixa. Ler-alterar-gravar sob trava: dois processos nunca reservam a mesma porta."""
+    with file_lock(state_file()):
+        return _port_for(home, connection_id, reserve)
+
+
+def _port_for(home: Path, connection_id: str, reserve: bool) -> int:
     data = _read()
     key = _key(home, connection_id)
     port, legacy = _stored(data, home, connection_id)
@@ -103,13 +108,14 @@ def port_for(home: Path, connection_id: str, reserve: bool = True) -> int:
 
 def forget(home: Path, connection_id: str) -> int | None:
     """Libera a porta da conexão no endpoints.json (e a entrada antiga, só com o id, no padrão). Devolve a porta."""
-    data = _read()
-    port = data["ports"].pop(_key(home, connection_id), None)
-    if _profile_id(home) == profiles.DEFAULT:
-        legacy = data["ports"].pop(connection_id, None)
-        port = port if port is not None else legacy
-    if port is not None:
-        atomic_json(state_file(), data)
+    with file_lock(state_file()):
+        data = _read()
+        port = data["ports"].pop(_key(home, connection_id), None)
+        if _profile_id(home) == profiles.DEFAULT:
+            legacy = data["ports"].pop(connection_id, None)
+            port = port if port is not None else legacy
+        if port is not None:
+            atomic_json(state_file(), data)
     return port if isinstance(port, int) else None
 
 

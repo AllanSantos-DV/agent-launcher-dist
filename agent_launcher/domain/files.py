@@ -1,7 +1,9 @@
 """Gravação atômica e validação de nomes, caminhos e IDs de modelo."""
 from __future__ import annotations
 
+import contextlib
 import json
+import msvcrt
 import os
 import random
 import shutil
@@ -119,6 +121,35 @@ def remove_tree(path, attempts: int = 5) -> None:
             if attempt == attempts:
                 raise
             time.sleep(0.5 * attempt)
+
+
+class LockBusy(LauncherError):
+    """O bloqueio de `file_lock` continua com outro processo depois do prazo."""
+
+
+@contextlib.contextmanager
+def file_lock(path, timeout: float = 10.0):
+    """Exclusão mútua entre processos para ler-alterar-gravar `path`: bloqueio do sistema num arquivo ao lado
+    (<nome>.lock), solto sozinho se o processo morre, então nunca fica velho. Passado `timeout`, levanta."""
+    lock = Path(path).with_name(Path(path).name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock, os.O_CREAT | os.O_RDWR)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise LockBusy(f"{Path(path).name} está em uso por outro processo do launcher; tente de novo.") from None
+                time.sleep(0.02)
+        try:
+            yield
+        finally:
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(descriptor)
 
 
 def atomic_json(path: Path, data: dict) -> None:

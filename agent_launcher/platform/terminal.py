@@ -23,7 +23,8 @@ import time
 import uuid
 from pathlib import Path
 
-from agent_launcher.domain.files import replace_retrying
+from agent_launcher.domain.downloads import restricted_redirects
+from agent_launcher.domain.files import LockBusy, file_lock, replace_retrying
 
 RELEASE_API = "https://api.github.com/repos/microsoft/terminal/releases/latest"
 MIN_BUILD = 19041
@@ -103,12 +104,16 @@ def _registry_reader():
 
 
 def _joined() -> str:
-    """'domínio', 'Entra ID' ou '' (dsregcmd existe no Windows 10/11 e não exige admin)."""
+    """'domínio', 'Entra ID' ou '' (dsregcmd existe no Windows 10/11 e não exige admin). Sem resposta do dsregcmd
+    (ausente, estourou o tempo ou saiu com erro) levanta TerminalError: '' quer dizer "não ingressada", não "não sei"."""
     try:
-        output = subprocess.run(["dsregcmd", "/status"], capture_output=True, text=True, timeout=15,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        output = ""
+        result = subprocess.run(["dsregcmd", "/status"], capture_output=True, text=True, timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise TerminalError(f"dsregcmd não respondeu ({error})") from error
+    if result.returncode:
+        raise TerminalError(f"dsregcmd /status saiu com código {result.returncode}")
+    output = result.stdout
     flags = {line.split(":", 1)[0].strip(): line.split(":", 1)[1].strip()
              for line in output.splitlines() if ":" in line}
     joined = [label for flag, label in (("DomainJoined", "domínio"), ("AzureAdJoined", "Entra ID"))
@@ -125,14 +130,20 @@ def environment(read=None, joined=None) -> dict:
             blocks[kind].append(message)
     if any(read(hive, APPLOCKER_EXE, None) for hive in ("HKLM", "HKCU")):
         blocks["exec"].append("AppLocker com regras de executáveis: pode barrar programas em pastas do usuário")
-    managed = joined if joined is not None else _joined()
+    unknown = ""
+    try:
+        managed = joined if joined is not None else _joined()
+    except TerminalError as error:
+        managed, unknown = "", str(error)
     windows = sys.getwindowsversion() if hasattr(sys, "getwindowsversion") else None
-    return {"managed": managed, "blocks": blocks, "build": windows.build if windows else 0,
+    return {"managed": managed, "managed_unknown": unknown, "blocks": blocks, "build": windows.build if windows else 0,
             "portable_supported": bool(windows and windows.build >= MIN_BUILD)}
 
 
 def describe(env: dict) -> list[str]:
-    lines = [f"Máquina gerenciada ({env['managed']})" if env["managed"] else "Máquina não ingressada em domínio/Entra ID"]
+    lines = [f"Máquina gerenciada ({env['managed']})" if env["managed"] else
+             f"Não foi possível saber se a máquina é gerenciada: {env['managed_unknown']}" if env.get("managed_unknown") else
+             "Máquina não ingressada em domínio/Entra ID"]
     lines += [message for messages in env["blocks"].values() for message in messages]
     if not env["portable_supported"]:
         lines.append(f"Windows build {env['build']}: o Terminal portátil exige {MIN_BUILD} (Windows 10 2004) ou superior")
@@ -147,7 +158,8 @@ def _arch() -> str:
 def _open(url: str, timeout: int = 60):
     import urllib.request  # só quando baixa o Terminal portátil
     request = urllib.request.Request(url, headers={"User-Agent": "agent-launcher", "Accept": "application/json"})
-    return urllib.request.urlopen(request, timeout=timeout)  # proxy do sistema: hosts públicos (GitHub)
+    opener = urllib.request.build_opener(restricted_redirects(url, TerminalError))  # proxy do sistema: hosts públicos (GitHub)
+    return opener.open(request, timeout=timeout)
 
 
 def latest_zip() -> tuple[str, str, str]:
@@ -195,13 +207,21 @@ def powershell_env(extra: dict | None = None) -> dict:
 
 def signature_ok(executable: Path, signer: str = SIGNER) -> bool:
     """Assinatura Authenticode válida do `signer` (início do Subject do certificado; padrão: a Microsoft).
-    Get-AuthenticodeSignature não exige admin; o ambiente é o de powershell_env."""
-    script = ("$s = Get-AuthenticodeSignature -LiteralPath $env:AL_FILE; "
-              "if ($s.Status -eq 'Valid' -and $s.SignerCertificate.Subject -like ($env:AL_SIGNER + ',*')) { exit 0 }; exit 1")
+    Get-AuthenticodeSignature não exige admin; o ambiente é o de powershell_env. Código 0: válida; 1: sem assinatura
+    válida do `signer`; qualquer outro (o PowerShell falhou antes de poder dizer) levanta TerminalError, para quem chama
+    não confundir "não consegui conferir" com "não é assinado"."""
+    script = ("$ErrorActionPreference = 'Stop'; try { "
+              "$s = Get-AuthenticodeSignature -LiteralPath $env:AL_FILE; "
+              "if ($s.Status -eq 'Valid' -and $s.SignerCertificate.Subject -like ($env:AL_SIGNER + ',*')) { exit 0 }; exit 1 "
+              "} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 2 }")
     result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
                             env=powershell_env({"AL_FILE": str(executable), "AL_SIGNER": signer}),
-                            capture_output=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    return result.returncode == 0
+                            capture_output=True, text=True, errors="replace", timeout=60,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if result.returncode in (0, 1):
+        return result.returncode == 0
+    raise TerminalError(f"o PowerShell não conferiu a assinatura de {executable} (código {result.returncode}): "
+                        f"{(result.stderr or result.stdout).strip()[-300:] or 'sem mensagem'}")
 
 
 def zip_version(name: str) -> tuple[int, ...] | None:
@@ -253,8 +273,10 @@ def install_portable(root: Path, zip_path: Path | None = None, verify=signature_
         for required in ("wt.exe", "WindowsTerminal.exe"):
             if not (extracted / required).is_file():
                 raise TerminalError(f"O ZIP não contém {required}; não parece a distribuição do Windows Terminal.")
-            if not verify(extracted / required):
-                raise TerminalError(f"{required} sem assinatura válida da Microsoft; instalação recusada.")
+        for executable in sorted(extracted.rglob("*.exe")):  # todo executável do ZIP roda depois; não só os dois principais
+            if not verify(executable):
+                raise TerminalError(f"{executable.relative_to(extracted)} sem assinatura válida da Microsoft; "
+                                    "instalação recusada.")
         (extracted / ".portable").touch()
         version = zip_version(zip_path.name)
         if version:
@@ -290,6 +312,14 @@ def update_portable(root: Path, check=latest_zip, install=install_portable, stam
     if stamp is None:
         from version import data_home
         stamp = data_home() / "terminal-update-check"
+    try:
+        with file_lock(stamp, timeout=0):  # outra janela já está consultando ou trocando: ela faz
+            return _update_portable_locked(root, check, install, stamp, now)
+    except LockBusy:
+        return None
+
+
+def _update_portable_locked(root: Path, check, install, stamp: Path, now) -> str | None:
     try:
         if now() - stamp.stat().st_mtime < UPDATE_CHECK_INTERVAL_S:
             return None

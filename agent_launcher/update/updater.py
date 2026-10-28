@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 from agent_launcher import ROOT  # a pasta instalada (onde fica o updater.py da raiz), não a deste módulo
+from agent_launcher.domain.downloads import GITHUB_HOSTS, restricted_redirects
 from version import APP_ID, REGISTRY_PUBLIC_KEY, VERSION, data_home
 
 PACKAGE = "@allansantos-dev/agent-launcher"
@@ -57,26 +58,14 @@ def disabled_by_env() -> bool:
     return os.environ.get(DISABLE_ENV, "").strip() not in ("", "0")
 
 
-# Hosts que o GitHub usa para servir release e arquivo bruto: um redirecionamento só pode ir para eles ou para o host pedido.
-REDIRECT_HOSTS = ("github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com",
-                  "raw.githubusercontent.com")
+REDIRECT_HOSTS = GITHUB_HOSTS
 
 
 def _get(url: str, timeout: float, limit: int) -> bytes:
-    import urllib.parse
     import urllib.request  # só quando há rede
 
-    class SameHostRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            target = urllib.parse.urlsplit(newurl)
-            origin = urllib.parse.urlsplit(url).hostname
-            if target.hostname not in {origin, *REDIRECT_HOSTS} or (target.scheme != "https" and target.hostname != origin):
-                raise UpdateError(f"{url} redirecionou para {newurl}, fora do host da release e dos hosts de download do "
-                                  "GitHub; atualização recusada.")
-            return super().redirect_request(req, fp, code, msg, headers, newurl)
-
     request = urllib.request.Request(url, headers={"User-Agent": f"agent-launcher/{VERSION}", "Accept": "*/*"})
-    opener = urllib.request.build_opener(SameHostRedirect)  # proxy do sistema: host público
+    opener = urllib.request.build_opener(restricted_redirects(url, UpdateError, REDIRECT_HOSTS))  # proxy do sistema: host público
     with opener.open(request, timeout=timeout) as response:
         data = response.read(limit + 1)
     if len(data) > limit:
@@ -223,29 +212,35 @@ def _stale(path: Path) -> bool:
 
 
 def _take_over(path: Path) -> bool:
-    """Remove a trava velha sem corrida: só quem segura a guarda (criação exclusiva) apaga, e confere a idade de novo sob a
-    guarda, senão dois processos veriam a mesma trava velha e o segundo apagaria a trava nova do primeiro."""
+    """Remove a trava velha sem corrida: só quem segura a guarda apaga, e confere a idade de novo sob a guarda, senão dois
+    processos veriam a mesma trava velha e o segundo apagaria a trava nova do primeiro. A guarda é um bloqueio do Windows
+    no arquivo (o sistema o solta se o processo morrer), então nunca fica velha e ninguém precisa apagar guarda alheia:
+    apagar a de outro era a janela em que dois processos achavam que a seguravam."""
+    import msvcrt
     guard = path.with_name(path.name + ".takeover")
     try:
-        os.close(os.open(guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-    except (FileExistsError, PermissionError):
-        try:
-            if _stale(guard):
-                guard.unlink()  # guarda deixada por processo que morreu no meio
-        except OSError:
-            pass
+        descriptor = os.open(guard, os.O_CREAT | os.O_RDWR)
+    except PermissionError:  # guarda com remoção pendente no Windows
         return False
     try:
-        if _stale(path):
-            path.unlink()  # atualização anterior morreu no meio
-        return True
-    except FileNotFoundError:
-        return True
-    except PermissionError:
-        return False  # trava velha segura por antivírus ou leitor: não atualiza agora, tenta na próxima verificação
-    finally:
         try:
-            guard.unlink(missing_ok=True)
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False  # outro processo segura a guarda
+        try:
+            if _stale(path):
+                path.unlink()  # atualização anterior morreu no meio
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            return False  # trava velha segura por antivírus ou leitor: não atualiza agora, tenta na próxima verificação
+        finally:
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(descriptor)
+        try:
+            guard.unlink(missing_ok=True)  # o Windows recusa se outro processo ainda a tem aberta: aí ela é dele
         except PermissionError:
             pass
 

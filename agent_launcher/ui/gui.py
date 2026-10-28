@@ -442,7 +442,9 @@ class LauncherWindow(QMainWindow):
         self.infos: dict[str, str] = {}  # origem -> informativo; a mesma origem substitui o seu, origens diferentes convivem
         self.cli_failed = set()
         self.cli_announced = ()
-        self.update_notice_failed = False
+        self.update_notices: dict[str, str] = {}  # origem ("recuperacao", "falha", "atualizado") -> HTML; convivem
+        self.footer_lines: dict[str, str] = {}  # origem -> rodapé; o de uma operação em curso tem prioridade
+        self.footer_busy: set[str] = set()
         self.update_status = "não verificada nesta execução"
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(str(ROOT / "assets" / "launcher.ico")))
@@ -714,8 +716,7 @@ class LauncherWindow(QMainWindow):
         self.update_notice.linkActivated.connect(lambda _link: self.restart())
         self.update_notice.hide()
         if self.store.recovered:
-            self.update_notice.setText(self.store.recovered.replace("<", "&lt;"))
-            self.update_notice.show()
+            self.show_update_notice("recuperacao", self.store.recovered.replace("<", "&lt;"))
         body.addWidget(self.update_notice)
         actions = QHBoxLayout()
         session_options = QVBoxLayout()
@@ -957,22 +958,17 @@ class LauncherWindow(QMainWindow):
             self.update_status = f"falhou: {result}"
         elif isinstance(result, Exception):
             self.update_status = f"falhou: {result}"
-            self.update_notice_failed = True
-            self.update_notice.setText(f"Atualização automática falhou: {result}".replace("<", "&lt;"))
-            self.update_notice.show()
+            self.show_update_notice("falha", f"Atualização automática falhou: {result}".replace("<", "&lt;"))
         elif result:
             self.update_status = f"atualizado para {result}; reiniciando a interface"
-            self.update_notice.setText(f"{APP_NAME} atualizado para {result}. Reiniciando a interface em "
-                                       f"{RESTART_DELAY_MS // 1000} s; as sessões abertas continuam. "
-                                       f'<a href="restart">Reiniciar agora</a>')
-            self.update_notice.show()
+            self.show_update_notice("atualizado", f"{APP_NAME} atualizado para {result}. Reiniciando a interface em "
+                                    f"{RESTART_DELAY_MS // 1000} s; as sessões abertas continuam. "
+                                    f'<a href="restart">Reiniciar agora</a>')
             # A janela aberta segue com o código antigo na memória: sem reiniciar, correções não chegam a ela.
             QTimer.singleShot(RESTART_DELAY_MS, self.restart_if_idle)
         else:
             self.update_status = f"em dia ({VERSION})"
-            if self.update_notice_failed:  # só o aviso de falha sai; o de "atualizado, reinicie" continua
-                self.update_notice_failed = False
-                self.update_notice.hide()
+            self.clear_update_notice("falha")  # só o aviso de falha sai; o de "atualizado, reinicie" e o de recuperação ficam
         updater.record(self.update_status)
 
     def restart_if_idle(self):
@@ -981,10 +977,44 @@ class LauncherWindow(QMainWindow):
                 or self.cli_updating is not None)
         if busy:
             self.update_status = self.update_status.replace("reiniciando a interface", "reabra para usar")
-            self.update_notice.setText(f"{APP_NAME} atualizado. Termine o que está fazendo e "
-                                       f'<a href="restart">reinicie</a> para usar a versão nova.')
+            self.show_update_notice("atualizado", f"{APP_NAME} atualizado. Termine o que está fazendo e "
+                                    f'<a href="restart">reinicie</a> para usar a versão nova.')
             return
         self.restart()
+
+    def show_update_notice(self, origin, html):
+        """Faixa de atualização: cada origem tem o seu aviso (a mesma substitui o seu, origens diferentes convivem)."""
+        self.update_notices[origin] = html
+        self.render_update_notice()
+
+    def clear_update_notice(self, origin):
+        self.update_notices.pop(origin, None)
+        self.render_update_notice()
+
+    def render_update_notice(self):
+        html = "<br>".join(self.update_notices.values())
+        self.update_notice.setText(html)
+        self.update_notice.setVisible(bool(html))
+
+    def set_footer(self, origin, text, busy=False):
+        """Rodapé: operação em curso (busy) fica na frente até terminar; o que chegar enquanto isso espera a sua vez, e
+        sem operação em curso vale a mensagem mais recente."""
+        self.footer_lines.pop(origin, None)
+        self.footer_lines[origin] = text
+        self.footer_busy.discard(origin)
+        if busy:
+            self.footer_busy.add(origin)
+        self.render_footer()
+
+    def end_footer(self, origin):
+        self.footer_busy.discard(origin)
+        self.footer_lines.pop(origin, None)
+        self.render_footer()
+
+    def render_footer(self):
+        busy = [origin for origin in self.footer_lines if origin in self.footer_busy]
+        shown = busy[-1] if busy else next(reversed(self.footer_lines), None)
+        self.footer.setText(self.footer_lines.get(shown, ""))
 
     def restart(self):
         """Reabre o launcher pela versão instalada e fecha esta janela (as sessões são processos à parte)."""
@@ -1242,7 +1272,7 @@ class LauncherWindow(QMainWindow):
                             origin="connection")
         else:
             self.clear_error("connection")
-        self.footer.setText(self.catalog.status.replace("atualizar: r", "atualizar: F5") if self.online and self.catalog else error)
+        self.set_footer("catalogo", self.catalog.status.replace("atualizar: r", "atualizar: F5") if self.online and self.catalog else error)
         self.populate_providers()
         self.populate_models()
 
@@ -1280,7 +1310,7 @@ class LauncherWindow(QMainWindow):
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(f"A janela abriu, mas não foi possível salvar a preferência: {error}")
         mode = " · bypass ativo" if bypass_permissions else ""
-        self.footer.setText(f"Janela aberta: {title}{mode}. A janela verifica a conexão antes de iniciar.")
+        self.set_footer("sessao", f"Janela aberta: {title}{mode}. A janela verifica a conexão antes de iniciar.")
         note = self.shared_resume_note() if resume else None
         if note:
             self.show_info(note, origin="pasta")
@@ -1291,7 +1321,7 @@ class LauncherWindow(QMainWindow):
         if self.installing_cli:
             return
         self.installing_cli = True
-        self.footer.setText(f"Instalando {registry.get(self.cli).LABEL} sem admin…")
+        self.set_footer("instalacao", f"Instalando {registry.get(self.cli).LABEL} sem admin…", busy=True)
         self.update_actions()
         self.install_task = InstallCliTask(self.cli)
         self.install_task.signals.completed.connect(self.finish_install_cli)
@@ -1302,9 +1332,9 @@ class LauncherWindow(QMainWindow):
         self.installing_cli = False
         if found:
             self.clear_error("cli:instalacao")
-            self.footer.setText(f"Instalado: {found}")
+            self.set_footer("instalacao", f"Instalado: {found}")
         else:
-            self.footer.setText("A instalação não terminou; o motivo está no aviso acima.")
+            self.set_footer("instalacao", "A instalação não terminou; o motivo está no aviso acima.")
             self.show_error(log or "Não foi possível instalar o CLI.", origin="cli:instalacao")
         self.update_actions()
 
@@ -1312,7 +1342,7 @@ class LauncherWindow(QMainWindow):
         finished = [(process, title) for process, title in self.sessions if process.poll() is not None]
         self.sessions = [(process, title) for process, title in self.sessions if process.poll() is None]
         if finished:
-            self.footer.setText(f"Sessão encerrada: {finished[-1][1]} · {len(self.sessions)} janela(s) ainda abertas")
+            self.set_footer("sessao", f"Sessão encerrada: {finished[-1][1]} · {len(self.sessions)} janela(s) ainda abertas")
 
     def eventFilter(self, watched, event):
         # *ToParent: chegam ao mostrar/esconder a faixa mesmo com a janela ainda invisível (Show/Hide não).
@@ -1338,7 +1368,7 @@ class LauncherWindow(QMainWindow):
 
     def copy_notice(self):
         QApplication.clipboard().setText(self.problem_report(self.notice.toolTip() or self.notice.text()))
-        self.footer.setText("Erro copiado com o contexto: cole num chat de IA ou mande para o suporte.")
+        self.set_footer("copia", "Erro copiado com o contexto: cole num chat de IA ou mande para o suporte.")
 
     def ensure_terminal(self, opened_in_console: bool = False):
         """Sem Terminal: instala sozinho em segundo plano; só avisa de erro se todas as formas falharem."""
@@ -1456,7 +1486,7 @@ class LauncherWindow(QMainWindow):
             added, skipped = fresh.import_legacy(Path(path))
             self.store = fresh
             self.populate_projects(self.project["id"] if self.project else None)
-            self.footer.setText(f"{added} projeto(s) importado(s); {skipped} já existentes ou inválidos. Nenhuma credencial importada.")
+            self.set_footer("importacao", f"{added} projeto(s) importado(s); {skipped} já existentes ou inválidos. Nenhuma credencial importada.")
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(str(error))
 
@@ -1525,7 +1555,7 @@ class LauncherWindow(QMainWindow):
             self.populate_projects(project["id"])
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(f"{harness.LABEL} aberto, mas não foi possível salvar a preferência: {error}")
-        self.footer.setText(message)
+        self.set_footer("sessao", message)
 
     # Perfis de trabalho
 
@@ -1585,7 +1615,7 @@ class LauncherWindow(QMainWindow):
         self.populate_projects(self.store.data["last_project"])
         self.populate_connections()
         name = profiles.profile_of_home(self.store.home, self.profile_base)["name"]
-        self.footer.setText(f"Perfil {name}: só os projetos e as conexões dele aparecem aqui.")
+        self.set_footer("perfil", f"Perfil {name}: só os projetos e as conexões dele aparecem aqui.")
 
     def new_profile(self):
         name, accepted = QInputDialog.getText(self, "Novo perfil", "Nome do perfil (ex.: o cliente):")
@@ -1662,8 +1692,8 @@ class LauncherWindow(QMainWindow):
         # Limpeza em segundo plano (fechar o Copilot app e esperar o banco pode levar ~40 s). A pergunta já foi feita
         # aqui, na thread da interface: a tarefa confirma sozinha e nunca abre QMessageBox fora dela.
         self.set_profile_busy(True)
-        self.footer.setText(f"Removendo as conexões do perfil {current['name']} do Copilot app e do VS Code… "
-                            "(pode levar alguns segundos)")
+        self.set_footer("perfil", f"Removendo as conexões do perfil {current['name']} do Copilot app e do VS Code… "
+                        "(pode levar alguns segundos)", busy=True)
         self.cleanup_task = CleanupTask(self.store.home)
         self.cleanup_task.signals.completed.connect(
             lambda messages, _text: self.finish_remove_profile(current, delete_data, messages))
@@ -1679,6 +1709,7 @@ class LauncherWindow(QMainWindow):
         from agent_launcher.harnesses.cleanup import Failure, failure
         messages = [failure("Limpeza nos destinos", messages)] if isinstance(messages, Exception) else list(messages or [])
         self.set_profile_busy(False)
+        self.end_footer("perfil")  # o "Removendo…" acabou, com ou sem mensagem de resultado
         self.cleanup_task = None
         from agent_launcher.harnesses.cleanup import release_profile_endpoints
         try:
@@ -1694,7 +1725,7 @@ class LauncherWindow(QMainWindow):
             return
         self.switch_profile(profiles.DEFAULT)
         if messages:  # o que foi feito (informativo) e o que falhou (erro, ex.: "VS Code: arquivo preso"), sem bloquear
-            self.footer.setText(" ".join(messages))
+            self.set_footer("perfil", " ".join(messages))
             failed = [message for message in messages if isinstance(message, Failure)]
             if failed:
                 self.show_error(" ".join(failed), origin="perfil")
@@ -1747,7 +1778,7 @@ class LauncherWindow(QMainWindow):
         if result["warnings"]:
             QMessageBox.information(self, "Importar perfil", profile_package.describe(result))
         else:
-            self.footer.setText(profile_package.describe(result))
+            self.set_footer("perfil", profile_package.describe(result))
         return result
 
     def export_profile(self, path: str | None = None):
@@ -1764,7 +1795,7 @@ class LauncherWindow(QMainWindow):
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(f"Não foi possível exportar o perfil: {error}")
             return None
-        self.footer.setText(f"Perfil {current['name']} exportado sem chaves em {result['path']}.")
+        self.set_footer("perfil", f"Perfil {current['name']} exportado sem chaves em {result['path']}.")
         return result
 
     def shared_warning(self, path: str) -> str | None:

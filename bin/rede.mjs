@@ -46,3 +46,18 @@ export function describeError(error) {
       " ou aponte NODE_EXTRA_CA_CERTS para a CA da empresa."
     : text;
 }
+
+// Download do GitHub: um redirecionamento só pode ir (https) para os hosts que o GitHub usa para servir release.
+const GITHUB_REDIRECT_HOSTS = ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"];
+
+export async function fetchFromGitHub(url, { fetchImpl = fetch, hosts = GITHUB_REDIRECT_HOSTS, redirects = 5 } = {}) {
+  const response = await fetchImpl(url, { redirect: "manual" });
+  if (response.status < 300 || response.status >= 400) return response;
+  const location = response.headers.get("location");
+  if (!location || redirects === 0) throw new Error(`download of ${url} redirected without a usable Location`);
+  const next = new URL(location, url);
+  if (next.protocol !== "https:" || !hosts.includes(next.hostname)) {
+    throw new Error(`download of ${url} redirected to ${next.href}, outside the GitHub download hosts; refused`);
+  }
+  return fetchFromGitHub(next.href, { fetchImpl, hosts, redirects: redirects - 1 });
+}

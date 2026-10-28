@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { childEnv, describeError, relaunchArgs } from "./rede.mjs";
+import { childEnv, describeError, fetchFromGitHub, relaunchArgs } from "./rede.mjs";
 
 const PACKAGE_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const RUNTIME_DIR = join(homedir(), ".agent-launcher", "runtime");
@@ -42,7 +42,7 @@ async function ensureUv() {
   console.log(`Baixando uv ${UV_VERSION} (gerenciador de Python)...`);
   let response;
   try {
-    response = await fetch(url);
+    response = await fetchFromGitHub(url);
   } catch (error) {
     fail(`download of ${url} failed: ${describeError(error)}`);
   }

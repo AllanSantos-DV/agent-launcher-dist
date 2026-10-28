@@ -174,11 +174,14 @@ def update(cli: str, latest=latest_version) -> dict:
     lock = lock_path(cli)
     if not updater._lock(lock):
         raise UpdateDeferred(f"Atualização do {NAMES[cli]} adiada: outra janela do launcher já está atualizando.")
+    taken = lock.stat().st_mtime_ns
     try:
         return _apply(cli, path, before, len(running(cli, path)))
     finally:
         try:
-            lock.unlink(missing_ok=True)
+            # Passada a validade (npm + desfazer podem levar mais), outro processo já pode ter tomado a trava: a dele fica.
+            if lock.exists() and lock.stat().st_mtime_ns == taken:
+                lock.unlink(missing_ok=True)
         except PermissionError:
             installers.record(f"trava {lock} não removida (arquivo em uso); vale como velha depois de "
                               f"{updater.LOCK_STALE_S // 60} min e nesse tempo as sessões de {NAMES[cli]} não abrem")
@@ -203,7 +206,7 @@ def _signed_targets(cli: str, path: str) -> list[Path]:
         if builds:
             newest = max(builds, key=lambda item: tuple(int(part) for part in item.name.split(".")))
             found += list(newest.glob("prebuilds/win32-x64/copilot-runtime.exe"))
-    return found
+    return found + (installers.official_auxiliary_executables(cli) if found else [])
 
 
 def _verify_signature(cli: str, path: str, origin: str) -> None:
@@ -215,17 +218,7 @@ def _verify_signature(cli: str, path: str, origin: str) -> None:
             installers._fail(cli, "atualização", f"não achei o executável do {NAMES[cli]} ({path}) para conferir a assinatura "
                                                  "depois da atualização; reinstale pelo launcher.")
         return
-    unsigned = [item for item in targets if not installers._signed(item, installers.SIGNERS[cli])]
-    for item in unsigned:
-        try:
-            item.unlink()
-        except OSError as error:
-            installers._fail(cli, "atualização", f"{item} sem assinatura válida de {installers.SIGNERS[cli]} e não pôde ser "
-                                                 f"apagado ({error}); apague-o à mão.")
-    if unsigned:
-        installers._fail(cli, "atualização", f"{', '.join(map(str, unsigned))} sem assinatura Authenticode válida de "
-                                             f"{installers.SIGNERS[cli]} depois da atualização; o executável foi apagado "
-                                             "e a atualização recusada.")
+    installers.reject_unsigned(cli, targets, "atualização", "atualização", " depois da atualização")
 
 
 def _apply(cli: str, path: str, before: str | None, sessions: int = 0) -> dict:

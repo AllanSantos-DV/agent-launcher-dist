@@ -7,7 +7,7 @@ import json
 import os
 import time
 from pathlib import Path
-from agent_launcher.domain.files import atomic_text, read_text_retrying
+from agent_launcher.domain.files import LockBusy, atomic_text, file_lock, read_text_retrying
 
 FILE = "sessions.jsonl"
 KEEP = 2000
@@ -34,9 +34,10 @@ def record(home: Path, *, profile: str, project: str, folder, cli: str, connecti
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
         if path.stat().st_size > KEEP * 600:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-KEEP:]
-            atomic_text(path, "\n".join(lines) + "\n")
-    except OSError:
+            with file_lock(path):  # a rotação lê e regrava tudo: sem a trava perderia a linha que outro processo acrescentou
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-KEEP:]
+                atomic_text(path, "\n".join(lines) + "\n")
+    except (OSError, LockBusy):
         pass
     return entry
 

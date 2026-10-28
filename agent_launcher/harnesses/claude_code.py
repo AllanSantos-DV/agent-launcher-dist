@@ -111,6 +111,15 @@ def claude_config_file() -> Path:
     return Path(folder) / ".claude.json" if folder else Path.home() / ".claude.json"
 
 
+def _trusted(config: Path, keys: list[str]) -> bool:
+    try:
+        projects = json.loads(config.read_text(encoding="utf-8")).get("projects")
+    except (OSError, ValueError):
+        return False
+    return isinstance(projects, dict) and all(isinstance(projects.get(name), dict)
+                                              and projects[name].get("hasTrustDialogAccepted") is True for name in keys)
+
+
 def trust_claude_folder(path: Path, config: Path | None = None, attempts: int = 8, before_replace=None) -> bool:
     """Grava projects[<pasta>].hasTrustDialogAccepted=true no estado do Claude Code. Só para sessões controladas
     em projetos cadastrados. O arquivo é reescrito pelas sessões abertas: troca atômica e só se ele não mudou desde
@@ -144,7 +153,9 @@ def trust_claude_folder(path: Path, config: Path | None = None, attempts: int = 
             now = config.stat()
             if (now.st_mtime_ns, now.st_size) == (before.st_mtime_ns, before.st_size):
                 replace_retrying(temporary, config)
-                return True
+                if _trusted(config, keys):  # outra sessão pode ter regravado o arquivo entre a conferência e a troca
+                    return True
+                continue
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
