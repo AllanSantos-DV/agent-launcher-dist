@@ -68,6 +68,7 @@ class Gateway:
             self.module.verify(self.options)
         except ConnectorError as error:
             raise LauncherError(f"{self.name}: {error}") from error
+        self.store.clear_connection_status(self.connection["id"])  # a cota voltou: o aviso gravado deixa de valer
 
     def empty_catalog(self, records=(), status="Catálogo indisponível; capacidades não confirmadas.", verified=False) -> Catalog:
         return Catalog(list(records), status, verified, self.clis, self.any_model, frozenset(self.protocols))

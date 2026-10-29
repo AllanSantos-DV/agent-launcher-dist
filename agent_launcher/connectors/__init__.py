@@ -15,7 +15,9 @@ Um conector é um módulo Python com:
             "messages_auth": "bearer" (Authorization: Bearer) ou "api_key" (header x-api-key)}
            O formato antigo ({"claude", "codex", "claude_auth"}) continua aceito: normalize_targets() o traduz.
   verify(options) -> None, levantando ConnectorError com um motivo acionável; login por código (device flow):
-           levante LoginPending(mensagem, uri, código, expires_at, interval) enquanto aguarda a autorização
+           levante LoginPending(mensagem, uri, código, expires_at, interval) enquanto aguarda a autorização;
+           levante QuotaExhausted(mensagem) só quando login e assinatura estão válidos e a cota acabou (a conexão é
+           gravada com o aviso e o estado "cota esgotada")
   models(options) -> (list[ModelInfo], contexto_confirmado: bool)
 
 Várias conexões e perfis:
@@ -52,6 +54,12 @@ class LoginPending(ConnectorError):
     def __init__(self, message: str, uri: str, code: str, expires_at: float, interval: float = 5.0):
         super().__init__(message)
         self.uri, self.code, self.expires_at, self.interval = uri, code, float(expires_at), float(interval)
+
+
+class QuotaExhausted(ConnectorError):
+    """Login e assinatura válidos; a única falha é a cota esgotada. A conexão é gravada com este aviso (estado "cota
+    esgotada", nunca "funcionando") e passa a servir quando a cota voltar ou com outra conta. Qualquer outra falha
+    (login, conta errada, sem assinatura, rede) continua ConnectorError e impede gravar."""
 
 
 def normalize_targets(raw: dict) -> dict:

@@ -71,7 +71,8 @@ def show_connections(store: Store) -> None:
         module = modules.get(connection["connector"])
         marker = " • padrão" if connection["id"] == store.data["default_connection"] else ""
         label = module.LABEL if module else f"{connection['connector']} (conector indisponível)"
-        print(f"  {index:>2}. {connection['name']}{marker}\n      {label} • {connection['options'].get('base_url', '')}")
+        quota = " • cota esgotada" if (connection.get("status") or {}).get("state") == "quota_exhausted" else ""
+        print(f"  {index:>2}. {connection['name']}{marker}\n      {label} • {connection['options'].get('base_url', '')}{quota}")
     if not store.connections:
         print("  Nenhuma conexão. Adicione um provedor (LiteLLM, 9router, OmniRoute, OpenRouter, Anthropic, OpenAI...).")
     for error in errors:
@@ -821,6 +822,9 @@ def main(arguments: list[str] | None = None) -> int:
                 existing = next((c["id"] for c in store.connections if c["name"].casefold() == options.name.casefold()), None)
                 connection = store.save_connection(options.name, options.connector, values, existing)
                 print(f"Conexão {'atualizada' if existing else 'salva'}: {connection['name']}")
+                status = connection.get("status") or {}
+                if status.get("state") == "quota_exhausted":
+                    print(f"AVISO: cota esgotada, a conexão não está funcionando agora. {status.get('message', '')}")
             elif action == "test":
                 Gateway(store, store.find_connection(options.reference)).verify()
                 print("Conexão respondeu.")

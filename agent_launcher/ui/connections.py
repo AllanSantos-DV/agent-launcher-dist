@@ -64,6 +64,12 @@ def login_of(task) -> LoginPending | None:
     return failure
 
 
+def quota_warning(connection: dict | None) -> str:
+    """Mensagem de cota esgotada gravada na conexão ("" se ela não está nesse estado)."""
+    status = (connection or {}).get("status") or {}
+    return str(status.get("message") or "") if status.get("state") == "quota_exhausted" else ""
+
+
 def _remaining(seconds: float) -> str:
     seconds = max(0, int(seconds))
     return f"{seconds // 60}:{seconds % 60:02d}"
@@ -324,6 +330,17 @@ class ConnectionForm(QDialog):
                 self.notice.show()
             return
         self.saved = connection
+        if quota_warning(connection):
+            # gravada, mas não funcionando: o aviso fica na tela até o usuário fechar (não some com o diálogo)
+            if self.login_panel.state == "waiting":
+                self.login_panel.authorized("Autorizado.")
+            self.notice.setText("Conexão salva, mas a cota está esgotada: " + quota_warning(connection))
+            self.notice.show()
+            self.adjustSize()  # o aviso tem várias linhas: sem isso a janela mantém a altura e corta o texto
+            self.save_button.setText("Fechar")
+            self.save_button.clicked.disconnect()
+            self.save_button.clicked.connect(self.accept)
+            return
         if self.login_panel.state == "waiting":
             self.login_panel.authorized()
             QTimer.singleShot(DONE_DELAY_MS, self.accept)
@@ -331,6 +348,8 @@ class ConnectionForm(QDialog):
             self.accept()
 
     def done(self, result: int):
+        if result == QDialog.DialogCode.Rejected and self.saved:
+            result = QDialog.DialogCode.Accepted  # já gravou (com aviso de cota): fechar não desfaz nem esconde a lista nova
         self.login_panel.clear()
         super().done(result)
 
@@ -535,8 +554,9 @@ class ConnectionsDialog(QDialog):
         for connection in store.connections:
             module = modules.get(connection["connector"])
             default = " • padrão" if connection["id"] == store.data["default_connection"] else ""
-            item = QListWidgetItem(f"{connection['name']}{default}\n{module.LABEL if module else connection['connector']}"
-                                   f" • {connection['options'].get('base_url', '')}")
+            details = [module.LABEL if module else connection["connector"], connection["options"].get("base_url", ""),
+                       "cota esgotada" if quota_warning(connection) else ""]
+            item = QListWidgetItem(f"{connection['name']}{default}\n" + " • ".join(part for part in details if part))
             item.setData(Qt.ItemDataRole.UserRole, connection["id"])
             self.list.addItem(item)
             if connection["id"] == preferred:
@@ -544,6 +564,9 @@ class ConnectionsDialog(QDialog):
         if self.list.currentItem() is None and self.list.count():
             self.list.setCurrentRow(0)
         self.set_status("lista", "" if self.list.count() else "Nenhuma conexão ainda. Clique em Adicionar.")
+        self.set_status("cota", "\n".join(f"{connection['name']}: cota esgotada, a conexão volta a funcionar quando a cota "
+                                          "voltar ou com outra conta." for connection in store.connections
+                                          if quota_warning(connection)))
         self.update_buttons()
 
     def current(self) -> dict | None:
@@ -601,6 +624,8 @@ class ConnectionsDialog(QDialog):
             if self.login_panel.state == "waiting":
                 self.login_panel.authorized("Autorizado.")
             self.errors.pop("teste", None)
+            item = self.list.currentItem()
+            self.populate(item.data(Qt.ItemDataRole.UserRole) if item else None)  # o aviso de cota gravado já foi limpo
             self.set_status("teste", f"{name}: conexão respondeu.")
         self.render_errors()
 

@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 
 from agent_launcher import connectors
-from agent_launcher.connectors import ConnectorError
+from agent_launcher.connectors import ConnectorError, QuotaExhausted
 from agent_launcher.domain.catalog import CLIS
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import (atomic_json, clean_text, path_key, project_path, read_json_state,
@@ -397,10 +397,14 @@ class Store:
             if item.get("required") and not value:
                 raise LauncherError(f"Preencha {item['label']}.")
             options[key] = value
+        quota = None
         try:
             connectors.normalize_targets(module.targets(options))
             if verify:
-                module.verify(options)
+                try:
+                    module.verify(options)
+                except QuotaExhausted as error:  # login e assinatura valem: grava, com o estado "cota esgotada"
+                    quota = {"state": "quota_exhausted", "message": str(error), "checked_at": int(time.time())}
         except ConnectorError as error:
             raise LauncherError(f"{module.LABEL}: {error}") from error
         if existing:
@@ -413,10 +417,19 @@ class Store:
             self.data["connections"].append(connection)
             if self.data["default_connection"] is None:
                 self.data["default_connection"] = identifier
+        if quota:
+            connection["status"] = quota
+        elif verify:
+            connection.pop("status", None)  # verificada de verdade: o estado antigo de cota deixa de valer
         for key, value in hidden.items():
             self.vault.set(f"{identifier}:{key}", value)
         self.save()
         return connection
+
+    def clear_connection_status(self, reference: str) -> None:
+        connection = self.find_connection(reference)
+        if connection.pop("status", None) is not None:
+            self.save()
 
     def remove_connection(self, reference: str) -> None:
         connection = self.find_connection(reference)
