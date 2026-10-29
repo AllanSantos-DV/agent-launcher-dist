@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QApplication, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
+from agent_launcher.connectors import LoginPending
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
@@ -27,16 +30,21 @@ CLEAN_NOTE = ("Se o Copilot app estiver aberto, ele é fechado e aberto de novo 
               "launcher faz backup do banco do app antes e não mexe nos seus outros providers.")
 
 
+DONE_DELAY_MS = 1500  # o painel de login mostra "Autorizado" por este tempo antes de o formulário fechar
+
+
 class _Signals(QObject):
     done = Signal(object, str)
 
 
 class _Task(QRunnable):
-    """Teste/gravação de conexão fora da thread da interface (a verificação consulta a rede)."""
+    """Teste/gravação de conexão fora da thread da interface (a verificação consulta a rede). A exceção fica em
+    `failure`: o login por código (LoginPending) chega à tela pela causa dela, não pelo texto."""
 
     def __init__(self, job):
         super().__init__()
         self.job = job
+        self.failure = None
         self.signals = _Signals()
 
     @Slot()
@@ -44,7 +52,131 @@ class _Task(QRunnable):
         try:
             self.signals.done.emit(self.job(), "")
         except Exception as error:
+            self.failure = error
             self.signals.done.emit(None, str(error))
+
+
+def login_of(task) -> LoginPending | None:
+    """O login por código pendente que fez a tarefa falhar (a verificação o embrulha em LauncherError), ou None."""
+    failure = getattr(task, "failure", None)
+    while failure is not None and not isinstance(failure, LoginPending):
+        failure = failure.__cause__
+    return failure
+
+
+def _remaining(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+class LoginPanel(QWidget):
+    """Login por código na própria tela: endereço (abre no navegador), código (copiável), tempo restante e estado
+    (aguardando, autorizado, expirado, erro). Enquanto aguarda, emite `poll` a cada intervalo do provedor para quem o
+    usa repetir a verificação, sem mais cliques; ao expirar, para de pedir (um novo código só vem pelo botão)."""
+
+    poll = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.login: LoginPending | None = None
+        self.state = ""
+        self.next_poll = 0.0
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(_label("Entrar com o código", "section"))
+        self.address_label = _label("", "muted")
+        self.address_label.setAccessibleName("Endereço de autorização")
+        layout.addWidget(self.address_label)
+        self.code_label = QLabel("")
+        self.code_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.code_label.setAccessibleName("Código de autorização")
+        self.code_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.code_label.setStyleSheet("font-size: 28px; font-weight: 700; letter-spacing: 4px;")
+        layout.addWidget(self.code_label)
+        self.state_label = _label("", "notice")
+        self.state_label.setAccessibleName("Estado do login")
+        layout.addWidget(self.state_label)
+        row = QHBoxLayout()
+        self.open_button = QPushButton("Abrir no navegador")
+        self.open_button.clicked.connect(self.open_address)
+        row.addWidget(self.open_button)
+        self.copy_button = QPushButton("Copiar código")
+        self.copy_button.clicked.connect(self.copy_code)
+        row.addWidget(self.copy_button)
+        row.addStretch()
+        layout.addLayout(row)
+        self.timer = QTimer(self)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self.tick)
+        self.hide()
+
+    def start(self, login: LoginPending) -> None:
+        """Mostra o código recebido. O mesmo código de novo só mantém a contagem (a verificação seguinte)."""
+        same = self.login is not None and (self.login.code, self.login.uri) == (login.code, login.uri)
+        self.login = login
+        if not same or self.state != "waiting":
+            self.next_poll = time.time() + login.interval
+        self.state = "waiting"
+        self.address_label.setText(f"Abra {login.uri} e digite o código:")
+        self.code_label.setText(login.code)
+        self.open_button.setEnabled(self.secure(login.uri))
+        self.copy_button.setEnabled(True)
+        self.show()
+        self.timer.start()
+        self.tick()
+
+    @staticmethod
+    def secure(uri: str) -> bool:
+        return QUrl(uri).scheme() == "https"
+
+    def tick(self) -> None:
+        if self.state != "waiting" or self.login is None:
+            return
+        left = self.login.expires_at - time.time()
+        if left <= 0:
+            self.expire()
+            return
+        self.state_label.setText(f"Aguardando a autorização… o código vale por mais {_remaining(left)}.")
+        if time.time() >= self.next_poll:
+            self.next_poll = time.time() + self.login.interval
+            self.poll.emit()
+
+    def expire(self) -> None:
+        self.timer.stop()
+        self.state = "expired"
+        self.state_label.setText("O código expirou. Clique em Testar e salvar para gerar outro.")
+        self.copy_button.setEnabled(False)
+        self.open_button.setEnabled(False)
+
+    def authorized(self, text: str = "Autorizado. Conexão salva.") -> None:
+        self.timer.stop()
+        self.state = "authorized"
+        self.state_label.setText(text)
+        self.copy_button.setEnabled(False)
+        self.open_button.setEnabled(False)
+        self.show()
+
+    def failed(self, error: str) -> None:
+        """Erro durante o login: o painel fica com o código (a verificação seguinte retoma o mesmo, enquanto valer)."""
+        self.timer.stop()
+        self.state = "error"
+        retry = "" if "Clique em" in error else "\nClique em Testar e salvar para tentar de novo."
+        self.state_label.setText(f"Erro: {error}{retry}")
+        self.show()
+
+    def clear(self) -> None:
+        self.timer.stop()
+        self.login, self.state = None, ""
+        self.hide()
+
+    def open_address(self) -> None:
+        if self.login is not None and self.secure(self.login.uri):
+            QDesktopServices.openUrl(QUrl(self.login.uri))
+
+    def copy_code(self) -> None:
+        if self.login is not None:
+            QApplication.clipboard().setText(self.login.code)
 
 
 class ConnectionForm(QDialog):
@@ -83,9 +215,13 @@ class ConnectionForm(QDialog):
         self.form.setVerticalSpacing(8)
         self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         layout.addWidget(self.fields_host)
+        self.login_panel = LoginPanel()
+        self.login_panel.poll.connect(self.poll_login)
+        layout.addWidget(self.login_panel)
         self.notice = _label("", "notice")
         self.notice.hide()
         layout.addWidget(self.notice)
+        self.running = False
         actions = QHBoxLayout()
         actions.addStretch()
         cancel = QPushButton("Cancelar")
@@ -94,7 +230,7 @@ class ConnectionForm(QDialog):
         self.save_button = QPushButton("Testar e salvar")
         self.save_button.setObjectName("primary")
         self.save_button.setDefault(True)
-        self.save_button.clicked.connect(self.save)
+        self.save_button.clicked.connect(lambda: self.save())
         actions.addWidget(self.save_button)
         layout.addLayout(actions)
         self.kind.currentIndexChanged.connect(self.build_fields)
@@ -149,27 +285,54 @@ class ConnectionForm(QDialog):
                 values[key] = widget.text()
         return values
 
-    def save(self):
+    def save(self, polling: bool = False):
+        """Testar e salvar. Com login por código pendente (`polling`), é a conferência automática: não mexe no botão."""
+        if self.running:
+            return
         name, connector, values = self.name.text(), self.module.NAME, self.values()
         reference = self.connection["id"] if self.connection else None
         home = self.home
-        self.save_button.setEnabled(False)
-        self.save_button.setText("Testando…")
-        self.notice.hide()
+        self.running = True
+        if not polling:
+            self.save_button.setEnabled(False)
+            self.save_button.setText("Testando…")
+            self.notice.hide()
+            self.login_panel.clear()
         self.task = _Task(lambda: Store(home).save_connection(name, connector, values, reference))
-        self.task.signals.done.connect(self.finished)
+        self.task.signals.done.connect(self.saved_result)
         QThreadPool.globalInstance().start(self.task)
 
+    @Slot()
+    def poll_login(self):
+        self.save(polling=True)
+
     @Slot(object, str)
-    def finished(self, connection, error):
+    def saved_result(self, connection, error):
+        # não pode se chamar `finished`: esse nome é o sinal do QDialog e o connect falha no clique
+        self.running = False
         self.save_button.setEnabled(True)
         self.save_button.setText("Testar e salvar")
         if error:
-            self.notice.setText(error)
-            self.notice.show()
+            login = login_of(self.task)
+            if login is not None:
+                self.notice.hide()
+                self.login_panel.start(login)
+            elif self.login_panel.state == "waiting":
+                self.login_panel.failed(error)
+            else:
+                self.notice.setText(error)
+                self.notice.show()
             return
         self.saved = connection
-        self.accept()
+        if self.login_panel.state == "waiting":
+            self.login_panel.authorized()
+            QTimer.singleShot(DONE_DELAY_MS, self.accept)
+        else:
+            self.accept()
+
+    def done(self, result: int):
+        self.login_panel.clear()
+        super().done(result)
 
 
 class EndpointPanel(QWidget):
@@ -343,6 +506,10 @@ class ConnectionsDialog(QDialog):
         layout.addLayout(body, 1)
         self.endpoint = EndpointPanel(home, self)
         layout.addWidget(self.endpoint)
+        self.login_panel = LoginPanel()
+        self.login_panel.poll.connect(lambda: self.test(polling=True))
+        layout.addWidget(self.login_panel)
+        self.testing = False
         self.errors: dict[str, str] = {}  # origem ("limpeza", "teste") -> erro; some só quando a origem se resolve
         self.error_notice = _label("", "notice")  # não some com a lista que recarrega nem com a linha de status
         self.error_notice.setWordWrap(True)
@@ -401,24 +568,48 @@ class ConnectionsDialog(QDialog):
             if form.exec() and form.saved:
                 self.populate(form.saved["id"])
 
-    def test(self):
+    def test(self, polling: bool = False):
+        """Testar a conexão selecionada. Com login por código pendente (`polling`), é a conferência automática."""
         connection = self.current()
-        if not connection:
+        if not connection or self.testing:
             return
         home = self.home
-        self.set_status("teste", f"Testando {connection['name']}…")
+        self.testing = True
+        if not polling:
+            self.login_panel.clear()
+            self.set_status("teste", f"Testando {connection['name']}…")
         self.task = _Task(lambda: Gateway(Store(home), Store(home).find_connection(connection["id"])).verify())
-        self.task.signals.done.connect(lambda _result, error: self.show_test_result(connection["name"], error))
-        QThreadPool.globalInstance().start(self.task)
+        task = self.task
+        task.signals.done.connect(lambda _result, error: self.show_test_result(connection["name"], error, task))
+        QThreadPool.globalInstance().start(task)
 
-    def show_test_result(self, name: str, error: str):
-        if error:
+    def show_test_result(self, name: str, error: str, task=None):
+        self.testing = False
+        login = login_of(task) if error else None
+        if login is not None:
+            self.errors.pop("teste", None)
+            self.set_status("teste", f"{name}: aguardando a autorização do login…")
+            self.login_panel.start(login)
+        elif error and self.login_panel.state == "waiting":
+            self.login_panel.failed(error)  # o erro fica no painel, junto do código que ainda vale
+            self.errors.pop("teste", None)
+            self.set_status("teste", "")
+        elif error:
             self.errors["teste"] = f"{name}: {error}"
             self.set_status("teste", "")
         else:
+            if self.login_panel.state == "waiting":
+                self.login_panel.authorized("Autorizado.")
             self.errors.pop("teste", None)
             self.set_status("teste", f"{name}: conexão respondeu.")
         self.render_errors()
+
+    def done(self, result: int):
+        """Não fecha no meio da limpeza nos destinos (Fechar, Esc ou o X): o fim dela atualiza este diálogo."""
+        if self.cleaning:
+            return
+        self.login_panel.clear()
+        super().done(result)
 
     def set_status(self, origin: str, text: str):
         """Linha de status: cada origem tem a sua (o fim de uma não apaga a das outras)."""
@@ -438,12 +629,6 @@ class ConnectionsDialog(QDialog):
         if connection:
             Store(self.home).set_default_connection(connection["id"])
             self.populate(connection["id"])
-
-    def done(self, result: int):
-        """Não fecha no meio da limpeza nos destinos (Fechar, Esc ou o X): o fim dela atualiza este diálogo."""
-        if self.cleaning:
-            return
-        super().done(result)
 
     def _set_cleaning(self, cleaning: bool):
         """Durante a limpeza nos destinos: lista e botões travados (a conexão ainda existe até o fim)."""

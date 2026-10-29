@@ -40,31 +40,48 @@ def validate_model(model: str) -> str:
 
 
 REPLACE_ATTEMPTS = 10
+REPLACE_TIMEOUT = 5.0   # s: o Windows recusa enquanto qualquer processo/thread mantém o arquivo aberto sem FILE_SHARE_DELETE
+                        # (o open do Python nunca o passa) ou o antivírus o varre; sob carga isso passa de 1 s
 
 
-def replace_retrying(source, destination, attempts: int = REPLACE_ATTEMPTS) -> None:
+def _give_up(attempt: int, attempts: int, started: float, timeout: float) -> bool:
+    """Depois de uma recusa: desiste só quando as tentativas mínimas E o prazo acabaram; senão espera (crescente, com
+    variação, no máximo 0,25 s) para a próxima."""
+    if attempt >= attempts and time.monotonic() - started >= timeout:
+        return True
+    time.sleep(min(0.015 * attempt, 0.25) * (0.5 + random.random()))
+    return False
+
+
+def replace_retrying(source, destination, attempts: int = REPLACE_ATTEMPTS, timeout: float = REPLACE_TIMEOUT) -> None:
     """os.replace que repete quando o Windows recusa por um leitor ou outro escritor com o destino aberto (EPERM,
-    EACCES e EBUSY chegam como PermissionError); espera crescente com variação. Esgotadas as tentativas, levanta."""
-    for attempt in range(1, attempts + 1):
+    EACCES e EBUSY chegam como PermissionError). Repete por no mínimo `attempts` tentativas e por `timeout` segundos;
+    esgotados os dois, levanta."""
+    started = time.monotonic()
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             os.replace(source, destination)
             return
         except PermissionError:
-            if attempt == attempts:
+            if _give_up(attempt, attempts, started, timeout):
                 raise
-            time.sleep(0.015 * attempt * (0.5 + random.random()))
 
 
-def read_text_retrying(path, attempts: int = REPLACE_ATTEMPTS, encoding: str = "utf-8-sig", errors: str = "strict") -> str:
+def read_text_retrying(path, attempts: int = REPLACE_ATTEMPTS, encoding: str = "utf-8-sig", errors: str = "strict",
+                       timeout: float = REPLACE_TIMEOUT) -> str:
     """read_text que repete quando o Windows recusa a abertura por um replace em andamento no mesmo arquivo (a leitura
-    concorrente com o rename atômico chega como PermissionError); esgotadas as tentativas, levanta."""
-    for attempt in range(1, attempts + 1):
+    concorrente com o rename atômico chega como PermissionError); mesmo prazo de replace_retrying, depois levanta."""
+    started = time.monotonic()
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             return Path(path).read_text(encoding=encoding, errors=errors)
         except PermissionError:
-            if attempt == attempts:
+            if _give_up(attempt, attempts, started, timeout):
                 raise
-            time.sleep(0.015 * attempt * (0.5 + random.random()))
 
 
 def note_state_recovery(folder: Path, message: str) -> None:

@@ -14,7 +14,8 @@ Um conector é um módulo Python com:
             "any_model": True quando o host traduz qualquer modelo para os protocolos que serve,
             "messages_auth": "bearer" (Authorization: Bearer) ou "api_key" (header x-api-key)}
            O formato antigo ({"claude", "codex", "claude_auth"}) continua aceito: normalize_targets() o traduz.
-  verify(options) -> None, levantando ConnectorError com um motivo acionável
+  verify(options) -> None, levantando ConnectorError com um motivo acionável; login por código (device flow):
+           levante LoginPending(mensagem, uri, código, expires_at, interval) enquanto aguarda a autorização
   models(options) -> (list[ModelInfo], contexto_confirmado: bool)
 
 Várias conexões e perfis:
@@ -41,6 +42,16 @@ LEGACY = {"claude": "messages", "codex": "responses"}
 
 class ConnectorError(Exception):
     pass
+
+
+class LoginPending(ConnectorError):
+    """Login interativo em andamento (fluxo de dispositivo): verify() levanta isto enquanto o usuário não autorizou.
+    A interface mostra o endereço, o código e o tempo restante (expires_at, epoch em segundos) e chama verify() de novo a
+    cada `interval` segundos até autorizar; a mensagem serve ao modo texto."""
+
+    def __init__(self, message: str, uri: str, code: str, expires_at: float, interval: float = 5.0):
+        super().__init__(message)
+        self.uri, self.code, self.expires_at, self.interval = uri, code, float(expires_at), float(interval)
 
 
 def normalize_targets(raw: dict) -> dict:
