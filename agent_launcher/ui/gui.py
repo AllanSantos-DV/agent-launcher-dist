@@ -27,6 +27,7 @@ from agent_launcher.platform import terminal
 from agent_launcher.session.conversations import conversations_for, has_conversation_for
 from agent_launcher.session.window import session_title, start_session
 from agent_launcher.ui.connections import ConnectionsDialog
+from agent_launcher.ui.instructions import InstructionsDialog
 from agent_launcher.ui.theme import GREEN, MUTED, STYLE, CliButton, ElidedLabel, icon
 from agent_launcher.update import updater
 from version import APP_NAME, APP_USER_MODEL_ID, VERSION
@@ -615,7 +616,7 @@ class LauncherWindow(QMainWindow):
         self.cli_update_preference.setChecked(self.store.preference("cli_auto_update"))
         self.cli_update_preference.toggled.connect(self.set_cli_auto_update)
         menu.addAction(self.cli_update_preference)
-        menu.addAction("Abrir instruções", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(ROOT / "README.md"))))
+        menu.addAction("Instruções e comandos…", self.show_instructions)
         self.options.setMenu(menu)
         top.addWidget(self.options)
         body.addLayout(top)
@@ -1659,6 +1660,10 @@ class LauncherWindow(QMainWindow):
             self.show_error(str(error))
             return
         self.populate_profiles()
+
+    def show_instructions(self):
+        self.instructions_dialog = InstructionsDialog(self)
+        self.instructions_dialog.show()
 
     def show_usage(self):
         current = profiles.profile_of_home(self.store.home, self.profile_base)

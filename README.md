@@ -8,7 +8,7 @@ Abre **Claude Code**, **Codex** e **GitHub Copilot CLI** nos seus projetos, e co
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
 
-Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). **Status:** 1.1.0, Windows 10/11.
+Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). Para Windows 10/11.
 
 ## Requisitos
 
