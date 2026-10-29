@@ -4,7 +4,7 @@ from pathlib import Path
 
 APP_NAME = "Agent Launcher"
 APP_ID = "agent-launcher"
-VERSION = "1.2.8"
+VERSION = "1.2.9"
 # Chave pública Ed25519 do produto no engine-registry (a privada fica só na máquina de quem publica). Tem de ser igual
 # à release.publicKey de docs/registry-app-entry.json: quem confere um pacote usa esta, nunca só a do manifest.
 REGISTRY_PUBLIC_KEY = "bbfc8c1a639872d4e5fc44ac4172443886153b4579b4f3e0466220c02d09407a"

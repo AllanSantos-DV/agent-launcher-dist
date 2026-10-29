@@ -55,6 +55,34 @@ def running() -> list[tuple[int, str]]:
     return found
 
 
+def descendants(root: int) -> list[int]:
+    """PIDs de todos os descendentes de `root` neste instante (filhos, netos…), pela tabela pai→filho do sistema."""
+    if os.name != "nt":
+        return []
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot in (None, INVALID_HANDLE):
+        return []
+    children: dict[int, list[int]] = {}
+    try:
+        entry = _Entry()
+        entry.dwSize = ctypes.sizeof(_Entry)
+        more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            children.setdefault(entry.th32ParentProcessID, []).append(entry.th32ProcessID)
+            more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    found, pending = [], [root]
+    while pending:
+        for pid in children.get(pending.pop(), []):
+            if pid != root and pid not in found:
+                found.append(pid)
+                pending.append(pid)
+    return found
+
+
 def _key(path) -> str:
     return os.path.normcase(os.path.realpath(str(path)))
 

@@ -7,6 +7,16 @@ import socket
 import subprocess
 
 from agent_launcher.domain.errors import LauncherError
+from agent_launcher.platform.processes import descendants
+
+
+def _assign(kernel32, job, pid: int) -> bool:
+    handle = kernel32.OpenProcess(0x0001 | 0x0100, False, pid)  # PROCESS_TERMINATE | PROCESS_SET_QUOTA
+    try:
+        return bool(handle) and bool(kernel32.AssignProcessToJobObject(ctypes.c_void_p(job), ctypes.c_void_p(handle)))
+    finally:
+        if handle:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
 def kill_with_parent(process: subprocess.Popen):
@@ -35,13 +45,12 @@ def kill_with_parent(process: subprocess.Popen):
     info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
     if not kernel32.SetInformationJobObject(ctypes.c_void_p(job), 9, ctypes.byref(info), ctypes.sizeof(info)):
         raise LauncherError("Não foi possível configurar o Job Object do app-server.")
-    handle = kernel32.OpenProcess(0x0001 | 0x0100, False, process.pid)  # PROCESS_TERMINATE | PROCESS_SET_QUOTA
-    try:
-        if not handle or not kernel32.AssignProcessToJobObject(ctypes.c_void_p(job), ctypes.c_void_p(handle)):
-            raise LauncherError("Não foi possível vincular o app-server a esta janela.")
-    finally:
-        if handle:
-            kernel32.CloseHandle(ctypes.c_void_p(handle))
+    # Raiz primeiro: a partir daí todo processo novo herda o Job. Os que ela já tinha criado antes (o filho nasce
+    # rodando) não herdam; a segunda passada os vincula pela tabela de processos.
+    if not _assign(kernel32, job, process.pid):
+        raise LauncherError("Não foi possível vincular o app-server a esta janela.")
+    for pid in descendants(process.pid):
+        _assign(kernel32, job, pid)
     return job
 
 
