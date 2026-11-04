@@ -26,6 +26,7 @@ from agent_launcher.harnesses import registry
 from agent_launcher.platform import terminal
 from agent_launcher.session.conversations import conversations_for, has_conversation_for
 from agent_launcher.session.window import session_title, start_session
+from agent_launcher.ui.background import deliver
 from agent_launcher.ui.connections import ConnectionsDialog, quota_warning
 from agent_launcher.ui.instructions import InstructionsDialog
 from agent_launcher.ui.theme import GREEN, MUTED, STYLE, CliButton, ElidedLabel, icon
@@ -221,10 +222,10 @@ class InstallCliTask(QRunnable):
     def run(self):
         lines = []
         try:
-            found = clis.ensure(self.cli, log=lines.append, progress=self.signals.progress.emit)
+            found = clis.ensure(self.cli, log=lines.append, progress=lambda fraction, text: deliver(self.signals, "progress", fraction, text))
         except Exception as error:  # falha inesperada também precisa voltar para a tela
             found, lines = None, lines + [f"{type(error).__name__}: {error}"]
-        self.signals.completed.emit(found, "\n".join(lines))
+        deliver(self.signals, "completed", found, "\n".join(lines))
 
 
 class RefreshSignals(QObject):
@@ -251,7 +252,7 @@ class TerminalTask(QRunnable):
             found = terminal.ensure(self.root, log=lines.append)
         except Exception as error:  # falha inesperada também precisa voltar para a tela
             found, lines = None, lines + [str(error)]
-        self.signals.completed.emit(found, "\n".join(lines))
+        deliver(self.signals, "completed", found, "\n".join(lines))
 
 
 class CliCheckTask(QRunnable):
@@ -264,9 +265,9 @@ class CliCheckTask(QRunnable):
     @Slot()
     def run(self):
         try:
-            self.signals.completed.emit(cli_update.check_all(), "")
+            deliver(self.signals, "completed", cli_update.check_all(), "")
         except Exception as error:  # falha inesperada também precisa voltar para a tela
-            self.signals.completed.emit(error, "")
+            deliver(self.signals, "completed", error, "")
 
 
 class CliUpdateTask(QRunnable):
@@ -280,9 +281,9 @@ class CliUpdateTask(QRunnable):
     @Slot()
     def run(self):
         try:
-            self.signals.completed.emit(cli_update.update(self.cli), self.cli)
+            deliver(self.signals, "completed", cli_update.update(self.cli), self.cli)
         except Exception as error:  # falha inesperada também precisa voltar para a tela
-            self.signals.completed.emit(error, self.cli)
+            deliver(self.signals, "completed", error, self.cli)
 
 
 class TerminalUpdateTask(QRunnable):
@@ -296,9 +297,9 @@ class TerminalUpdateTask(QRunnable):
     @Slot()
     def run(self):
         try:
-            self.signals.completed.emit(terminal.update_portable(self.root) or "", "")
+            deliver(self.signals, "completed", terminal.update_portable(self.root) or "", "")
         except Exception as error:  # falha inesperada também precisa voltar para a tela
-            self.signals.completed.emit(error, "")
+            deliver(self.signals, "completed", error, "")
 
 
 class UpdateTask(QRunnable):
@@ -312,9 +313,9 @@ class UpdateTask(QRunnable):
     @Slot()
     def run(self):
         try:
-            self.signals.completed.emit(updater.update(self.root), "")
+            deliver(self.signals, "completed", updater.update(self.root), "")
         except Exception as error:  # rede, integridade ou instalador: volta para a tela/diagnóstico
-            self.signals.completed.emit(error, "")
+            deliver(self.signals, "completed", error, "")
 
 
 class RefreshTask(QRunnable):
@@ -331,9 +332,9 @@ class RefreshTask(QRunnable):
             store = Store(self.home)
             gateway = Gateway(store, store.find_connection(self.connection))
             catalog = gateway.catalog(refresh=self.force)
-            self.signals.completed.emit(catalog, self.connection)
+            deliver(self.signals, "completed", catalog, self.connection)
         except Exception as error:
-            self.signals.completed.emit(error, self.connection)
+            deliver(self.signals, "completed", error, self.connection)
 
 
 class CleanupTask(QRunnable):
@@ -350,10 +351,10 @@ class CleanupTask(QRunnable):
     def run(self):
         try:
             from agent_launcher.harnesses.cleanup import cleanup_profile
-            self.signals.completed.emit((self.cleanup or cleanup_profile)(self.home, lambda *_: True), "")
+            deliver(self.signals, "completed", (self.cleanup or cleanup_profile)(self.home, lambda *_: True), "")
         except Exception as error:  # volta para a tela como aviso, nunca derruba a thread
             from agent_launcher.harnesses.cleanup import failure
-            self.signals.completed.emit([failure("Limpeza nos destinos", error)], "")
+            deliver(self.signals, "completed", [failure("Limpeza nos destinos", error)], "")
 
 
 class UsageTask(QRunnable):
@@ -368,9 +369,9 @@ class UsageTask(QRunnable):
     def run(self):
         try:
             from agent_launcher.domain.usage import usage_report
-            self.signals.completed.emit(usage_report(self.home, self.month), "")
+            deliver(self.signals, "completed", usage_report(self.home, self.month), "")
         except Exception as error:  # volta para a tela como erro, nunca derruba a thread
-            self.signals.completed.emit(error, "")
+            deliver(self.signals, "completed", error, "")
 
 
 def usage_rows(report: dict) -> list[tuple[str, str, str, str, str]]:

@@ -15,6 +15,7 @@ from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
 from agent_launcher.endpoint import registry as endpoint_registry
+from agent_launcher.ui.background import deliver
 
 
 def _label(text: str, role: str = "") -> QLabel:
@@ -50,10 +51,10 @@ class _Task(QRunnable):
     @Slot()
     def run(self):
         try:
-            self.signals.done.emit(self.job(), "")
+            deliver(self.signals, "done", self.job(), "")
         except Exception as error:
             self.failure = error
-            self.signals.done.emit(None, str(error))
+            deliver(self.signals, "done", None, str(error))
 
 
 def cause_of(task, kind: type):
