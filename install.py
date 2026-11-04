@@ -230,7 +230,7 @@ def create_shortcuts(target, pythonw, only_existing=False):
     automática renova o ícone e o AppUserModelID sem recriar o que o usuário apagou nem trocar a identidade do fixado)."""
     powershell(_SHORTCUTS, {"AL_ONLY_EXISTING": "1" if only_existing else "", "AL_NAME": SHORTCUT, "AL_PYTHONW": str(pythonw), "AL_SCRIPT": str(target / "launcher.pyw"),
                             "AL_DIR": str(target), "AL_ICON": str(target / "assets" / "launcher.ico"),
-                            "AL_DESCRIPTION": f"{APP_NAME}: Claude Code e Codex em qualquer provedor",
+                            "AL_DESCRIPTION": f"{APP_NAME}: Claude Code, Codex, Copilot CLI, VS Code e Copilot app em qualquer provedor",
                             "AL_APPID": APP_USER_MODEL_ID, "AL_TYPE": _APP_ID_TYPE})
 
 
@@ -376,11 +376,19 @@ def main():
     parser.add_argument("--no-file-association", action="store_true",
                         help=f"não associa os arquivos {FILE_EXTENSION} (perfil) ao launcher")
     parser.add_argument("--no-terminal", action="store_true", help="não instala o Windows Terminal quando ele falta")
-    parser.add_argument("--no-clis", action="store_true", help="não instala Claude Code e Codex quando faltam")
+    parser.add_argument("--with-clis", nargs="?", const="claude,codex", default="", metavar="LISTA",
+                        help="instala também os CLIs pedidos quando faltam (ex.: claude,codex,copilot; sem lista: "
+                             "claude,codex). Sem esta opção nenhuma ferramenta é instalada: cada uma se instala pelo "
+                             "cartão dela no launcher")
+    parser.add_argument("--no-clis", action="store_true", help=argparse.SUPPRESS)  # aceita a chamada do atualizador 1.2.x
     parser.add_argument("--terminal-zip", type=Path,
                         help="ZIP do Windows Terminal entregue pela TI (sem acesso ao GitHub); instala em modo portátil")
     parser.add_argument("--uninstall", action="store_true", help="remove a instalação e os atalhos (mantém os dados)")
     args = parser.parse_args()
+    wanted = [name.strip() for name in args.with_clis.split(",") if name.strip()]
+    unknown = [name for name in wanted if name not in clis.NAMES]
+    if unknown:
+        parser.error(f"--with-clis: {', '.join(unknown)} não é CLI conhecido (use {', '.join(clis.NAMES)}).")
     target = args.target.resolve()
     if target == SOURCE or target.is_relative_to(SOURCE) or SOURCE.is_relative_to(target):
         raise SystemExit("O destino não pode ser a pasta de origem, ficar dentro dela nem contê-la.")
@@ -445,11 +453,12 @@ def main():
     if not args.no_terminal:
         # Etapa à parte: sem Terminal o launcher funciona (consoles separados), então a falha avisa e não desfaz nada.
         terminal.ensure(target, args.terminal_zip.resolve() if args.terminal_zip else None)
-    if not args.no_clis:
+    for cli in wanted:
         # Instaladores oficiais por usuário; como o Terminal, a falha avisa e não desfaz a instalação do launcher.
-        for cli in ("claude", "codex"):  # os outros destinos (Copilot CLI, VS Code...) são opcionais: pela interface
-            clis.ensure(cli)
-    print(f"{APP_NAME} pronto." + ("" if args.no_shortcuts else f" Abra pelo atalho '{APP_NAME}' no Menu Iniciar ou na Área de Trabalho."))
+        clis.ensure(cli)
+    print(f"{APP_NAME} pronto." + ("" if args.no_shortcuts else f" Abra pelo atalho '{APP_NAME}' no Menu Iniciar ou na Área de Trabalho.")
+          + ("" if wanted else " As ferramentas (Claude Code, Codex, Copilot CLI, VS Code, Copilot app) se instalam pelo "
+                               "cartão de cada uma, na tela do launcher."))
 
 
 if __name__ == "__main__":

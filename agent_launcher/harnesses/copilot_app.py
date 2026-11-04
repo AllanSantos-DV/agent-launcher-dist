@@ -18,6 +18,7 @@ from pathlib import Path
 
 from agent_launcher.domain.catalog import Catalog, ModelInfo, prefers_responses, token_label
 from agent_launcher.domain.errors import LauncherError
+from agent_launcher.harnesses import installers
 from agent_launcher.harnesses.base import Harness
 from agent_launcher.platform import terminal
 
@@ -261,11 +262,14 @@ class CopilotApp(Harness):
     SYMBOL = "app"
     PREVIEW = True
     SESSION_HINT = "Provider da conexão no app"
-    MISSING_HINT = "Instale o GitHub Copilot app (github.com/features/copilot) e abra de novo."
+    MISSING_HINT = "Instale pelo cartão do Copilot app no launcher (ou em github.com/github/app) e abra de novo."
 
     def find_executable(self) -> str | None:
         executable = app_executable()
         return str(executable) if executable.is_file() else None
+
+    def install_steps(self) -> list:
+        return installers.steps(self.ID)
 
     def eligible(self, record: ModelInfo, catalog: Catalog) -> bool:
         if not record.chat or record.tools is False:

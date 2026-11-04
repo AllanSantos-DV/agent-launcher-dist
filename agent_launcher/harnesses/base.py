@@ -139,7 +139,7 @@ class Harness:
     BYPASS_HINT = "Sem pedir permissão"
     PREVIEW = False                 # destino em prévia (o fabricante ainda chama de preview)
     SESSION_HINT = "Terminal com título do projeto"
-    MISSING_HINT = ""               # como instalar, quando o launcher não instala sozinho
+    MISSING_HINT = ""               # como instalar à mão
     SCRUB = frozenset()             # variáveis herdadas que saem do ambiente da sessão (além das genéricas)
     SCRUB_PREFIXES: tuple = ()
     EXECUTABLE = ""                 # nome no PATH
@@ -157,7 +157,8 @@ class Harness:
         return next((str(path) for path in self.native_paths() if path.is_file()), None)
 
     def install_steps(self) -> list:
-        """[(rótulo, função sem argumentos)] em ordem; vazio = o launcher não instala este destino."""
+        """[(rótulo, função(progress))] em ordem; vazio = o launcher não instala este destino.
+        `progress(fração entre 0 e 1 ou None quando não há como medir, texto curto)`."""
         return []
 
     # Conexão e modelos

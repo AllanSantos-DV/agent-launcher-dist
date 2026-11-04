@@ -9,15 +9,17 @@ você escolher. Este texto cobre o uso do dia a dia.
 npx @allansantos-dev/agent-launcher@latest install
 ```
 
-O instalador copia o app para `%LOCALAPPDATA%\Programs\AgentLauncher`, instala o que faltar (Windows Terminal, Claude
-Code, Codex) e cria o atalho **Agent Launcher** no Menu Iniciar e na Área de Trabalho. Opções úteis: `--no-clis`,
-`--no-terminal`, `--terminal-zip CAMINHO`, `--no-shortcuts`.
+O instalador copia o app para `%LOCALAPPDATA%\Programs\AgentLauncher`, instala o Windows Terminal se faltar e cria o
+atalho **Agent Launcher** no Menu Iniciar e na Área de Trabalho. As ferramentas se instalam sob demanda, pelo cartão de
+cada uma. Opções úteis: `--with-clis` (Claude Code e Codex já na instalação), `--no-terminal`, `--terminal-zip CAMINHO`,
+`--no-shortcuts`.
 
 - **Atualização automática.** A interface confere a versão a cada abertura e, havendo uma nova, se atualiza sozinha e
   reinicia em seguida. As sessões abertas continuam. Para desligar, use **Atualizar automaticamente** no menu de opções.
   Para atualizar na hora: `launcher update` (`--check` só consulta).
-- **CLIs.** Cada botão de CLI mostra a versão instalada e oferece **Instalar** ou **Atualizar** quando for o caso. Não
-  é preciso fazer login no Claude Code nem no Codex: a chave vem da conexão. Modo texto: `launcher cli`.
+- **Ferramentas.** Cartão desligado é ferramenta não instalada: um clique instala, por usuário e sem admin, com a barra
+  e o ícone mostrando o progresso. Cartão pronto mostra a versão e oferece **Atualizar** quando for o caso. Não é
+  preciso fazer login no Claude Code nem no Codex: a chave vem da conexão. Modo texto: `launcher cli`.
 - **Windows Terminal.** Se a máquina não tem o Terminal, o instalador o instala sem admin. Se tudo for bloqueado, as
   sessões abrem em consoles separados. `launcher terminal` mostra o que foi encontrado.
 - **Desinstalar:** `npx @allansantos-dev/agent-launcher@latest install --uninstall`. Remove o app e os atalhos; seus

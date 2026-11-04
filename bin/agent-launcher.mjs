@@ -19,7 +19,8 @@ const PYTHON_DIR = join(RUNTIME_DIR, "python");
 const USAGE = `Uso: npx @allansantos-dev/agent-launcher@latest install [opções]
 
 Instala ou atualiza o Agent Launcher para este usuário do Windows (sem admin). Rode de novo com @latest para atualizar.
-Opções: --no-clis, --no-terminal, --terminal-zip CAMINHO, --no-shortcuts, --target PASTA, --uninstall`;
+Instala só o launcher; cada ferramenta (Claude Code, Codex, Copilot CLI, VS Code, Copilot app) se instala pelo cartão dela.
+Opções: --with-clis [claude,codex,copilot], --no-terminal, --terminal-zip CAMINHO, --no-shortcuts, --target PASTA, --uninstall`;
 
 class Failure extends Error {}
 

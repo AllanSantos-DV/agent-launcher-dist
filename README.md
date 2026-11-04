@@ -14,8 +14,9 @@ Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). Para Win
 
 - Windows 10 ou 11 (x64) e Node.js 18 ou superior (para o `npx`). Não precisa de Python nem de administrador: o
   instalador prepara um Python só para o Agent Launcher, isolado do resto da máquina.
-- Claude Code e Codex são instalados automaticamente se faltarem (instaladores oficiais, por usuário). O Codex precisa
-  de um host com a API **Responses**: ele não aceita `/chat/completions`.
+- O pacote leva só o launcher. Cada ferramenta (Claude Code, Codex, Copilot CLI, VS Code, Copilot app) se instala sob
+  demanda, pelo cartão dela na tela, por usuário e sem admin. O Codex precisa de um host com a API **Responses**: ele
+  não aceita `/chat/completions`.
 
 ## Instalar
 
@@ -23,10 +24,12 @@ Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). Para Win
 npx @allansantos-dev/agent-launcher@latest install
 ```
 
-O instalador copia o app para `%LOCALAPPDATA%\Programs\AgentLauncher`, cria o ambiente com PySide6, instala o que
-faltar (Windows Terminal, Claude Code, Codex) e coloca o atalho **Agent Launcher** no Menu Iniciar e na Área de
-Trabalho. O atalho abre a interface direto, sem janela de console. Opções úteis: `--no-clis`, `--no-terminal`,
-`--terminal-zip CAMINHO`, `--no-shortcuts`.
+O instalador copia o app para `%LOCALAPPDATA%\Programs\AgentLauncher`, cria o ambiente com PySide6, instala o Windows
+Terminal se faltar e coloca o atalho **Agent Launcher** no Menu Iniciar e na Área de Trabalho. O atalho abre a interface
+direto, sem janela de console. Nenhuma ferramenta é instalada sem pedido: quem quiser os CLIs já na instalação usa
+`--with-clis` (Claude Code e Codex) ou `--with-clis claude,codex,copilot`. Outras opções: `--no-terminal`,
+`--terminal-zip CAMINHO`, `--no-shortcuts`. Quem já usa o launcher não perde nada: as ferramentas instaladas continuam
+lá e aparecem prontas.
 
 ### Atualização automática
 
@@ -48,12 +51,24 @@ novo o comando de instalação acima.
 Desinstalar: `npx @allansantos-dev/agent-launcher@latest install --uninstall`. Remove o app e os atalhos; seus dados
 ficam em `~/.agent-launcher`.
 
-### Claude Code e Codex
+### Instalar as ferramentas
 
-Quando um dos dois falta, o instalador usa o instalador oficial do fabricante, por usuário e sem admin
-(`claude.ai/install.ps1` e `chatgpt.com/codex/install.ps1`, ambos conferem o SHA-256 do binário). Se ele for
-bloqueado, tenta `npm install -g`. Depois disso a interface também oferece **Instalar** ao lado do CLI que faltar, e
-o modo texto tem `launcher cli --install claude|codex|all`. Não é preciso fazer login nos CLIs: a chave vem da conexão.
+Cartão de ferramenta que ainda não está instalada aparece desligado, com o ícone claro e "Não instalado · clique para
+instalar". Um clique instala, por usuário e sem admin, uma ferramenta por vez:
+
+| Ferramenta | Caminho de instalação | Progresso |
+| --- | --- | --- |
+| Claude Code | instalador oficial (`claude.ai/install.ps1`), depois `npm install -g` | indeterminado até concluir |
+| Codex | instalador oficial (`chatgpt.com/codex/install.ps1`), depois `npm install -g` | indeterminado até concluir |
+| Copilot CLI | `npm install -g @github/copilot`, depois winget | indeterminado até concluir |
+| VS Code | instalador de usuário baixado da API de update da Microsoft, com SHA-256 e assinatura conferidos, depois winget | proporcional no download |
+| Copilot app | instalador da última release de `github/app`, com SHA-256 e assinatura conferidos, depois winget | proporcional no download |
+
+Durante a instalação a barra do cartão cresce e o ícone vai sendo pintado. Onde o próprio launcher baixa o instalador,
+a barra acompanha os bytes; onde o instalador oficial roda em silêncio, não há porcentagem e a barra corre de um lado a
+outro até o fim. Falha aparece na faixa de erros com o motivo e fica em `~/.agent-launcher/cli-install.log`. No modo
+texto: `launcher cli --install claude|codex|copilot|vscode|copilot_app|all` (`all` = os três CLIs de terminal), e
+abrir sessão de uma ferramenta que falta pergunta se instala. Não é preciso fazer login nos CLIs: a chave vem da conexão.
 
 **Atualização das CLIs.** Cada botão de CLI mostra a versão instalada (`--version`) e, quando o registro do npm tem uma mais
 nova, a faixa de avisos (informativa, separada da de erros) diz "Codex 0.164.0 disponível (instalada 0.162.1)" e aparece **Atualizar Codex 0.162.1 → 0.164.0**.
@@ -101,9 +116,9 @@ ou Entra ID, Store removida ou restrita, MSIX por usuário bloqueado, winget des
 | VS Code | janela do VS Code no perfil **Agent Launcher** | os três, pelo endpoint local | não precisa |
 | GitHub Copilot app | o app, com o provider **Agent Launcher — conexão** | Responses (GPT-5 em diante) e Chat Completions, pelo endpoint local | o app pede conta GitHub |
 
-Os três de terminal recebem a conexão só no ambiente do processo da sessão: nada é gravado na configuração deles. O
-Copilot CLI e o Copilot app não vêm no instalador; a interface oferece **Instalar** para o Copilot CLI (npm ou winget,
-por usuário). Claude Code e Codex têm sessão controlada pelo orquestrador; o Copilot CLI ainda não.
+Os três de terminal recebem a conexão só no ambiente do processo da sessão: nada é gravado na configuração deles. Todos
+se instalam pelo cartão (veja [Instalar as ferramentas](#instalar-as-ferramentas)). Claude Code e Codex têm sessão
+controlada pelo orquestrador; o Copilot CLI ainda não.
 
 **VS Code e Copilot app guardam a configuração**, então nunca recebem a chave nem o endereço real do host. Eles
 apontam para o **endpoint local** da conexão, um processo oculto do launcher que escuta só em `127.0.0.1` (porta fixa
@@ -399,7 +414,7 @@ caminho.
 
 ```powershell
 launcher                       # menu de texto
-launcher doctor                # CLIs + todas as conexões, sem gerar tokens
+launcher doctor                # ferramentas + todas as conexões, sem gerar tokens (nenhuma ferramenta é normal)
 launcher projects add "C:\meus projetos\app" --name "Meu app"
 launcher projects edit "Meu app" --name "App" --path "D:\app"   # só o cadastro muda
 launcher projects import "C:\caminho\config.json"   # só nomes e caminhos
@@ -409,7 +424,7 @@ launcher launch --project "Meu app" --resume
 launcher launch --project "Meu app" --cli copilot --model "vertex_ai.anthropic.claude-sonnet-5-5"
 launcher launch --project "Meu app" --cli vscode --model "azure.gpt-5.4-mini"   # ou --cli copilot_app
 launcher endpoint                # endpoint local de cada conexão (start, stop, autostart [--off])
-launcher cli --install copilot   # Copilot CLI por usuário (npm ou winget)
+launcher cli --install vscode    # qualquer ferramenta por usuário: claude, codex, copilot, vscode, copilot_app
 launcher cli --update all        # atualiza as CLIs instaladas (adia com sessão aberta)
 launcher update                # atualiza agora pelo engine-registry (--check só consulta)
 launcher topmost on --title "Jarvis"   # janela sempre por cima (off, resume, status)

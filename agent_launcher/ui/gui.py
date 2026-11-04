@@ -35,9 +35,7 @@ from version import APP_NAME, APP_USER_MODEL_ID, VERSION
 
 def installed_path(cli: str) -> str | None:
     """Executável do destino (CLIs de terminal pelo módulo de instalação, que os testes substituem)."""
-    if cli in clis.NAMES:
-        return clis.find(cli)
-    return registry.get(cli).find_executable()
+    return clis.locate(cli)
 
 
 def model_name(identifier: str) -> str:
@@ -212,25 +210,30 @@ class ConversationsDialog(QDialog):
 
 
 class InstallCliTask(QRunnable):
-    """Instala o CLI fora da thread da interface (download de centenas de MB)."""
+    """Instala a ferramenta fora da thread da interface (download de centenas de MB), relatando o progresso."""
 
     def __init__(self, cli: str):
         super().__init__()
         self.cli = cli
-        self.signals = RefreshSignals()
+        self.signals = InstallSignals()
 
     @Slot()
     def run(self):
         lines = []
         try:
-            found = clis.ensure(self.cli, log=lines.append) if self.cli in clis.NAMES else None
+            found = clis.ensure(self.cli, log=lines.append, progress=self.signals.progress.emit)
         except Exception as error:  # falha inesperada também precisa voltar para a tela
-            found, lines = None, lines + [str(error)]
+            found, lines = None, lines + [f"{type(error).__name__}: {error}"]
         self.signals.completed.emit(found, "\n".join(lines))
 
 
 class RefreshSignals(QObject):
     completed = Signal(object, str)
+
+
+class InstallSignals(QObject):
+    completed = Signal(object, str)
+    progress = Signal(object, str)
 
 
 class TerminalTask(QRunnable):
@@ -495,6 +498,7 @@ class LauncherWindow(QMainWindow):
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.check_sessions)
         self.refresh_timer.start(1500)
+        QApplication.instance().applicationStateChanged.connect(self.recheck_tools)
         self.shortcuts = []
         for sequence, callback in (("Ctrl+K", self.project_search.setFocus), ("Ctrl+F", self.model_search.setFocus),
                                    ("Ctrl+N", self.add_project), ("F5", lambda: self.refresh_catalog(True))):
@@ -673,7 +677,7 @@ class LauncherWindow(QMainWindow):
             widget = CliButton(harness.LABEL + (" (prévia)" if harness.PREVIEW else ""), harness.SUBTITLE, harness.SYMBOL)
             self.cli_group.addButton(widget)
             self.cli_buttons[harness.ID] = widget
-            widget.clicked.connect(lambda checked=False, chosen=harness.ID: self.select_cli(chosen))
+            widget.clicked.connect(lambda checked=False, chosen=harness.ID: self.choose_card(chosen))
             cli_row.addWidget(widget, index // 3, index % 3)
         self.cli_buttons["claude"].setChecked(True)
         body.addLayout(cli_row)
@@ -1098,8 +1102,7 @@ class LauncherWindow(QMainWindow):
             self.show_error(str(error))
         self.address_label.setText(self.gateway.url if self.gateway else "Nenhuma conexão")
         self.address_label.setToolTip(self.gateway.url if self.gateway else "")
-        for cli, widget in self.cli_buttons.items():
-            widget.setEnabled(bool(self.gateway and cli in self.gateway.clis))
+        self.refresh_card_states()
         if not self.gateway:
             self.connection.setText("Sem conexão")
             self.connection.setProperty("offline", True)
@@ -1108,7 +1111,8 @@ class LauncherWindow(QMainWindow):
         else:
             self.connection.setText("Verificando conexão…")
         preferred = self.store.last_cli(self.project) if self.project else self.cli
-        available = [cli for cli in registry.ids() if self.gateway and cli in self.gateway.clis] or ["claude"]
+        served = [cli for cli in registry.ids() if self.gateway and cli in self.gateway.clis]
+        available = [cli for cli in served if self.cli_buttons[cli].installed] or served or ["claude"]
         self.select_cli(preferred if preferred in available else available[0])
         if self.gateway and self.auto_refresh:
             QTimer.singleShot(0, self.refresh_catalog)
@@ -1124,10 +1128,41 @@ class LauncherWindow(QMainWindow):
         known = {connection["id"] for connection in self.store.connections}
         self.populate_connections(current if current in known else None)
 
+    def refresh_card_states(self):
+        """Cartão desligado pode instalar; o instalado só fica habilitado se a conexão serve aquela ferramenta."""
+        for cli, widget in self.cli_buttons.items():
+            if not widget.installing:
+                widget.set_installed(installed_path(cli) is not None)
+            widget.setEnabled(not widget.installed or bool(self.gateway and cli in self.gateway.clis))
+
+    @Slot(Qt.ApplicationState)
+    def recheck_tools(self, state):
+        """Ao voltar para o launcher, ferramenta instalada ou removida por fora aparece no cartão."""
+        if state == Qt.ApplicationState.ApplicationActive:
+            self.refresh_card_states()
+            self.update_actions()
+
+    def choose_card(self, cli):
+        """Cartão de ferramenta pronta seleciona; o de ferramenta que falta (e que o launcher instala) instala."""
+        widget = self.cli_buttons[cli]
+        if widget.installed or not registry.get(cli).install_steps():
+            self.select_cli(cli)
+        elif self.installing_cli and self.installing_cli != cli:
+            self.show_info(f"Aguarde o fim da instalação do {registry.get(self.installing_cli).LABEL}: uma ferramenta "
+                           "por vez.", origin="cli:instalacao")
+        elif not self.installing_cli:
+            self.select_cli(cli)
+            self.install_cli(cli)
+
     def select_cli(self, cli):
         self.cli = cli
         self.bypass_checkbox.setChecked(self.bypass_default)
-        self.cli_buttons[cli].setChecked(True)
+        if self.cli_buttons[cli].isCheckable():
+            self.cli_buttons[cli].setChecked(True)
+        elif self.cli_group.checkedButton():
+            self.cli_group.setExclusive(False)  # grupo exclusivo não desmarca o último marcado
+            self.cli_group.checkedButton().setChecked(False)
+            self.cli_group.setExclusive(True)
         self.selected_model = None
         self.model_search.blockSignals(True)
         self.model_search.clear()
@@ -1198,9 +1233,9 @@ class LauncherWindow(QMainWindow):
         harness = registry.get(self.cli)
         missing = installed_path(self.cli) is None
         installable = bool(harness.install_steps())
-        self.install_cli_button.setVisible((missing and installable) or self.installing_cli)
+        self.install_cli_button.setVisible(bool((missing and installable) or self.installing_cli))
         self.install_cli_button.setEnabled(not self.installing_cli)
-        self.install_cli_button.setText(f"Instalando {harness.LABEL}…" if self.installing_cli
+        self.install_cli_button.setText(f"Instalando {registry.get(self.installing_cli).LABEL}…" if self.installing_cli
                                         else f"Instalar {harness.LABEL}")
         found = self.cli_versions.get(self.cli) if harness.KIND == "terminal" else None
         self.update_cli_button.setVisible(bool(found and found["newer"]) or self.cli_updating == self.cli)
@@ -1224,7 +1259,8 @@ class LauncherWindow(QMainWindow):
         self.bypass_checkbox.setToolTip(description)
         self.bypass_checkbox.setAccessibleDescription(description)
         self.session_hint.setText(harness.BYPASS_HINT if bypass else
-                                  harness.MISSING_HINT if missing and not installable else harness.SESSION_HINT)
+                                  f"{harness.LABEL} não instalado: clique no cartão dele para instalar." if missing and installable else
+                                  harness.MISSING_HINT if missing else harness.SESSION_HINT)
         self.session_hint.setToolTip(description if bypass else
                                      session_title(self.project, self.cli, self.store.home) if self.project else "Selecione um projeto")
         self.session_hint.setProperty("bypass", bypass)
@@ -1354,25 +1390,41 @@ class LauncherWindow(QMainWindow):
         if terminal.find(ROOT) is None:
             self.ensure_terminal(opened_in_console=True)
 
-    def install_cli(self):
+    def install_cli(self, cli=None):
         if self.installing_cli:
             return
-        self.installing_cli = True
-        self.set_footer("instalacao", f"Instalando {registry.get(self.cli).LABEL} sem admin…", busy=True)
+        cli = cli or self.cli
+        self.installing_cli = cli
+        self.clear_info("cli:instalacao")
+        self.cli_buttons[cli].set_progress(None, "Preparando")
+        self.set_footer("instalacao", f"Instalando {registry.get(cli).LABEL} sem admin…", busy=True)
         self.update_actions()
-        self.install_task = InstallCliTask(self.cli)
+        self.install_task = InstallCliTask(cli)
+        self.install_task.signals.progress.connect(self.show_install_progress)
         self.install_task.signals.completed.connect(self.finish_install_cli)
         QThreadPool.globalInstance().start(self.install_task)
 
     @Slot(object, str)
+    def show_install_progress(self, fraction, stage):
+        if self.installing_cli:
+            self.cli_buttons[self.installing_cli].set_progress(fraction, stage)
+
+    @Slot(object, str)
     def finish_install_cli(self, found, log):
+        cli = self.installing_cli or self.cli
         self.installing_cli = False
+        self.cli_buttons[cli].finish_install(bool(found))
         if found:
             self.clear_error("cli:instalacao")
             self.set_footer("instalacao", f"Instalado: {found}")
+            self.refresh_card_states()
+            if cli == self.cli:
+                self.select_cli(cli)
+            if cli in clis.NAMES:
+                self.start_cli_check()
         else:
             self.set_footer("instalacao", "A instalação não terminou; o motivo está no aviso acima.")
-            self.show_error(log or "Não foi possível instalar o CLI.", origin="cli:instalacao")
+            self.show_error(log or f"Não foi possível instalar o {registry.get(cli).LABEL}.", origin="cli:instalacao")
         self.update_actions()
 
     def check_sessions(self):
@@ -1875,10 +1927,15 @@ class LauncherWindow(QMainWindow):
                  "Estado: " + ("respondeu" if self.online else "não confirmado"),
                  "Windows Terminal: " + (terminal.find(ROOT) or "ausente (sessões em consoles separados)"),
                  "Atualização automática: " + self.update_status, ""]
+        found_any = False
         for harness in registry.all():
             found = installed_path(harness.ID)
+            found_any = found_any or bool(found)
             lines.append(f"{harness.LABEL}: encontrado\n{found}" if found else
+                         f"{harness.LABEL}: não instalado. Instale pelo cartão dele." if harness.install_steps() else
                          f"{harness.LABEL}: não encontrado. {harness.MISSING_HINT}".rstrip())
+        if not found_any:
+            lines.append("Nenhuma ferramenta instalada ainda: normal numa instalação nova.")
         lines.extend(f"Adaptador do usuário não carregado: {error}" for error in registry.errors())
         quota = self.quota_mark()
         lines.extend(["", self.catalog.status if self.catalog else "Sem catálogo.", "",

@@ -306,6 +306,8 @@ def launch(store: Store, project: dict, gateway: Gateway, cli: str, model: str, 
     except LauncherError as error:
         catalog = gateway.empty_catalog(status=str(error))
     harness = registry.get(cli)
+    if not dry_run and clis.locate(cli) is None and harness.install_steps():
+        offer_install(cli)
     if harness.KIND != "terminal":
         if dry_run:
             print(json.dumps(harness.preview(store, project, gateway, model, catalog), ensure_ascii=False, indent=2))
@@ -364,6 +366,17 @@ def confirm_in_console(question: str) -> bool:
     return ask(f"{question} (s/n)", "n").lower() in ("s", "sim", "y", "yes")
 
 
+def offer_install(cli: str) -> None:
+    """Ferramenta que falta: no console pergunta se instala agora; sem console (ou com "não"), explica como instalar."""
+    missing = (f"{label_of(cli)} não está instalado. Instale pelo cartão dele na interface ou com: "
+               f"launcher.py cli --install {cli}")
+    if not (sys.stdin and sys.stdin.isatty()) or not confirm_in_console(f"{label_of(cli)} não está instalado. "
+                                                                        "Instalar agora, sem admin?"):
+        raise LauncherError(missing)
+    if not clis.ensure(cli):
+        raise LauncherError(missing)
+
+
 def confirm_flagged(question: str) -> bool:
     """--clean-destinations já é o pedido explícito: mostra o que vai acontecer e segue."""
     print(question.replace("\n\n", " "))
@@ -392,20 +405,24 @@ def doctor(store: Store, reference: str | None = None) -> int:
     failed = False
     installed = 0
     for harness in registry.all():
+        found = clis.locate(harness.ID)
+        if not found:
+            print(f"  [--] {harness.LABEL} não instalado" + (f" (instale pelo cartão ou 'cli --install {harness.ID}')."
+                                                            if harness.install_steps() else "."))
+            continue
         if harness.KIND == "terminal":
             try:
-                command = harness.command()
-                installed += 1
-                print(f"  [OK] {harness.ID}: {command[-1]}")
+                found = harness.command()[-1]
             except LauncherError as error:
                 print(f"  [AVISO] {error}")
-        else:
-            found = harness.find_executable()
-            print(f"  [OK] {harness.ID}: {found}" if found else f"  [--] {harness.LABEL} não encontrado (opcional).")
+                continue
+        installed += 1
+        print(f"  [OK] {harness.ID}: {found}")
     for error in registry.errors():
         print(f"  [AVISO] adaptador do usuário não carregado: {error}")
     if not installed:
-        failed = True
+        print("  [--] Nenhuma ferramenta instalada ainda: normal numa instalação nova. Cada uma se instala pelo cartão "
+              "dela na interface.")
     wt = terminal.find(ROOT)
     print(f"  [OK] Windows Terminal: {wt}" if wt else
           "  [AVISO] Windows Terminal ausente: sessões em consoles separados. Use 'terminal --install'.")
@@ -544,7 +561,9 @@ def menu(store: Store) -> int:
                 cli = choose_cli(gateway, store.last_cli(project), ("terminal", "ide", "app"))
                 if not cli:
                     continue
-                if registry.get(cli).KIND == "terminal":
+                if clis.locate(cli) is None and registry.get(cli).install_steps():
+                    offer_install(cli)
+                elif registry.get(cli).KIND == "terminal":
                     registry.get(cli).command()  # erra antes da lista de modelos se o CLI não estiver instalado
                 model = choose_model(gateway, cli, store.last_model(project, connection, cli))
                 if model:
@@ -612,7 +631,7 @@ def usage_command(store, options) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description=f"{APP_NAME}: Claude Code e Codex em provedores compatíveis.")
+    result = argparse.ArgumentParser(description=f"{APP_NAME}: Claude Code, Codex, Copilot CLI, VS Code e Copilot app em provedores compatíveis.")
     result.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
     result.add_argument("--profile", metavar="ID_OU_NOME",
                         help="Perfil de trabalho (id ou nome); omitido usa o padrão")
@@ -675,9 +694,11 @@ def parser() -> argparse.ArgumentParser:
     remove.add_argument("reference", help="Nome, ID ou caminho")
     legacy = actions.add_parser("import", help="Importar nomes e caminhos de outro config.json")
     legacy.add_argument("source", type=Path)
-    cli_command = commands.add_parser("cli", help="CLIs de terminal (Claude Code, Codex, Copilot CLI): situação e instalação por usuário, sem admin")
-    cli_command.add_argument("--install", choices=(*clis.NAMES, "all"),
-                             help="instala o CLI que falta (instalador oficial, npm ou winget)")
+    cli_command = commands.add_parser("cli", help="Ferramentas (Claude Code, Codex, Copilot CLI, VS Code, Copilot app): "
+                                                  "situação e instalação por usuário, sem admin")
+    cli_command.add_argument("--install", choices=(*clis.installable(), "all"),
+                             help="instala a ferramenta que falta (instalador oficial, npm ou winget); "
+                                  "all = os três CLIs de terminal")
     cli_command.add_argument("--update", choices=(*clis.NAMES, "all"),
                              help="atualiza o CLI instalado (o `update` da própria CLI, npm ou winget; adia com sessão aberta)")
     endpoint = commands.add_parser("endpoint", help="Endpoint local das conexões (VS Code e Copilot app): situação, "
@@ -882,9 +903,9 @@ def main(arguments: list[str] | None = None) -> int:
                 return 0 if all(clis.ensure(cli) for cli in targets) else 1
             if options.update:
                 return update_clis(tuple(clis.NAMES) if options.update == "all" else (options.update,))
-            for cli in clis.NAMES:
-                print(f"{clis.NAMES[cli]}: {clis.find(cli) or 'não instalado'}")
-                found = cli_update.check(cli) if clis.find(cli) else None
+            for cli in clis.installable():
+                print(f"{clis.label(cli)}: {clis.locate(cli) or 'não instalado'}")
+                found = cli_update.check(cli) if cli in clis.NAMES and clis.find(cli) else None
                 if found:
                     print("  " + describe_cli_version(found))
         elif options.action == "terminal":

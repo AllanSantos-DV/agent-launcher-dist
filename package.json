@@ -1,7 +1,7 @@
 {
   "name": "@allansantos-dev/agent-launcher",
-  "version": "1.2.12",
-  "description": "Opens Claude Code and Codex in your projects through any model provider: LiteLLM, 9router, OmniRoute, OpenRouter, Anthropic, OpenAI or any compatible host. Windows.",
+  "version": "1.3.0",
+  "description": "Opens Claude Code, Codex, Copilot CLI, VS Code and the Copilot app in your projects through any model provider: LiteLLM, 9router, OmniRoute, OpenRouter, Anthropic, OpenAI or any compatible host. Ships only the launcher; each tool installs on demand from its card. Windows.",
   "license": "MIT",
   "author": "Allan Santos",
   "homepage": "https://allansantos-dv.github.io/agent-launcher/",

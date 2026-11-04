@@ -1,4 +1,4 @@
-"""CLIs de terminal: onde ficam as instalações por usuário e como instalá-los sem admin.
+"""Ferramentas (CLIs de terminal, VS Code, Copilot app): onde ficam as instalações por usuário e como instalá-las sem admin.
 
 Ordem (nenhuma exige admin):
   1. Instalador oficial do fabricante, por usuário; o script confere o SHA-256 do binário e o launcher confere de novo a
@@ -9,10 +9,21 @@ Ordem (nenhuma exige admin):
   3. winget, por usuário, para quem o publica (GitHub Copilot CLI: GitHub.Copilot).
 Os instaladores oficiais acrescentam a pasta ao PATH do usuário, mas o processo atual não vê a mudança: por isso
 native_paths() é consultado além do PATH.
+
+VS Code e GitHub Copilot app (DOWNLOADS): o launcher baixa o instalador oficial por usuário (progresso real do download),
+confere o SHA-256 publicado pelo fabricante e a assinatura Authenticode, e roda em silêncio; winget por usuário depois.
+  VS Code: update.code.visualstudio.com/api/update/win32-x64-user/stable/latest (URL e sha256hash), Inno Setup
+  /VERYSILENT /NORESTART /MERGETASKS=!runcode -> %LOCALAPPDATA%\\Programs\\Microsoft VS Code
+  Copilot app: api.github.com/repos/github/app/releases/latest (asset GitHub-Copilot-windows-x64-setup.exe e o digest
+  sha256 do asset), NSIS /S -> %LOCALAPPDATA%\\Programs\\GitHub Copilot
+Nada é instalado sem pedido: só pelo cartão da ferramenta, por cli --install ou por install.py --with-clis.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -31,11 +42,23 @@ OFFICIAL = {"claude": "https://claude.ai/install.ps1", "codex": "https://chatgpt
 OFFICIAL_HOSTS = {"claude": ("downloads.claude.ai",), "codex": ("releases.openai.com",)}
 # Início do Subject do certificado Authenticode dos binários nativos de cada fabricante (lidos dos pacotes oficiais).
 SIGNERS = {"claude": 'CN="Anthropic, PBC"', "codex": 'CN="OpenAI OpCo, LLC"',
-           "copilot": 'CN="GitHub, Inc."'}
+           "copilot": 'CN="GitHub, Inc."', "vscode": "CN=Microsoft Corporation", "copilot_app": 'CN="GitHub, Inc."'}
 NPM_PACKAGES = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex", "copilot": "@github/copilot"}
 NODE_MINIMUM = {"claude": 22, "codex": 18, "copilot": 22}
-WINGET = {"copilot": "GitHub.Copilot"}
-MANUAL = {"claude": OFFICIAL["claude"], "codex": OFFICIAL["codex"], "copilot": "https://github.com/github/copilot-cli"}
+WINGET = {"copilot": "GitHub.Copilot", "vscode": "Microsoft.VisualStudioCode", "copilot_app": "GitHub.CopilotApp"}
+MANUAL = {"claude": OFFICIAL["claude"], "codex": OFFICIAL["codex"], "copilot": "https://github.com/github/copilot-cli",
+          "vscode": "https://code.visualstudio.com/download", "copilot_app": "https://github.com/github/app/releases/latest"}
+# Instaladores por usuário que o próprio launcher baixa: (onde perguntar a versão corrente, hosts do download, argumentos).
+DOWNLOADS = {
+    "vscode": ("https://update.code.visualstudio.com/api/update/win32-{arch}-user/stable/latest",
+               ("update.code.visualstudio.com", "vscode.download.prss.microsoft.com"),
+               ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/MERGETASKS=!runcode"]),
+    "copilot_app": ("https://api.github.com/repos/github/app/releases/latest",
+                    ("api.github.com", "github.com", "objects.githubusercontent.com",
+                     "release-assets.githubusercontent.com"),
+                    ["/S"]),
+}
+DOWNLOAD_LIMIT = 600 * 1024 * 1024  # instaladores de ~320 MB (Copilot app) e ~260 MB (VS Code)
 # O npm 11 não roda o postinstall de dependências sem --allow-scripts: o Claude Code deixa bin/claude.exe como script de
 # texto e o Windows recusa abri-lo. O Codex não tem postinstall; o binário vem do pacote opcional da plataforma.
 NPM_FLAGS = {"claude": ["--include=optional", "--allow-scripts=@anthropic-ai/claude-code"], "codex": ["--include=optional"]}
@@ -48,6 +71,26 @@ LOG_MAX_BYTES = 1_000_000  # passando disso, fica a metade mais recente
 
 class CliInstallError(Exception):
     pass
+
+
+def _harness(tool: str):
+    from agent_launcher.harnesses import registry
+    return registry.get(tool)
+
+
+def label(tool: str) -> str:
+    return NAMES.get(tool) or _harness(tool).LABEL
+
+
+def locate(tool: str) -> str | None:
+    """Executável da ferramenta: os CLIs por `find` (que os testes substituem); os outros pelo próprio adaptador."""
+    return find(tool) if tool in NAMES else _harness(tool).find_executable()
+
+
+def installable() -> tuple[str, ...]:
+    """IDs das ferramentas que o launcher sabe instalar, na ordem do registro."""
+    from agent_launcher.harnesses import registry
+    return tuple(harness.ID for harness in registry.all() if harness.install_steps())
 
 
 def native_paths(cli: str) -> list[Path]:
@@ -103,9 +146,9 @@ def record(message: str) -> None:
         pass  # o texto segue na exceção e no log da tela; o arquivo é só o registro
 
 
-def _fail(cli: str, label: str, message: str):
+def _fail(cli: str, step: str, message: str):
     """Registra a falha em LOG_FILE (o texto também sobe na exceção) e a levanta."""
-    record(f"{NAMES[cli]} ({label}): {message}")
+    record(f"{label(cli)} ({step}): {message}")
     raise CliInstallError(message)
 
 
@@ -254,7 +297,7 @@ def install_npm(cli: str) -> None:
     if major is None or major < NODE_MINIMUM[cli]:
         raise CliInstallError(f"{NPM_PACKAGES[cli]} exige Node {NODE_MINIMUM[cli]}+; encontrado: "
                               f"{'nenhum' if major is None else major}.")
-    result = _run([npm, "install", "-g", NPM_PACKAGES[cli], *NPM_FLAGS[cli]], timeout=900)
+    result = _run([npm, "install", "-g", NPM_PACKAGES[cli], *NPM_FLAGS.get(cli, [])], timeout=900)
     installed = find(cli)
     if result.returncode or not installed:
         _fail(cli, "npm", f"npm install -g {NPM_PACKAGES[cli]} falhou: {_tail(result)}")
@@ -272,45 +315,115 @@ def install_winget(cli: str) -> None:
         raise CliInstallError("winget não encontrado.")
     result = _run([winget, "install", "--id", WINGET[cli], "-e", "--scope", "user", "--silent",
                    "--accept-package-agreements", "--accept-source-agreements"], timeout=900)
-    if not find(cli):
+    if not locate(cli):
         raise CliInstallError(f"winget install {WINGET[cli]} não deixou o executável: {_tail(result)}")
 
 
-def steps(cli: str) -> list:
-    """[(rótulo, função)] na ordem em que se tenta instalar o CLI."""
+def _open(url: str, hosts: tuple[str, ...], timeout: int = 60):
+    import urllib.request
+    opener = urllib.request.build_opener(restricted_redirects(url, CliInstallError, hosts))
+    return opener.open(urllib.request.Request(url, headers={"User-Agent": "agent-launcher"}), timeout=timeout)
+
+
+def release_asset(tool: str) -> tuple[str, str, int]:
+    """(URL, SHA-256, tamanho em bytes ou 0) do instalador oficial corrente para esta arquitetura."""
+    query, hosts, _ = DOWNLOADS[tool]
+    arm = platform.machine().lower() in ("arm64", "aarch64")
+    try:
+        with _open(query.format(arch="arm64" if arm else "x64"), hosts, timeout=30) as response:
+            release = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError) as error:
+        raise CliInstallError(f"não foi possível consultar a versão corrente do {label(tool)}: {error}") from error
+    if tool == "vscode":
+        url, sha256, size = release.get("url"), release.get("sha256hash"), 0
+    else:
+        name = f"GitHub-Copilot-windows-{'arm64' if arm else 'x64'}-setup.exe"
+        asset = next((item for item in release.get("assets") or [] if item.get("name") == name), {})
+        url, size = asset.get("browser_download_url"), int(asset.get("size") or 0)
+        sha256 = (asset.get("digest") or "").removeprefix("sha256:")
+    if not url or not re.fullmatch(r"[0-9a-fA-F]{64}", sha256 or ""):
+        raise CliInstallError(f"a versão corrente do {label(tool)} veio sem instalador ou sem SHA-256 publicado; recusado.")
+    return url, sha256.lower(), size
+
+
+def download(tool: str, url: str, destination: Path, expected_sha256: str, size: int, progress) -> None:
+    """Baixa o instalador para `destination` relatando a fração baixada; só segue redirecionamento para DOWNLOADS."""
+    digest, received = hashlib.sha256(), 0
+    try:
+        with _open(url, DOWNLOADS[tool][1], timeout=120) as response, open(destination, "wb") as stream:
+            total = int(response.headers.get("Content-Length") or 0) or size
+            while chunk := response.read(1024 * 1024):
+                received += len(chunk)
+                if received > DOWNLOAD_LIMIT:
+                    raise CliInstallError(f"download do {label(tool)} acima do limite esperado; interrompido.")
+                digest.update(chunk)
+                stream.write(chunk)
+                if total:
+                    progress(min(received / total, 1.0), f"Baixando {min(received * 100 // total, 100)}%")
+    except OSError as error:
+        raise CliInstallError(f"download do {label(tool)} falhou ({url}): {error}") from error
+    if digest.hexdigest() != expected_sha256:
+        raise CliInstallError(f"SHA-256 do instalador do {label(tool)} não confere com o publicado; arquivo descartado.")
+
+
+def install_download(tool: str, progress=lambda fraction, text: None) -> None:
+    """Instalador oficial por usuário baixado pelo launcher: SHA-256 e assinatura conferidos antes de rodar, em silêncio."""
+    url, sha256, size = release_asset(tool)
+    with tempfile.TemporaryDirectory(prefix="agent-launcher-instalador-") as work:
+        setup = Path(work) / url.rsplit("/", 1)[-1].split("?")[0]
+        download(tool, url, setup, sha256, size, progress)
+        progress(None, "Conferindo assinatura")
+        try:
+            signed = _signed(setup, SIGNERS[tool])
+        except SignatureUnchecked as error:
+            _fail(tool, "instalador oficial", f"não foi possível conferir a assinatura do instalador: {error}; recusado.")
+        if not signed:
+            _fail(tool, "instalador oficial", f"instalador sem assinatura Authenticode válida de {SIGNERS[tool]}; recusado.")
+        progress(None, "Instalando")
+        result = _run([str(setup), *DOWNLOADS[tool][2]], timeout=900)
+    if result.returncode:
+        _fail(tool, "instalador oficial", f"o instalador do {label(tool)} terminou com erro: {_tail(result)}")
+
+
+def steps(tool: str) -> list:
+    """[(rótulo, função(progress))] na ordem em que se tenta instalar a ferramenta. `progress(fração ou None, texto)`:
+    None = sem como medir (o instalador do fabricante roda em silêncio)."""
     found = []
-    if cli in OFFICIAL:
-        found.append(("instalador oficial", lambda: install_official(cli)))
-    if cli in NPM_PACKAGES:
-        found.append(("npm", lambda: install_npm(cli)))
-    if cli in WINGET:
-        found.append(("winget", lambda: install_winget(cli)))
+    if tool in OFFICIAL:
+        found.append(("instalador oficial", lambda progress: install_official(tool)))
+    if tool in DOWNLOADS:
+        found.append(("instalador oficial", lambda progress: install_download(tool, progress)))
+    if tool in NPM_PACKAGES:
+        found.append(("npm", lambda progress: install_npm(tool)))
+    if tool in WINGET:
+        found.append(("winget", lambda progress: install_winget(tool)))
     return found
 
 
-def ensure(cli: str, log=print) -> str | None:
-    """Garante o CLI; devolve o executável ou None (com o motivo de cada tentativa no log). Nunca pede admin."""
-    found = find(cli)
+def ensure(tool: str, log=print, progress=None) -> str | None:
+    """Garante a ferramenta; devolve o executável ou None (com o motivo de cada tentativa no log). Nunca pede admin.
+    `progress(fração ou None, texto)` acompanha a instalação; 1.0 só depois de o executável aparecer."""
+    report = progress or (lambda fraction, text: None)
+    found = locate(tool)
     if found:
-        log(f"{NAMES[cli]}: instalado ({found})")
+        log(f"{label(tool)}: instalado ({found})")
         return found
     errors = []
-    order = [("instalador oficial", install_official)] if cli in OFFICIAL else []
-    order += [("npm", install_npm)] if cli in NPM_PACKAGES else []
-    order += [("winget", install_winget)] if cli in WINGET else []
-    for label, step in order:
+    for step_label, step in (steps(tool) if tool in NAMES else _harness(tool).install_steps()):
         try:
-            log(f"Instalando {NAMES[cli]} pelo {label}…")
-            step(cli)
-            found = find(cli)
+            log(f"Instalando {label(tool)} pelo {step_label}…")
+            report(None, "Instalando")
+            step(report)
+            found = locate(tool)
             if found:
-                log(f"{NAMES[cli]} instalado ({found}).")
+                report(1.0, "Instalado")
+                log(f"{label(tool)} instalado ({found}).")
                 return found
-            errors.append(f"{label}: terminou sem deixar o executável")
+            errors.append(f"{step_label}: terminou sem deixar o executável")
         except (CliInstallError, OSError, subprocess.TimeoutExpired) as error:
-            errors.append(f"{label}: {error}")
+            errors.append(f"{step_label}: {error}")
     for error in errors:
         log(f"  [falhou] {error}")
-    log(f"{NAMES[cli]} não foi instalado. Instale manualmente ({MANUAL[cli]}) ou peça à TI; "
-        f"depois rode: launcher.py cli --install {cli}")
+    log(f"{label(tool)} não foi instalado. Instale manualmente ({MANUAL.get(tool) or _harness(tool).MISSING_HINT}) "
+        f"ou peça à TI; depois rode: launcher.py cli --install {tool}")
     return None

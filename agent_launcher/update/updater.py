@@ -194,7 +194,7 @@ def interpreter(root: Path, windowless: bool = False) -> Path:
 
 
 def apply(package: Path, root: Path = ROOT, timeout: float = 900) -> None:
-    """Roda o instalador da versão nova sobre esta instalação (sem criar atalhos, Terminal nem CLIs: já existem; os atalhos existentes são regravados)."""
+    """Roda o instalador da versão nova sobre esta instalação, sem criar atalhos nem Terminal e sem instalar ferramentas (os atalhos existentes são regravados; `--no-clis` fica para o install.py da 1.2.x, que ainda instalava os CLIs por padrão)."""
     command = [str(interpreter(root)), str(Path(package) / "install.py"),
                "--target", str(root), "--skip-tests", "--refresh-shortcuts", "--no-terminal", "--no-clis"]
     try:

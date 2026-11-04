@@ -17,6 +17,7 @@ from pathlib import Path
 from agent_launcher.domain.catalog import Catalog, ModelInfo, protocol_for, token_label
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import atomic_json, project_path
+from agent_launcher.harnesses import installers
 from agent_launcher.harnesses.base import Harness
 
 PROFILE = "Agent Launcher"
@@ -162,11 +163,14 @@ class VsCode(Harness):
     SUBTITLE = "Chat do Copilot, perfil próprio"
     SYMBOL = "editor"
     SESSION_HINT = "Perfil Agent Launcher no VS Code"
-    MISSING_HINT = "Instale o VS Code (code.visualstudio.com) e abra de novo."
+    MISSING_HINT = "Instale pelo cartão do VS Code no launcher (ou em code.visualstudio.com) e abra de novo."
     EXECUTABLE = "code"
 
     def find_executable(self) -> str | None:
         return find_code()
+
+    def install_steps(self) -> list:
+        return installers.steps(self.ID)
 
     def eligible(self, record: ModelInfo, catalog: Catalog) -> bool:
         return (record.chat and record.tools is not False

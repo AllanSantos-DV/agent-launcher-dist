@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QRectF, QSize, Qt
+from PySide6.QtCore import QByteArray, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QAbstractButton, QLabel, QSizePolicy
@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QAbstractButton, QLabel, QSizePolicy
 INK = "#233e32"
 MUTED = "#5b7063"
 GREEN = "#286046"
+PALE = "#a3b3a8"
 PATHS = {
     "folder": '<path d="M3 7V5h6l2 2h10v12H3Z"/>',
     "search": '<circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/>',
@@ -70,12 +71,26 @@ class ElidedLabel(QLabel):
 
 
 class CliButton(QAbstractButton):
+    """Cartão de uma ferramenta. Pronta: marcável, como sempre. Não instalada: ícone apagado e "clique para instalar".
+    Instalando: barra no rodapé e ícone pintado na mesma fração; sem fração conhecida (instalador do fabricante em
+    silêncio) a barra e o ícone mostram movimento sem fingir porcentagem."""
+
+    INSTALLED_HOLD_MS = 900
+
     def __init__(self, title: str, subtitle: str, symbol: str, parent=None):
         super().__init__(parent)
         self.title = title
         self.subtitle = subtitle
         self.symbol = symbol
         self.version = ""
+        self.installed = True
+        self.installing = False
+        self.fraction: float | None = None
+        self.stage = ""
+        self.phase = 0.0
+        self.animation = QTimer(self)
+        self.animation.setInterval(40)
+        self.animation.timeout.connect(self._advance)
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -86,8 +101,50 @@ class CliButton(QAbstractButton):
 
     def set_version(self, text: str) -> None:
         self.version = text
-        self.setAccessibleDescription(f"{self.subtitle}. {text}" if text else self.subtitle)
+        self._describe()
         self.update()
+
+    def set_installed(self, installed: bool) -> None:
+        self.installed = installed
+        self.setCheckable(installed)
+        self._describe()
+        self.update()
+
+    def set_progress(self, fraction: float | None, stage: str) -> None:
+        self.installing = True
+        self.fraction = None if fraction is None else max(0.0, min(float(fraction), 1.0))
+        self.stage = stage
+        if self.fraction is None:
+            self.animation.start()
+        else:
+            self.animation.stop()
+        self._describe()
+        self.update()
+
+    def finish_install(self, installed: bool) -> None:
+        """Instalado: a barra completa fica à vista um instante antes de o cartão voltar ao normal."""
+        self.animation.stop()
+        if installed:
+            self.fraction, self.stage = 1.0, "Instalado"
+            self.update()
+            QTimer.singleShot(self.INSTALLED_HOLD_MS, self._stop_installing)
+        else:
+            self._stop_installing()
+        self.set_installed(installed)
+
+    def _stop_installing(self) -> None:
+        self.installing, self.fraction, self.stage = False, None, ""
+        self._describe()
+        self.update()
+
+    def _advance(self) -> None:
+        self.phase = (self.phase + 0.02) % 1.0
+        self.update()
+
+    def _describe(self) -> None:
+        state = (self.stage if self.installing else self.version if self.installed
+                 else "Não instalado. Clique para instalar")
+        self.setAccessibleDescription(f"{self.subtitle}. {state}" if state else self.subtitle)
 
     def sizeHint(self):
         return QSize(240, 76)
@@ -102,17 +159,46 @@ class CliButton(QAbstractButton):
         painter.setBrush(QColor(background))
         painter.setPen(QPen(QColor(GREEN if active or self.hasFocus() else "#d8e1d7"), 2 if self.hasFocus() else 1))
         painter.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 12, 12)
-        icon(self.symbol, GREEN, 25).paint(painter, 19, 24, 25, 25)
+        if self.installed and not self.installing:
+            icon(self.symbol, GREEN, 25).paint(painter, 19, 24, 25, 25)
+        else:
+            icon(self.symbol, PALE, 25).paint(painter, 19, 24, 25, 25)
+            if self.installing:
+                painter.save()
+                if self.fraction is None:
+                    painter.setClipRect(QRectF(19 - 10 + 35 * self.phase, 24, 10, 25))
+                else:
+                    painter.setClipRect(QRectF(19, 24 + 25 * (1 - self.fraction), 25, 25 * self.fraction))
+                icon(self.symbol, GREEN, 25).paint(painter, 19, 24, 25, 25)
+                painter.restore()
         painter.setPen(QColor(INK))
         painter.setFont(QFont("Segoe UI", 11, QFont.Weight.DemiBold))
         painter.drawText(58, 30, self.title)
         painter.setFont(QFont("Segoe UI", 9))
         painter.setPen(QColor(MUTED))
         painter.drawText(58, 51, self.subtitle)
-        if self.version:
+        line, color = ((self.stage, GREEN) if self.installing else
+                       (self.version, GREEN if "disponível" in self.version else MUTED) if self.installed else
+                       ("Não instalado · clique para instalar", MUTED))
+        if line:
             painter.setFont(QFont("Segoe UI", 8))
-            painter.setPen(QColor(GREEN if "disponível" in self.version else MUTED))
-            painter.drawText(58, 67, self.version)
+            painter.setPen(QColor(color))
+            painter.drawText(58, 67, line)
+        if self.installing:
+            track = QRectF(14, self.height() - 7, self.width() - 28, 3)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#dfe7dc"))
+            painter.drawRoundedRect(track, 1.5, 1.5)
+            if self.fraction is None:
+                width = track.width() * 0.28
+                left = track.left() - width + (track.width() + width) * self.phase
+                painter.setClipRect(track)
+                fill = QRectF(left, track.top(), width, track.height())
+            else:
+                fill = QRectF(track.left(), track.top(), track.width() * self.fraction, track.height())
+            painter.setBrush(QColor(GREEN))
+            painter.drawRoundedRect(fill, 1.5, 1.5)
+            painter.setClipping(False)
         if active:
             icon("check", GREEN, 17).paint(painter, self.width() - 32, 17, 17, 17)
 
