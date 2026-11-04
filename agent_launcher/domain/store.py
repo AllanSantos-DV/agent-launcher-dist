@@ -28,6 +28,20 @@ DEFAULT_HOME = Path.home() / ".agent-launcher"
 # continua no formato da 1.0 (last_cli e models só com claude/codex), legível por uma instalação 1.0.x que divida a
 # mesma pasta de dados (o orquestrador pode estar numa versão anterior durante a atualização automática).
 SELECTIONS = "selections.json"
+QUOTA_MESSAGE_MAX = 300
+
+
+def quota_message(text: str, secrets: list[str]) -> str:
+    """Texto do aviso de cota como vai em claro para o config.json: sem valor de campo secreto, numa linha e com teto
+    (o texto vem do conector do usuário, que pode ecoar a resposta inteira do serviço)."""
+    for secret in sorted(filter(None, secrets), key=len, reverse=True):
+        text = text.replace(secret, "[omitido]")
+    text = " ".join(text.split())
+    return text if len(text) <= QUOTA_MESSAGE_MAX else text[:QUOTA_MESSAGE_MAX - 1] + "…"
+
+
+def secret_values(module, options: dict) -> list[str]:
+    return [options[item["name"]] for item in module.FIELDS if item.get("secret")]
 
 
 def legacy_configs() -> list[Path]:
@@ -404,7 +418,7 @@ class Store:
                 try:
                     module.verify(options)
                 except QuotaExhausted as error:  # login e assinatura valem: grava, com o estado "cota esgotada"
-                    quota = {"state": "quota_exhausted", "message": str(error), "checked_at": int(time.time())}
+                    quota = {"state": "quota_exhausted", "message": quota_message(str(error), secret_values(module, options))}
         except ConnectorError as error:
             raise LauncherError(f"{module.LABEL}: {error}") from error
         if existing:
@@ -425,6 +439,11 @@ class Store:
             self.vault.set(f"{identifier}:{key}", value)
         self.save()
         return connection
+
+    def mark_quota_exhausted(self, reference: str, message: str, secrets: list[str]) -> None:
+        """Grava na conexão o estado "cota esgotada" com a mensagem do provedor (sem valor de campo secreto)."""
+        self.find_connection(reference)["status"] = {"state": "quota_exhausted", "message": quota_message(message, secrets)}
+        self.save()
 
     def clear_connection_status(self, reference: str) -> None:
         connection = self.find_connection(reference)

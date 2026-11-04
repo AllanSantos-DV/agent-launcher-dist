@@ -298,7 +298,9 @@ def choose_model(gateway: Gateway, cli: str, previous: str = "") -> str | None:
 def launch(store: Store, project: dict, gateway: Gateway, cli: str, model: str, resume: bool = False,
            dry_run: bool = False, controlled: bool = False, conversation: str | None = None) -> int:
     if not dry_run:
-        gateway.verify()
+        quota = gateway.verify(tolerate_quota=True)
+        if quota:
+            print(f"  [AVISO] {quota}")
     try:
         catalog = gateway.catalog(offline=dry_run)
     except LauncherError as error:
@@ -422,6 +424,9 @@ def doctor(store: Store, reference: str | None = None) -> int:
                 print(f"       {label_of(cli)}: {len(records)} modelos; {large} com entrada >= 1M informada")
             if not catalog.verified:
                 print(f"       [AVISO] {catalog.status}")
+            mark = connection.get("status") or {}
+            if mark.get("state") == "quota_exhausted":
+                print(f"       [AVISO] cota esgotada na última verificação: {mark.get('message', '')}")
         except LauncherError as error:
             failed = True
             print(f"  [ERRO] {connection['name']}: {error}")

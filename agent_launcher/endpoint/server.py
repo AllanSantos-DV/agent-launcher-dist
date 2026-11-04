@@ -28,6 +28,7 @@ from pathlib import Path
 
 from agent_launcher.connectors._http import is_local_host
 from agent_launcher.domain.errors import LauncherError
+from agent_launcher.domain.files import append_capped
 
 IDLE_SECONDS = 4 * 60 * 60
 LOG_MAX_BYTES = 1_000_000  # endpoint.log: passando disso, fica a metade mais recente
@@ -412,11 +413,7 @@ class EndpointServer(ThreadingHTTPServer):
     def _append(self, line: str) -> None:
         """Acrescenta ao endpoint.log (sob _log_lock); passando de LOG_MAX_BYTES, fica só a metade mais recente."""
         try:
-            if self.log.exists() and self.log.stat().st_size > LOG_MAX_BYTES:
-                kept = self.log.read_bytes()[-LOG_MAX_BYTES // 2:].split(b"\n", 1)[-1]
-                self.log.write_bytes(kept)
-            with self.log.open("a", encoding="utf-8") as stream:
-                stream.write(line)
+            append_capped(self.log, line, LOG_MAX_BYTES)
         except OSError:
             pass
 

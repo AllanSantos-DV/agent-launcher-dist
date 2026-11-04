@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QApplication, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
-from agent_launcher.connectors import LoginPending
+from agent_launcher.connectors import LoginPending, QuotaExhausted
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
@@ -56,12 +56,17 @@ class _Task(QRunnable):
             self.signals.done.emit(None, str(error))
 
 
-def login_of(task) -> LoginPending | None:
-    """O login por código pendente que fez a tarefa falhar (a verificação o embrulha em LauncherError), ou None."""
+def cause_of(task, kind: type):
+    """A causa do tipo `kind` que fez a tarefa falhar (a verificação embrulha o erro do conector em LauncherError)."""
     failure = getattr(task, "failure", None)
-    while failure is not None and not isinstance(failure, LoginPending):
+    while failure is not None and not isinstance(failure, kind):
         failure = failure.__cause__
     return failure
+
+
+def login_of(task) -> LoginPending | None:
+    """O login por código pendente que fez a tarefa falhar, ou None."""
+    return cause_of(task, LoginPending)
 
 
 def quota_warning(connection: dict | None) -> str:
@@ -617,6 +622,11 @@ class ConnectionsDialog(QDialog):
             self.login_panel.failed(error)  # o erro fica no painel, junto do código que ainda vale
             self.errors.pop("teste", None)
             self.set_status("teste", "")
+        elif error and cause_of(task, QuotaExhausted) is not None:
+            self.errors.pop("teste", None)
+            item = self.list.currentItem()
+            self.populate(item.data(Qt.ItemDataRole.UserRole) if item else None)
+            self.set_status("teste", f"Aviso: {name} está sem cota. {error}")
         elif error:
             self.errors["teste"] = f"{name}: {error}"
             self.set_status("teste", "")

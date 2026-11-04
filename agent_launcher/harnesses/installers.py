@@ -21,8 +21,9 @@ import time
 from pathlib import Path
 
 from agent_launcher.domain.downloads import restricted_redirects
-from agent_launcher.domain.files import replace_retrying
+from agent_launcher.domain.files import append_capped, replace_retrying
 from agent_launcher.platform import terminal
+from version import data_home
 
 NAMES = {"claude": "Claude Code", "codex": "Codex", "copilot": "GitHub Copilot CLI"}
 OFFICIAL = {"claude": "https://claude.ai/install.ps1", "codex": "https://chatgpt.com/codex/install.ps1"}
@@ -41,7 +42,8 @@ NPM_FLAGS = {"claude": ["--include=optional", "--allow-scripts=@anthropic-ai/cla
 NPM_REPAIR = {cli: f"npm install -g {NPM_PACKAGES[cli]}@latest {' '.join(flags)}" for cli, flags in NPM_FLAGS.items()}
 CLAUDE_PLATFORM = Path("node_modules") / "@anthropic-ai" / "claude-code-win32-x64" / "claude.exe"
 CODEX_PLATFORM = (Path("node_modules") / "@openai" / "codex-win32-x64" / "vendor" / "x86_64-pc-windows-msvc" / "bin" / "codex.exe")
-LOG_FILE = Path(os.environ.get("USERPROFILE") or Path.home()) / ".agent-launcher" / "cli-install.log"
+LOG_FILE = data_home() / "cli-install.log"
+LOG_MAX_BYTES = 1_000_000  # passando disso, fica a metade mais recente
 
 
 class CliInstallError(Exception):
@@ -96,8 +98,7 @@ def _tail(result: subprocess.CompletedProcess, count: int = 8) -> str:
 def record(message: str) -> None:
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_FILE.open("a", encoding="utf-8") as stream:
-            stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+        append_capped(LOG_FILE, f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n", LOG_MAX_BYTES)
     except OSError:
         pass  # o texto segue na exceção e no log da tela; o arquivo é só o registro
 

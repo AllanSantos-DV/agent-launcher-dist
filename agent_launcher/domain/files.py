@@ -169,6 +169,15 @@ def file_lock(path, timeout: float = 10.0):
         os.close(descriptor)
 
 
+def append_capped(path: Path, line: str, max_bytes: int) -> None:
+    """Acrescenta `line` a um log; passando de `max_bytes`, fica só a metade mais recente, a partir de uma linha inteira."""
+    if path.exists() and path.stat().st_size > max_bytes:
+        kept = path.read_bytes()[-max_bytes // 2:].split(b"\n", 1)[-1]
+        path.write_bytes(kept)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(line)
+
+
 def atomic_json(path: Path, data: dict) -> None:
     atomic_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 

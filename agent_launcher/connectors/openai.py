@@ -1,7 +1,7 @@
 """API da OpenAI direto: só Codex, via Responses em https://api.openai.com/v1. /v1/models não informa contexto;
 o Codex usa os metadados nativos dele para os modelos OpenAI.
 """
-from agent_launcher.connectors._http import gateway
+from agent_launcher.connectors._http import gateway, openai_quota
 
 NAME = "openai"
 LABEL = "OpenAI API"
@@ -12,4 +12,4 @@ FIELDS = (
     {"name": "api_key", "label": "Chave da OpenAI", "secret": True, "required": True},
 )
 targets, verify, models = gateway(EXAMPLE, claude=None, codex="", models_path="/models", any_model=False,
-                                  key_required=True)
+                                  key_required=True, quota=openai_quota)

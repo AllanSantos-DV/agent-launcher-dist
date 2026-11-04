@@ -5,11 +5,12 @@ import hashlib
 import json
 import time
 
-from agent_launcher.connectors import PROTOCOLS, ConnectorError, normalize_targets
+from agent_launcher.connectors import PROTOCOLS, ConnectorError, QuotaExhausted, normalize_targets
 from agent_launcher.connectors._http import NO_KEY
 from agent_launcher.domain.catalog import Catalog, ModelInfo
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import atomic_json
+from agent_launcher.domain.store import secret_values
 
 CACHE_TTL = 6 * 60 * 60
 
@@ -63,12 +64,20 @@ class Gateway:
         """A chave real da conexão, ou "" (host que já injeta a autenticação ou não exige chave)."""
         return self.options.get("api_key") or ""
 
-    def verify(self) -> None:
+    def verify(self, tolerate_quota: bool = False) -> str:
+        """Confere a conexão. Com `tolerate_quota`, cota esgotada não é erro: devolve a mensagem para quem abre a sessão
+        avisar (a cota pode ter voltado); sem ela, devolve ""."""
         try:
             self.module.verify(self.options)
+        except QuotaExhausted as error:
+            self.store.mark_quota_exhausted(self.connection["id"], str(error), secret_values(self.module, self.options))
+            if not tolerate_quota:
+                raise LauncherError(f"{self.name}: {error}") from error
+            return f"{self.name}: {error}"
         except ConnectorError as error:
             raise LauncherError(f"{self.name}: {error}") from error
         self.store.clear_connection_status(self.connection["id"])  # a cota voltou: o aviso gravado deixa de valer
+        return ""
 
     def empty_catalog(self, records=(), status="Catálogo indisponível; capacidades não confirmadas.", verified=False) -> Catalog:
         return Catalog(list(records), status, verified, self.clis, self.any_model, frozenset(self.protocols))

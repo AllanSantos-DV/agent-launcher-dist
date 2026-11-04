@@ -233,6 +233,18 @@ def change(home: Path, mark: list[str], unmark: list[str]) -> dict:
     return outcome
 
 
+def log_tail(path: Path, count: int = 5, window: int = 4096) -> str:
+    """Últimas linhas não vazias de um log, lendo só o fim do arquivo."""
+    try:
+        with path.open("rb") as stream:
+            start = max(0, stream.seek(0, os.SEEK_END) - window)
+            stream.seek(start)
+            lines = stream.read().decode("utf-8", "replace").splitlines()[1 if start else 0:]
+    except OSError as error:
+        return f"não foi possível ler o log ({error})."
+    return " | ".join([line.strip() for line in lines if line.strip()][-count:]) or "log vazio."
+
+
 def await_result(result: Path, what: str, timeout: float = 30) -> dict:
     """Lê o arquivo de resultado que o runner elevado grava na pasta de pedidos e o apaga."""
     deadline = time.monotonic() + timeout
@@ -242,8 +254,9 @@ def await_result(result: Path, what: str, timeout: float = 30) -> dict:
                 return json.loads(result.read_text(encoding="utf-8"))
             except (OSError, ValueError):  # ainda não existe ou está sendo gravado
                 if time.monotonic() > deadline:
+                    log = protected_dir() / "runner.log"
                     raise LauncherError(f"{what}: a tarefa elevada não respondeu em {timeout:.0f}s; "
-                                        f"veja {protected_dir() / 'runner.log'}.")
+                                        f"fim de {log}: {log_tail(log)}")
                 time.sleep(0.2)
     finally:
         result.unlink(missing_ok=True)

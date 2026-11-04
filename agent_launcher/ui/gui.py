@@ -9,7 +9,7 @@ from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeyS
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QTableWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QTableWidget,
     QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -26,7 +26,7 @@ from agent_launcher.harnesses import registry
 from agent_launcher.platform import terminal
 from agent_launcher.session.conversations import conversations_for, has_conversation_for
 from agent_launcher.session.window import session_title, start_session
-from agent_launcher.ui.connections import ConnectionsDialog
+from agent_launcher.ui.connections import ConnectionsDialog, quota_warning
 from agent_launcher.ui.instructions import InstructionsDialog
 from agent_launcher.ui.theme import GREEN, MUTED, STYLE, CliButton, ElidedLabel, icon
 from agent_launcher.update import updater
@@ -114,6 +114,42 @@ class ProjectDialog(QDialog):
         folder = QFileDialog.getExistingDirectory(self, "Escolha a pasta do projeto", self.path.text())
         if folder:
             self.path.setText(str(Path(folder)))
+
+
+class DiagnosticsDialog(QDialog):
+    """O diagnóstico como texto selecionável, com o botão que o copia inteiro (como o Copiar erro da faixa de avisos)."""
+
+    def __init__(self, text: str, parent=None, on_copy=None):
+        super().__init__(parent)
+        self.setWindowTitle("Diagnóstico")
+        self.resize(640, 520)
+        layout = QVBoxLayout(self)
+        self.box = QPlainTextEdit(text)
+        self.box.setReadOnly(True)
+        self.box.setAccessibleName("Diagnóstico")
+        # cores explícitas: sem elas o texto segue a paleta do Windows (fundo escuro com a tinta escura do app)
+        self.box.setStyleSheet("QPlainTextEdit { background: #ffffff; color: #233e32; border: 1px solid #d5ded1; "
+                               "border-radius: 8px; padding: 6px; selection-background-color: #d5e6cf; }")
+        layout.addWidget(self.box, 1)
+        actions = QHBoxLayout()
+        self.copy_button = QPushButton("Copiar diagnóstico")
+        self.copy_button.clicked.connect(lambda: self.copy(on_copy))
+        actions.addWidget(self.copy_button)
+        self.copied = QLabel("")
+        self.copied.setObjectName("muted")
+        actions.addWidget(self.copied)
+        actions.addStretch()
+        close = QPushButton("Fechar")
+        close.setObjectName("primary")
+        close.clicked.connect(self.accept)
+        actions.addWidget(close)
+        layout.addLayout(actions)
+
+    def copy(self, on_copy=None) -> None:
+        QApplication.clipboard().setText(self.box.toPlainText())
+        self.copied.setText("Diagnóstico copiado.")
+        if on_copy:
+            on_copy()
 
 
 class ConversationsDialog(QDialog):
@@ -1311,7 +1347,7 @@ class LauncherWindow(QMainWindow):
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(f"A janela abriu, mas não foi possível salvar a preferência: {error}")
         mode = " · bypass ativo" if bypass_permissions else ""
-        self.set_footer("sessao", f"Janela aberta: {title}{mode}. A janela verifica a conexão antes de iniciar.")
+        self.set_footer("sessao", f"{self.quota_note()}Janela aberta: {title}{mode}. A janela verifica a conexão antes de iniciar.")
         note = self.shared_resume_note() if resume else None
         if note:
             self.show_info(note, origin="pasta")
@@ -1556,7 +1592,18 @@ class LauncherWindow(QMainWindow):
             self.populate_projects(project["id"])
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(f"{harness.LABEL} aberto, mas não foi possível salvar a preferência: {error}")
-        self.set_footer("sessao", message)
+        self.set_footer("sessao", self.quota_note() + message)
+
+    def quota_mark(self) -> str:
+        """Mensagem da marca de cota esgotada da conexão em uso ("" sem marca ou sem conexão)."""
+        try:
+            return quota_warning(self.store.find_connection(self.gateway.connection["id"])) if self.gateway else ""
+        except (LauncherError, OSError, ValueError):
+            return ""
+
+    def quota_note(self) -> str:
+        """Aviso que não bloqueia a abertura (a cota pode ter voltado), no início da faixa: ela corta o meio do texto."""
+        return "Aviso: cota esgotada nesta conexão (veja o Diagnóstico). " if self.quota_mark() else ""
 
     # Perfis de trabalho
 
@@ -1662,8 +1709,12 @@ class LauncherWindow(QMainWindow):
         self.populate_profiles()
 
     def show_instructions(self):
-        self.instructions_dialog = InstructionsDialog(self)
+        """Uma janela de instruções só: o clique seguinte traz a que já existe para a frente."""
+        if getattr(self, "instructions_dialog", None) is None:
+            self.instructions_dialog = InstructionsDialog(self)
         self.instructions_dialog.show()
+        self.instructions_dialog.raise_()
+        self.instructions_dialog.activateWindow()
 
     def show_usage(self):
         current = profiles.profile_of_home(self.store.home, self.profile_base)
@@ -1829,9 +1880,15 @@ class LauncherWindow(QMainWindow):
             lines.append(f"{harness.LABEL}: encontrado\n{found}" if found else
                          f"{harness.LABEL}: não encontrado. {harness.MISSING_HINT}".rstrip())
         lines.extend(f"Adaptador do usuário não carregado: {error}" for error in registry.errors())
+        quota = self.quota_mark()
         lines.extend(["", self.catalog.status if self.catalog else "Sem catálogo.", "",
                       "As chaves das conexões ficam cifradas (DPAPI) e nunca aparecem aqui."])
-        QMessageBox.information(self, "Diagnóstico", "\n".join(lines))
+        if quota:
+            lines.insert(lines.index("Estado: " + ("respondeu" if self.online else "não confirmado")) + 1,
+                         "Cota: esgotada na última verificação. " + quota)
+        self.diagnostics_dialog = DiagnosticsDialog("\n".join(lines), self, lambda: self.set_footer(
+            "copia", "Diagnóstico copiado: cole num chat de IA ou mande para o suporte."))
+        self.diagnostics_dialog.open()
 
 
 UPDATE_INTERVAL_MS = 4 * 60 * 60 * 1000

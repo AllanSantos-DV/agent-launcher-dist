@@ -162,6 +162,8 @@ QPushButton#ghost:hover, QToolButton#ghost:hover { background: #e6ecdf; }
 QFrame#sidebar QPushButton { color: #edf5e6; background: #305942; border-color: #547954; }
 QFrame#sidebar QPushButton:hover { background: #41684c; }
 QFrame#sidebar QPushButton#ghost { background: transparent; color: #cfdfce; border-color: transparent; }
+QListWidget { background: #ffffff; color: #233e32; border: 1px solid #d5ded1; border-radius: 8px; outline: 0; }
+QListWidget::item:selected { background: #dfecda; color: #193d2b; }
 QFrame#sidebar QListWidget { background: transparent; border: 0; outline: 0; color: #d6e4d6; }
 QFrame#sidebar QListWidget::item { padding: 12px 10px; margin-bottom: 3px; border-radius: 8px; }
 QFrame#sidebar QListWidget::item:hover { background: #2a5141; }

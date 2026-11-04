@@ -86,6 +86,18 @@ def console_python() -> Path:
     return executable
 
 
+def terminal_tab(terminal_exe: str, title: str, color: str, window_command: list[str],
+                 window: str = TERMINAL_WINDOW) -> list[str]:
+    """wt.exe abrindo a sessão numa aba da janela única. --suppressApplicationTitle impede o CLI de trocar o título.
+
+    O primeiro processo da aba é um cmd.exe que roda a janela e sai com 0: o Terminal só fecha a aba sozinho com o
+    primeiro processo saindo com 0, depois que o último processo do console sai. Assim a aba fecha no fim da sessão
+    mesmo com o desktop.py encerrado por fora (taskkill /IM python.exe de outra sessão) e o CLI ainda vivo. O "call"
+    impede o cmd de tirar as aspas do primeiro argumento quando o caminho do Python tem espaço."""
+    return [terminal_exe, "-w", window, "new-tab", "--title", title.replace(";", " "), "--suppressApplicationTitle",
+            "--tabColor", color, "cmd.exe", "/d", "/c", "call", *window_command, "&", "exit", "0"]
+
+
 def start_session(store: Store, project: dict, cli: str, model: str, resume: bool = False,
                   bypass_permissions: bool = False, controlled: bool = False,
                   connection: str | None = None, background: bool | None = None,
@@ -128,11 +140,9 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
 
     def open_window() -> subprocess.Popen | None:
         if terminal_exe:
-            # Aba na janela única do launcher; --suppressApplicationTitle impede o CLI de trocar o título da aba.
             # wt.exe apenas encaminha a abertura e termina antes da sessão, por isso não há processo para acompanhar.
             try:
-                subprocess.Popen([terminal_exe, "-w", TERMINAL_WINDOW, "new-tab", "--title", title.replace(";", " "),
-                                  "--suppressApplicationTitle", "--tabColor", tab_color(harness, store.home), *command],
+                subprocess.Popen(terminal_tab(terminal_exe, title, tab_color(harness, store.home), command),
                                  cwd=directory, env=environment, shell=False)
                 return None
             except OSError as error:  # ex.: AppLocker barrando o Terminal portátil
@@ -164,7 +174,9 @@ def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
         gateway = Gateway.for_project(store, project, connection)
         harness = registry.get(cli)
         print(f"  Conexão: {gateway.name} • {harness.connection_url(gateway) or gateway.url}\n")
-        gateway.verify()
+        quota = gateway.verify(tolerate_quota=True)
+        if quota:
+            print(f"  Aviso: {quota}\n")
         plan = build_plan(gateway, cli, project["path"], model, resume, gateway.catalog(), preserve_terminal_title=True,
                           bypass_permissions=bypass_permissions, controlled=controlled,
                           admin_note=elevated.session_note(project), conversation=conversation)
@@ -204,7 +216,60 @@ def main() -> int:
         return 0  # fechamento pedido pelo orquestrador: código 0 faz o Windows Terminal fechar a aba
     if result not in (0, 130):
         try:
-            input("\nPressione ENTER para fechar esta janela...")
-        except (EOFError, KeyboardInterrupt):
+            return wait_to_close(result, os.getpid())
+        except KeyboardInterrupt:
             pass
     return result
+
+
+ENABLE_PROCESSED_INPUT = 0x0001
+KEY_POLL_S = 0.1
+
+
+def _console_key() -> str | None:
+    """Tecla digitada no console, ou None depois de KEY_POLL_S sem tecla."""
+    import msvcrt
+    import time
+    if msvcrt.kbhit():
+        return msvcrt.getwch()
+    time.sleep(KEY_POLL_S)
+    return None
+
+
+def wait_to_close(result: int, pid: int, read_key=None) -> int:
+    """Segura a janela que não iniciou a sessão até ENTER ou Ctrl+C (devolve result) ou até o pedido de fechamento do
+    orquestrador chegar (devolve 0), o que vier primeiro: o pedido pode chegar durante a espera.
+
+    Ctrl+C chega como tecla, com a entrada processada do console desligada: como sinal, ele iria também ao cmd.exe pai
+    da aba, que largaria o "& exit 0" e deixaria a aba aberta. read_key (testes) devolve a tecla ou None; sem ele, a
+    tecla vem do console, e sem console não há quem tecle ENTER."""
+    console = mode = None
+    if read_key is None:
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        console = kernel32.CreateFileW("CONIN$", 0xC0000000, 0x3, None, 3, 0, None)  # leitura e escrita, OPEN_EXISTING
+        if console in (None, wintypes.HANDLE(-1).value):
+            return result
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(console, ctypes.byref(mode)):
+            kernel32.CloseHandle(console)
+            return result
+        if not kernel32.SetConsoleMode(console, mode.value & ~ENABLE_PROCESSED_INPUT):
+            print(f"  Aviso: Ctrl+C continua como sinal ({ctypes.get_last_error()}); feche com ENTER.")
+        read_key = _console_key
+    print("\nPressione ENTER para fechar esta janela...", flush=True)
+    try:
+        while not consume_close_request(pid):
+            if read_key() in ("\r", "\n", "\x03"):
+                return result
+        return 0  # fechamento pedido pelo orquestrador: código 0 faz o Windows Terminal fechar a aba
+    finally:
+        if console is not None:
+            kernel32.SetConsoleMode(console, mode.value)
+            kernel32.CloseHandle(console)

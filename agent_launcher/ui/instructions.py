@@ -1,16 +1,16 @@
-"""Instruções e comandos dentro do próprio app: o README.md do pacote (fonte única do conteúdo) renderizado numa janela,
+"""Instruções e comandos dentro do próprio app: o texto de uso do pacote (instrucoes.md) renderizado numa janela,
 com os comandos copiáveis. Nada aqui abre arquivo, editor, navegador ou console."""
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QLabel, QPushButton, QTextBrowser, QVBoxLayout
 
-from agent_launcher import ROOT
 from agent_launcher.domain.errors import LauncherError
 
-SOURCE = ROOT / "README.md"
+SOURCE = Path(__file__).with_name("instrucoes.md")
 FENCE = re.compile(r"^```(?P<language>[^\n]*)\n(?P<body>.*?)^```", re.MULTILINE | re.DOTALL)
 SHELL = {"", "powershell", "pwsh", "cmd", "bash", "sh", "shell", "console"}  # blocos que se colam num terminal
 

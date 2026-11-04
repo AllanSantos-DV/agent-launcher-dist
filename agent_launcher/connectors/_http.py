@@ -7,10 +7,15 @@ import re
 import urllib.parse
 
 from agent_launcher.domain.catalog import MODEL_PATTERN, ModelInfo, base_model, positive_integer
-from agent_launcher.connectors import ConnectorError
+from agent_launcher.connectors import ConnectorError, QuotaExhausted
 
 LIMIT = 16 * 1024 * 1024
 NO_KEY = "agent-launcher-no-key"
+ERROR_BODY_LIMIT = 64 * 1024
+# Códigos de error.code dos 429 de crédito e de limite de gasto da OpenAI (developers.openai.com/api/docs/guides/error-codes);
+# o 429 de rate limit não traz nenhum deles.
+OPENAI_QUOTA_CODES = {"credit_balance_exhausted", "organization_spend_limit_exceeded", "project_spend_limit_exceeded",
+                      "organization_usage_limit_exceeded", "insufficient_quota"}
 
 
 def _no_redirect():
@@ -51,7 +56,33 @@ def _opener(url: str):
     return urllib.request.build_opener(*handlers)
 
 
-def get_json(url: str, headers: dict | None = None, timeout: float = 15) -> dict:
+def openai_quota(status: int, payload: dict) -> bool:
+    """HTTP 429 com error.code (ou error.type) de crédito ou limite de gasto; sem ele, o 429 é rate limit comum."""
+    error = payload.get("error")
+    return status == 429 and isinstance(error, dict) and (
+        error.get("code") in OPENAI_QUOTA_CODES or error.get("type") == "insufficient_quota")
+
+
+def payment_required(status: int, payload: dict) -> bool:
+    """HTTP 402: sem crédito ou cobrança recusada (OpenRouter `payment_required`, Anthropic `billing_error`). O 402 do
+    orçamento em voo da OpenRouter (metadata.limit_source openrouter_in_flight_budget) é transitório e fica erro comum."""
+    error = payload.get("error")
+    metadata = error.get("metadata") if isinstance(error, dict) else None
+    return status == 402 and not (isinstance(metadata, dict)
+                                  and metadata.get("limit_source") == "openrouter_in_flight_budget")
+
+
+def _error_payload(error) -> dict:
+    try:
+        payload = json.loads(error.read(ERROR_BODY_LIMIT))
+    except (OSError, ValueError, UnicodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def get_json(url: str, headers: dict | None = None, timeout: float = 15, quota=None) -> dict:
+    """GET de JSON. `quota(status, corpo_do_erro)` diz quais respostas de erro são cota esgotada (QuotaExhausted) neste
+    provedor; sem ele, todo status de erro é ConnectorError comum."""
     import urllib.error
     import urllib.request
     request = urllib.request.Request(url, headers={"Accept": "application/json", **(headers or {})})
@@ -62,8 +93,13 @@ def get_json(url: str, headers: dict | None = None, timeout: float = 15) -> dict
             raise ConnectorError(f"Resposta de {url} acima de {LIMIT // (1024 * 1024)} MB.")
         result = json.loads(body)
     except urllib.error.HTTPError as error:
+        payload = _error_payload(error) if quota else {}
         error.close()
-        if error.code in (401, 403):
+        if quota and quota(error.code, payload):
+            detail = payload["error"].get("message") if isinstance(payload.get("error"), dict) else None
+            failure = QuotaExhausted(f"Cota ou crédito esgotado (HTTP {error.code} em {url})"
+                                     + (f": {' '.join(str(detail).split())[:200]}" if detail else "."))
+        elif error.code in (401, 403):
             failure = ConnectorError(f"O host recusou a chave (HTTP {error.code}) em {url}.")
         elif error.code == 404:
             failure = ConnectorError(f"{url} não existe (HTTP 404). Confira o endereço base da conexão.")
@@ -211,12 +247,13 @@ def require_key_routing(root_url: str, headers: dict | None = None, timeout: flo
 
 def gateway(example: str, *, claude: str | None = "", codex: str | None = "/v1", chat: str | None = "same",
             models_path: str = "/v1/models", any_model: bool = True, claude_auth: str = "bearer", key_required: bool = False,
-            headers=None, page_limit: int | None = None, listing_optional: bool = False):
+            headers=None, page_limit: int | None = None, listing_optional: bool = False, quota=None):
     """targets/verify/models de um host HTTP. `claude` (Anthropic Messages), `codex` (OpenAI Responses) e `chat`
     (OpenAI Chat Completions) são sufixos sobre o endereço; None = protocolo não servido. `chat="same"` (padrão) usa a
     mesma base do Responses: hosts OpenAI-compatíveis servem /chat/completions ao lado de /responses.
     `headers(options)` substitui o Bearer padrão; `page_limit` ativa a paginação after_id/has_more da Anthropic.
-    `listing_optional`: host sem /models funciona só com os "Modelos extras" digitados (a falha vira erro sem eles)."""
+    `listing_optional`: host sem /models funciona só com os "Modelos extras" digitados (a falha vira erro sem eles).
+    `quota`: classificador de cota esgotada do provedor (`openai_quota`, `payment_required`), repassado a `get_json`."""
     chat = codex if chat == "same" else chat
 
     def url(options):
@@ -242,11 +279,11 @@ def gateway(example: str, *, claude: str | None = "", codex: str | None = "/v1",
     def fetch(options, timeout=15):
         address = url(options) + models_path
         if page_limit is None:
-            return listed(get_json(address, auth(options), timeout), address)
+            return listed(get_json(address, auth(options), timeout, quota), address)
         entries, after = [], ""
         for _page in range(50):
             query = f"?limit={page_limit}" + (f"&after_id={urllib.parse.quote(after)}" if after else "")
-            payload = get_json(address + query, auth(options), timeout)
+            payload = get_json(address + query, auth(options), timeout, quota)
             entries += listed(payload, address)
             after = payload.get("last_id") or ""
             if payload.get("has_more") is not True or not after:

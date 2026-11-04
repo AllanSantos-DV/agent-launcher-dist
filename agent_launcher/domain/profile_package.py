@@ -235,7 +235,11 @@ def import_profile(base: Path | None, path: Path, ask=None, verify: bool = True)
             module = modules.get(entry["connector"])
             if module is None:
                 raise LauncherError(f"Conector {entry['connector']!r} não carregou: {'; '.join(load_errors)}")
-            names.append(_create_connection(store, module, entry, ask, verify, warnings)["name"])
+            created = _create_connection(store, module, entry, ask, verify, warnings)
+            names.append(created["name"])
+            status = created.get("status") or {}
+            if status.get("state") == "quota_exhausted":
+                warnings.append(f"Conexão {created['name']} criada, mas a cota está esgotada: {status.get('message', '')}")
         if manifest.get("default_connection"):
             store.set_default_connection(manifest["default_connection"])
     except BaseException:

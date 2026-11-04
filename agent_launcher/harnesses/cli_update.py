@@ -51,9 +51,29 @@ def installed_version(cli: str, path: str | None = None) -> str | None:
     return parse_version(result.stdout + "\n" + result.stderr) if result.returncode == 0 else None
 
 
+CLAUDE_CHANNELS = ("latest", "stable")
+
+
+def release_tag(cli: str, path: str | None = None) -> str:
+    """Dist-tag do npm que o comando de atualização instala. O `claude update` nativo segue `autoUpdatesChannel` do
+    settings.json do usuário ("latest" por padrão, ou "stable"); nas outras origens o launcher pede a versão exata."""
+    path = path or installers.find(cli)
+    if cli != "claude" or not path or source(cli, path) == "npm":
+        return "latest"
+    settings = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "settings.json"
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
+        channel = data.get("autoUpdatesChannel", "latest")
+    except (OSError, ValueError, AttributeError) as error:
+        raise updater.CheckError(f"Não foi possível ler o canal de atualização do Claude Code em {settings}: {error}") from error
+    if channel not in CLAUDE_CHANNELS:
+        raise updater.CheckError(f"Canal de atualização do Claude Code desconhecido em {settings}: {channel!r}")
+    return channel
+
+
 def latest_version(cli: str, get=updater._get, registry: str = updater.REGISTRY) -> str:
-    """Última versão publicada no registro npm (o mesmo que o launcher usa para se atualizar)."""
-    url = registry + NPM_PACKAGES[cli].replace("/", "%2F") + "/latest"
+    """Última versão publicada no registro npm, no canal que o comando de atualização da CLI instala."""
+    url = registry + NPM_PACKAGES[cli].replace("/", "%2F") + "/" + release_tag(cli)
     try:
         version = json.loads(get(url, 10, 2 * 1024 * 1024)).get("version")
     except (OSError, ValueError, AttributeError) as error:
@@ -73,14 +93,15 @@ def source(cli: str, path: str) -> str:
     return "native"
 
 
-def command(cli: str, path: str, origin: str) -> list[str]:
-    """Comando de atualização pela origem: `update` da própria CLI (nativa, winget e Copilot em qualquer origem) ou npm @latest."""
+def command(cli: str, path: str, origin: str, version: str = "latest") -> list[str]:
+    """Comando de atualização pela origem: `update` da própria CLI (nativa, winget e Copilot em qualquer origem) ou npm
+    na versão pedida (a que a verificação mostrou; o @latest do npm pode vir do cache dele, mais velho)."""
     if cli == "copilot" or origin != "npm":
         return [path, "update"]
     npm = shutil.which("npm.cmd") or shutil.which("npm")
     if not npm:
         raise CliInstallError("npm não encontrado (Node.js não instalado); atualize pelo comando da própria CLI.")
-    return [npm, "install", "-g", f"{NPM_PACKAGES[cli]}@latest", *NPM_FLAGS.get(cli, [])]
+    return [npm, "install", "-g", f"{NPM_PACKAGES[cli]}@{version}", *NPM_FLAGS.get(cli, [])]
 
 
 def _executables(cli: str, path: str) -> list[Path]:
@@ -163,7 +184,8 @@ def update(cli: str, latest=latest_version) -> dict:
     """Atualiza uma CLI sem esperar pelas sessões abertas (o Windows deixa renomear um .exe em execução: a sessão segue na
     versão velha e a nova vale na próxima abertura). {cli, before, after, updated, sessions}. Levanta UpdateDeferred só
     quando a tentativa real bate num arquivo preso, e CliInstallError (texto legível, também em cli-install.log) se o
-    comando falhar ou a CLI não executar depois; no npm volta para a versão anterior."""
+    comando falhar, se terminar sem chegar à versão publicada ou se a CLI não executar depois; no npm volta para a
+    versão anterior."""
     path = installers.find(cli)
     if not path:
         raise CliInstallError(f"{NAMES[cli]} não está instalado.")
@@ -176,7 +198,7 @@ def update(cli: str, latest=latest_version) -> dict:
         raise UpdateDeferred(f"Atualização do {NAMES[cli]} adiada: outra janela do launcher já está atualizando.")
     taken = lock.stat().st_mtime_ns
     try:
-        return _apply(cli, path, before, len(running(cli, path)))
+        return _apply(cli, path, before, target, len(running(cli, path)))
     finally:
         try:
             # Passada a validade (npm + desfazer podem levar mais), outro processo já pode ter tomado a trava: a dele fica.
@@ -221,9 +243,9 @@ def _verify_signature(cli: str, path: str, origin: str) -> None:
     installers.reject_unsigned(cli, targets, "atualização", "atualização", " depois da atualização")
 
 
-def _apply(cli: str, path: str, before: str | None, sessions: int = 0) -> dict:
+def _apply(cli: str, path: str, before: str | None, target: str, sessions: int = 0) -> dict:
     origin = source(cli, path)
-    result = _run_logged(cli, command(cli, path, origin))
+    result = _run_logged(cli, command(cli, path, origin, target))
     output = result.stdout + "\n" + result.stderr
     holders = running(cli, path) if result.returncode and (LOCKED.search(output) or DENIED.search(output)) else []
     if result.returncode and (holders or LOCKED.search(output)):
@@ -254,4 +276,7 @@ def _apply(cli: str, path: str, before: str | None, sessions: int = 0) -> dict:
                                                  f"voltei para {before} ({'ok' if not back.returncode else 'falhou'}).")
         installers._fail(cli, "atualização", f"o {NAMES[cli]} não executa depois da atualização ({origin}); "
                                              "sem volta automática para esta origem: reinstale pelo launcher.")
+    if updater.parts(after) < updater.parts(target):
+        installers._fail(cli, "atualização", f"a atualização do {NAMES[cli]} ({origin}) terminou sem erro, mas a versão "
+                                             f"continua {after} e a publicada é {target}: {installers._tail(result)}")
     return {"cli": cli, "before": before, "after": after, "updated": after != before, "sessions": sessions}

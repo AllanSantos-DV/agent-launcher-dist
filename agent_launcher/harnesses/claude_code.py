@@ -252,6 +252,8 @@ class ClaudeCode(Harness):
             "CLAUDE_CODE_USE_VERTEX": "0",
             "CLAUDE_CODE_USE_FOUNDRY": "0",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            # NONESSENTIAL_TRAFFIC desliga a atualização nativa de plugins; esta variável documentada a restaura.
+            "FORCE_AUTOUPDATE_PLUGINS": "1",
             "CLAUDE_CODE_DISABLE_1M_CONTEXT": "0" if catalog.verified and any(
                 record.one_million and record.family for record in [selected, *family_records.values()]) else "1",
             "ANTHROPIC_MODEL": model,
