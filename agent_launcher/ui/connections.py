@@ -6,7 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QCheckBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QApplication, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
@@ -16,6 +16,7 @@ from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
 from agent_launcher.endpoint import registry as endpoint_registry
 from agent_launcher.ui.background import deliver
+from agent_launcher.ui.theme import ReadableCombo
 
 
 def _label(text: str, role: str = "") -> QLabel:
@@ -206,7 +207,7 @@ class ConnectionForm(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(12)
-        self.kind = QComboBox()
+        self.kind = ReadableCombo()
         self.kind.setAccessibleName("Tipo de provedor")
         for name, module in self.modules.items():
             self.kind.addItem(module.LABEL, name)

@@ -7,9 +7,9 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
-    QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QTableWidget,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QDialog, QFileDialog, QFormLayout, QFrame,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QTableWidget,
     QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -26,10 +26,11 @@ from agent_launcher.harnesses import registry
 from agent_launcher.platform import terminal
 from agent_launcher.session.conversations import conversations_for, has_conversation_for
 from agent_launcher.session.window import session_title, start_session
+from agent_launcher.ui import placement
 from agent_launcher.ui.background import deliver
 from agent_launcher.ui.connections import ConnectionsDialog, quota_warning
 from agent_launcher.ui.instructions import InstructionsDialog
-from agent_launcher.ui.theme import GREEN, MUTED, STYLE, CliButton, ElidedLabel, icon
+from agent_launcher.ui.theme import GREEN, MUTED, STYLE, CardGrid, CliButton, ElidedLabel, ReadableCombo, icon
 from agent_launcher.update import updater
 from version import APP_NAME, APP_USER_MODEL_ID, VERSION
 
@@ -490,9 +491,10 @@ class LauncherWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(str(ROOT / "assets" / "launcher.ico")))
         available = QApplication.primaryScreen().availableGeometry()
-        self.resize(min(1220, available.width() - 40), min(850, available.height() - 60))
-        self.setMinimumSize(990, 680)
+        self.setGeometry(placement.initial_geometry(available, QSize(1220, 850)))
+        self.setMinimumSize(placement.minimum_for(available))
         self._build()
+        self.keeper = placement.WindowKeeper(self)
         self.populate_profiles()
         self.populate_projects(self.store.data["last_project"])
         self.populate_connections()
@@ -530,10 +532,18 @@ class LauncherWindow(QMainWindow):
         self.profile_strip.setObjectName("profileStrip")
         self.profile_strip.setFixedHeight(5)
         outer.addWidget(self.profile_strip)
-        rail = QVBoxLayout()
+        rail_page = QWidget()
+        rail_page.setObjectName("railPage")
+        rail = QVBoxLayout(rail_page)
         rail.setContentsMargins(20, 21, 20, 20)
         rail.setSpacing(13)
-        outer.addLayout(rail, 1)
+        rail_scroll = QScrollArea()
+        rail_scroll.setObjectName("rail")
+        rail_scroll.setWidgetResizable(True)
+        rail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        rail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        rail_scroll.setWidget(rail_page)
+        outer.addWidget(rail_scroll, 1)
         brand = QHBoxLayout()
         mark = QLabel()
         mark.setPixmap(QIcon(str(ROOT / "assets/launcher.svg")).pixmap(38, 38))
@@ -546,7 +556,7 @@ class LauncherWindow(QMainWindow):
         rail.addWidget(label("PERFIL", "railMuted"))
         profile_row = QHBoxLayout()
         profile_row.setSpacing(6)
-        self.profile_picker = QComboBox()
+        self.profile_picker = ReadableCombo()
         self.profile_picker.setAccessibleName("Perfil de trabalho")
         self.profile_picker.setToolTip("Cada perfil tem os seus projetos e as suas conexões")
         self.profile_picker.activated.connect(self.pick_profile)
@@ -607,7 +617,7 @@ class LauncherWindow(QMainWindow):
         rail.addWidget(import_button)
         rail.addSpacing(10)
         rail.addWidget(label("CONEXÃO", "railMuted"))
-        self.connection_picker = QComboBox()
+        self.connection_picker = ReadableCombo()
         self.connection_picker.setAccessibleName("Conexão com o provedor")
         self.connection_picker.currentIndexChanged.connect(self.select_connection)
         rail.addWidget(self.connection_picker)
@@ -619,9 +629,27 @@ class LauncherWindow(QMainWindow):
         rail.addWidget(manage)
         layout.addWidget(sidebar)
         content = QWidget()
-        body = QVBoxLayout(content)
-        body.setContentsMargins(32, 26, 32, 22)
+        column = QVBoxLayout(content)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        scrolled = QWidget()
+        scrolled.setObjectName("page")
+        body = QVBoxLayout(scrolled)
+        body.setContentsMargins(32, 26, 32, 12)
         body.setSpacing(12)
+        self.page = QScrollArea()
+        self.page.setObjectName("page")
+        self.page.setWidgetResizable(True)
+        self.page.setFrameShape(QFrame.Shape.NoFrame)
+        self.page.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.page.setWidget(scrolled)
+        column.addWidget(self.page, 1)
+        dock_frame = QFrame()
+        dock_frame.setObjectName("actionsBar")
+        dock = QVBoxLayout(dock_frame)
+        dock.setContentsMargins(32, 12, 32, 18)
+        dock.setSpacing(8)
+        column.addWidget(dock_frame)
         top = QHBoxLayout()
         self.project_title = ElidedLabel("Escolha um projeto")
         self.project_title.setObjectName("title")
@@ -670,18 +698,16 @@ class LauncherWindow(QMainWindow):
         project_path_row.addWidget(self.open_folder)
         body.addLayout(project_path_row)
         body.addSpacing(2)
-        cli_row = QGridLayout()
-        cli_row.setSpacing(12)
         self.cli_group = QButtonGroup(self)
         self.cli_buttons = {}
-        for index, harness in enumerate(registry.all()):
+        for harness in registry.all():
             widget = CliButton(harness.LABEL + (" (prévia)" if harness.PREVIEW else ""), harness.SUBTITLE, harness.SYMBOL)
             self.cli_group.addButton(widget)
             self.cli_buttons[harness.ID] = widget
             widget.clicked.connect(lambda checked=False, chosen=harness.ID: self.choose_card(chosen))
-            cli_row.addWidget(widget, index // 3, index % 3)
         self.cli_buttons["claude"].setChecked(True)
-        body.addLayout(cli_row)
+        self.cli_grid = CardGrid(list(self.cli_buttons.values()))
+        body.addWidget(self.cli_grid)
         model_heading = QHBoxLayout()
         model_heading.addWidget(label("Modelo da sessão", "section"))
         model_heading.addStretch()
@@ -695,7 +721,7 @@ class LauncherWindow(QMainWindow):
         self.model_search.addAction(icon("search", MUTED), QLineEdit.ActionPosition.LeadingPosition)
         self.model_search.textChanged.connect(self.populate_models)
         search_row.addWidget(self.model_search, 1)
-        self.provider_filter = QComboBox()
+        self.provider_filter = ReadableCombo()
         self.provider_filter.setAccessibleName("Filtrar provider")
         self.provider_filter.currentIndexChanged.connect(self.populate_models)
         search_row.addWidget(self.provider_filter)
@@ -746,12 +772,12 @@ class LauncherWindow(QMainWindow):
         self.copy_error.clicked.connect(self.copy_notice)
         self.copy_error.hide()
         notice_row.addWidget(self.copy_error, 0, Qt.AlignmentFlag.AlignTop)
-        body.addLayout(notice_row)
+        dock.addLayout(notice_row)
         self.notice.installEventFilter(self)  # o botão aparece e some junto com a faixa
         self.info_notice = label("", "notice")  # faixa própria do informativo: nunca ocupa o lugar de um erro
         self.info_notice.setWordWrap(True)
         self.info_notice.hide()
-        body.addWidget(self.info_notice)
+        dock.addWidget(self.info_notice)
         self.update_notice = label("", "notice")
         self.update_notice.setWordWrap(True)
         self.update_notice.setTextFormat(Qt.TextFormat.RichText)
@@ -759,7 +785,7 @@ class LauncherWindow(QMainWindow):
         self.update_notice.hide()
         if self.store.recovered:
             self.show_update_notice("recuperacao", self.store.recovered.replace("<", "&lt;"))
-        body.addWidget(self.update_notice)
+        dock.addWidget(self.update_notice)
         actions = QHBoxLayout()
         session_options = QVBoxLayout()
         session_options.setSpacing(4)
@@ -792,10 +818,10 @@ class LauncherWindow(QMainWindow):
         self.launch_button.setMinimumHeight(44)
         self.launch_button.clicked.connect(lambda: self.launch_session(False))
         actions.addWidget(self.launch_button)
-        body.addLayout(actions)
+        dock.addLayout(actions)
         self.footer = ElidedLabel("Consultando a conexão…")
         self.footer.setObjectName("muted")
-        body.addWidget(self.footer)
+        dock.addWidget(self.footer)
         layout.addWidget(content, 1)
 
     def populate_projects(self, preferred=None):
@@ -1990,6 +2016,7 @@ def create_application(arguments=None):
     palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#60725f"))
     application.setPalette(palette)
     application.setStyleSheet(STYLE)
+    application.popup_keepers = placement.install(application)
     return application
 
 

@@ -1,15 +1,18 @@
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QAbstractButton, QLabel, QSizePolicy
+from PySide6.QtWidgets import (
+    QAbstractButton, QComboBox, QGridLayout, QLabel, QLayout, QSizePolicy, QStyledItemDelegate, QWidget,
+)
 
 
 INK = "#233e32"
-MUTED = "#5b7063"
+MUTED = "#526659"
 GREEN = "#286046"
 PALE = "#a3b3a8"
+MIN_TEXT_PX = 13
 PATHS = {
     "folder": '<path d="M3 7V5h6l2 2h10v12H3Z"/>',
     "search": '<circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/>',
@@ -76,6 +79,8 @@ class CliButton(QAbstractButton):
     silêncio) a barra e o ícone mostram movimento sem fingir porcentagem."""
 
     INSTALLED_HOLD_MS = 900
+    HEIGHT = 88
+    TEXT_LEFT = 58
 
     def __init__(self, title: str, subtitle: str, symbol: str, parent=None):
         super().__init__(parent)
@@ -96,7 +101,7 @@ class CliButton(QAbstractButton):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAccessibleName(title)
         self.setAccessibleDescription(subtitle)
-        self.setMinimumHeight(76)
+        self.setMinimumHeight(self.HEIGHT)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def set_version(self, text: str) -> None:
@@ -147,7 +152,24 @@ class CliButton(QAbstractButton):
         self.setAccessibleDescription(f"{self.subtitle}. {state}" if state else self.subtitle)
 
     def sizeHint(self):
-        return QSize(240, 76)
+        return QSize(240, self.HEIGHT)
+
+    def minimumSizeHint(self):
+        return QSize(CardGrid.MIN_CARD, self.HEIGHT)
+
+    @staticmethod
+    def card_font(pixels: int, weight=QFont.Weight.Normal) -> QFont:
+        font = QFont("Segoe UI")
+        font.setPixelSize(pixels)
+        font.setWeight(weight)
+        return font
+
+    def _text(self, painter: QPainter, font: QFont, color: str, baseline: int, text: str, right: int) -> None:
+        painter.setFont(font)
+        painter.setPen(QColor(color))
+        room = max(0, right - self.TEXT_LEFT)
+        shown = painter.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, room)
+        painter.drawText(self.TEXT_LEFT, baseline, shown)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -157,33 +179,31 @@ class CliButton(QAbstractButton):
         if self.underMouse() and not active:
             background = "#eef2e9"
         painter.setBrush(QColor(background))
-        painter.setPen(QPen(QColor(GREEN if active or self.hasFocus() else "#d8e1d7"), 2 if self.hasFocus() else 1))
-        painter.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 12, 12)
+        width = 3 if self.hasFocus() else 2 if active else 1
+        painter.setPen(QPen(QColor(GREEN if active or self.hasFocus() else "#d8e1d7"), width))
+        inset = width / 2 + 0.5
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(inset, inset, -inset, -inset), 12, 12)
+        top = 30
         if self.installed and not self.installing:
-            icon(self.symbol, GREEN, 25).paint(painter, 19, 24, 25, 25)
+            icon(self.symbol, GREEN, 25).paint(painter, 19, top, 25, 25)
         else:
-            icon(self.symbol, PALE, 25).paint(painter, 19, 24, 25, 25)
+            icon(self.symbol, PALE, 25).paint(painter, 19, top, 25, 25)
             if self.installing:
                 painter.save()
                 if self.fraction is None:
-                    painter.setClipRect(QRectF(19 - 10 + 35 * self.phase, 24, 10, 25))
+                    painter.setClipRect(QRectF(19 - 10 + 35 * self.phase, top, 10, 25))
                 else:
-                    painter.setClipRect(QRectF(19, 24 + 25 * (1 - self.fraction), 25, 25 * self.fraction))
-                icon(self.symbol, GREEN, 25).paint(painter, 19, 24, 25, 25)
+                    painter.setClipRect(QRectF(19, top + 25 * (1 - self.fraction), 25, 25 * self.fraction))
+                icon(self.symbol, GREEN, 25).paint(painter, 19, top, 25, 25)
                 painter.restore()
-        painter.setPen(QColor(INK))
-        painter.setFont(QFont("Segoe UI", 11, QFont.Weight.DemiBold))
-        painter.drawText(58, 30, self.title)
-        painter.setFont(QFont("Segoe UI", 9))
-        painter.setPen(QColor(MUTED))
-        painter.drawText(58, 51, self.subtitle)
+        right = self.width() - (40 if active else 14)
+        self._text(painter, self.card_font(15, QFont.Weight.DemiBold), INK, 31, self.title, right)
+        self._text(painter, self.card_font(MIN_TEXT_PX), MUTED, 54, self.subtitle, self.width() - 14)
         line, color = ((self.stage, GREEN) if self.installing else
                        (self.version, GREEN if "disponível" in self.version else MUTED) if self.installed else
                        ("Não instalado · clique para instalar", MUTED))
         if line:
-            painter.setFont(QFont("Segoe UI", 8))
-            painter.setPen(QColor(color))
-            painter.drawText(58, 67, line)
+            self._text(painter, self.card_font(MIN_TEXT_PX), color, 74, line, self.width() - 14)
         if self.installing:
             track = QRectF(14, self.height() - 7, self.width() - 28, 3)
             painter.setPen(Qt.PenStyle.NoPen)
@@ -209,11 +229,110 @@ class CliButton(QAbstractButton):
             super().keyPressEvent(event)
 
 
+class CurrentMark(QStyledItemDelegate):
+    """List row painter that marks the combo's current item with "✓ Em uso", so it is not told apart by colour alone."""
+
+    MARK = "✓ Em uso"
+    ROW = 40
+    PADDING = 12
+    GAP = 16
+
+    def __init__(self, combo: QComboBox):
+        super().__init__(combo)
+        self.combo = combo
+
+    def mark_font(self) -> QFont:
+        return CliButton.card_font(MIN_TEXT_PX, QFont.Weight.DemiBold)
+
+    def mark_width(self) -> int:
+        return QFontMetrics(self.mark_font()).horizontalAdvance(self.MARK) + self.GAP + self.PADDING
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        return QSize(size.width() + self.mark_width(), max(size.height(), self.ROW))
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        if index.row() == self.combo.currentIndex():
+            room = option.rect.width() - self.mark_width() - self.PADDING
+            option.text = option.fontMetrics.elidedText(option.text, Qt.TextElideMode.ElideRight, max(room, 0))
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if index.row() != self.combo.currentIndex():
+            return
+        painter.save()
+        painter.setFont(self.mark_font())
+        painter.setPen(QColor(GREEN))
+        painter.drawText(option.rect.adjusted(0, 0, -self.PADDING, 0), Qt.AlignRight | Qt.AlignVCenter, self.MARK)
+        painter.restore()
+
+
+class ReadableCombo(QComboBox):
+    """Combo box whose open list follows the stylesheet item rules (dark text on white, 40 px rows) and is wide enough
+    for every name next to the "Em uso" mark; the default menu-style delegate paints the list with the combo's own text
+    colour, unreadable on the dark rail."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setItemDelegate(CurrentMark(self))
+
+    def showPopup(self):
+        view = self.view()
+        view.ensurePolished()
+        metrics = QFontMetrics(view.font())
+        widest = max((metrics.horizontalAdvance(self.itemText(row)) for row in range(self.count())), default=0)
+        view.setMinimumWidth(widest + 2 * CurrentMark.PADDING + self.itemDelegate().mark_width() + 8)
+        super().showPopup()
+
+
+class CardGrid(QWidget):
+    """Tool cards in three columns, or two when the area is too narrow for three readable cards."""
+
+    MIN_CARD = 200
+    SPACING = 12
+
+    def __init__(self, cards: list, parent=None):
+        super().__init__(parent)
+        self.cards = cards
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(self.SPACING)
+        self.grid.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(2 * self.MIN_CARD + self.SPACING)
+        self.columns = 0
+        self.arrange(3)
+
+    @classmethod
+    def columns_for(cls, width: int) -> int:
+        return 3 if width >= 3 * cls.MIN_CARD + 2 * cls.SPACING else 2
+
+    def arrange(self, columns: int) -> None:
+        if columns != self.columns:
+            self.columns = columns
+            for card in self.cards:
+                self.grid.removeWidget(card)
+            for index, card in enumerate(self.cards):
+                self.grid.addWidget(card, index // columns, index % columns)
+            for column in range(3):
+                self.grid.setColumnStretch(column, 1 if column < columns else 0)
+        rows = -(-len(self.cards) // columns)
+        self.setFixedHeight(rows * CliButton.HEIGHT + (rows - 1) * self.SPACING)
+
+    def sizeHint(self):
+        return QSize(3 * 240 + 2 * self.SPACING, self.height())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.arrange(self.columns_for(event.size().width()))
+
+
 STYLE = """
 QMainWindow, QDialog { background: #f5f6f1; }
-QWidget { font-family: 'Segoe UI'; font-size: 13px; color: #233e32; }
+QWidget { font-family: 'Segoe UI'; font-size: 14px; color: #233e32; }
 QLabel { background: transparent; }
-QLabel#muted { color: #5b7063; }
+QLabel#muted { color: #526659; }
 QLabel#muted[bypass="true"] { color: #7e4216; }
 QLabel#title { font-size: 29px; font-weight: 600; }
 QLabel#section { font-size: 14px; font-weight: 600; }
@@ -223,13 +342,15 @@ QLabel#notice { color: #7e4216; background: #f4e5ce; padding: 10px 14px; border-
 QFrame#sidebar { background: #193d32; }
 QFrame#sidebar QLabel { color: #d6e4d6; }
 QFrame#sidebar QLabel#brand { color: #f2f7ec; font-size: 19px; font-weight: 600; }
-QFrame#sidebar QLabel#railMuted { color: #b5cdbf; font-size: 12px; }
+QFrame#sidebar QLabel#railMuted { color: #b5cdbf; font-size: 13px; }
 QLineEdit, QComboBox { background: #ffffff; border: 1px solid #d5ded1; border-radius: 8px; padding: 9px 11px; selection-background-color: #d5e6cf; color: #233e32; }
 QLineEdit:focus, QComboBox:focus { border: 1px solid #286046; }
 QLineEdit { placeholder-text-color: #60725f; }
 QComboBox { min-width: 102px; padding-right: 25px; }
 QComboBox::drop-down { border: 0; width: 25px; }
-QComboBox QAbstractItemView { background: white; selection-background-color: #e3eddf; selection-color: #233e32; padding: 4px; border: 1px solid #d5ded1; }
+QComboBox QAbstractItemView, QFrame#sidebar QComboBox QAbstractItemView { background: #ffffff; color: #233e32; font-size: 14px; selection-background-color: #e3eddf; selection-color: #193d2b; padding: 4px; border: 1px solid #d5ded1; outline: 0; }
+QComboBox QAbstractItemView::item, QFrame#sidebar QComboBox QAbstractItemView::item { min-height: 40px; padding: 0 12px; color: #233e32; }
+QComboBox QAbstractItemView::item:selected, QFrame#sidebar QComboBox QAbstractItemView::item:selected { background: #e3eddf; color: #193d2b; }
 QFrame#sidebar QLineEdit { background: #264c3f; color: #f0f5e9; border: 1px solid #50715d; selection-background-color: #4c735a; }
 QFrame#sidebar QLineEdit:focus { border: 1px solid #bbd7a8; }
 QFrame#sidebar QLineEdit { placeholder-text-color: #c4d8c6; }
@@ -263,9 +384,16 @@ QScrollBar:vertical { background: transparent; width: 10px; margin: 3px; }
 QScrollBar::handle:vertical { background: #adc0aa; min-height: 28px; border-radius: 3px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-QMenu { background: #ffffff; border: 1px solid #d5ded1; padding: 5px; }
-QMenu::item { padding: 9px 20px; }
-QMenu::item:selected { background: #dfecda; }
+QMenu { background: #ffffff; color: #233e32; font-size: 14px; border: 1px solid #d5ded1; border-radius: 8px; padding: 6px; }
+QMenu::item { padding: 8px 24px 8px 12px; min-height: 20px; border-radius: 6px; }
+QMenu::item:selected { background: #e3eddf; color: #193d2b; }
+QMenu::item:disabled { color: #687566; }
+QMenu::separator { height: 1px; background: #d5ded1; margin: 5px 8px; }
+QMenu::indicator { width: 18px; height: 18px; padding-left: 6px; }
+QScrollArea#page, QWidget#page, QScrollArea#page > QWidget#qt_scrollarea_viewport { background: #f5f6f1; border: 0; }
+QFrame#actionsBar { background: #f5f6f1; border-top: 1px solid #d5ded1; }
+QFrame#sidebar QScrollArea#rail, QFrame#sidebar QWidget#railPage, QScrollArea#rail > QWidget#qt_scrollarea_viewport { background: transparent; border: 0; }
+QFrame#sidebar QScrollBar::handle:vertical { background: #50715d; }
 QToolTip { background: #233e32; color: #ffffff; padding: 6px; border: 0; }
 """
 
