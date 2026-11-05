@@ -221,7 +221,7 @@ class ConnectionForm(QDialog):
             layout.addWidget(_label("Conectores do usuário com erro: " + "; ".join(errors), "notice"))
         self.name = QLineEdit(connection["name"] if connection else "")
         self.name.setAccessibleName("Nome da conexão")
-        self.name.setPlaceholderText("Ex.: Meu túnel, OpenRouter pessoal")
+        self.name.setPlaceholderText("Ex.: Meu proxy, OpenRouter pessoal")
         self.fields_host = QWidget()
         self.form = QFormLayout(self.fields_host)
         self.form.setContentsMargins(0, 0, 0, 0)

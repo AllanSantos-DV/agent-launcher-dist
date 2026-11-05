@@ -64,20 +64,34 @@ class Gateway:
         """A chave real da conexão, ou "" (host que já injeta a autenticação ou não exige chave)."""
         return self.options.get("api_key") or ""
 
-    def verify(self, tolerate_quota: bool = False) -> str:
+    def verify(self, tolerate_quota: bool = False, retry_delays: tuple[float, ...] = (), on_wait=None) -> str:
         """Confere a conexão. Com `tolerate_quota`, cota esgotada não é erro: devolve a mensagem para quem abre a sessão
-        avisar (a cota pode ter voltado); sem ela, devolve ""."""
-        try:
-            self.module.verify(self.options)
-        except QuotaExhausted as error:
-            self.store.mark_quota_exhausted(self.connection["id"], str(error), secret_values(self.module, self.options))
-            if not tolerate_quota:
-                raise LauncherError(f"{self.name}: {error}") from error
-            return f"{self.name}: {error}"
-        except ConnectorError as error:
-            raise LauncherError(f"{self.name}: {error}") from error
-        self.store.clear_connection_status(self.connection["id"])  # a cota voltou: o aviso gravado deixa de valer
-        return ""
+        avisar (a cota pode ter voltado); sem ela, devolve "".
+
+        `retry_delays` são as esperas entre tentativas quando o host ainda não responde (falha `transient`, como um
+        gateway subindo no boot); chave recusada e cota esgotada não se repetem. `on_wait(error, delay, attempt,
+        attempts)` é chamado antes de cada espera."""
+        attempts = len(retry_delays) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                self.module.verify(self.options)
+            except QuotaExhausted as error:
+                self.store.mark_quota_exhausted(self.connection["id"], str(error),
+                                                secret_values(self.module, self.options))
+                if not tolerate_quota:
+                    raise LauncherError(f"{self.name}: {error}") from error
+                return f"{self.name}: {error}"
+            except ConnectorError as error:
+                if not error.transient or attempt == attempts:
+                    tried = (f" Sem resposta depois de {attempt} tentativas e {sum(retry_delays):g} s de espera; confira "
+                             "se o gateway já subiu e abra a sessão de novo." if attempt > 1 else "")
+                    raise LauncherError(f"{self.name}: {error}{tried}") from error
+                if on_wait:
+                    on_wait(error, retry_delays[attempt - 1], attempt, attempts)
+                time.sleep(retry_delays[attempt - 1])
+            else:
+                self.store.clear_connection_status(self.connection["id"])  # a cota voltou: o aviso gravado deixa de valer
+                return ""
 
     def empty_catalog(self, records=(), status="Catálogo indisponível; capacidades não confirmadas.", verified=False) -> Catalog:
         return Catalog(list(records), status, verified, self.clis, self.any_model, frozenset(self.protocols))

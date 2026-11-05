@@ -53,6 +53,7 @@ class _Labels(dict):
 CLI_NAMES = _Labels()
 # Todas as sessões viram abas de uma única janela do Windows Terminal com este nome (criada se não existir).
 TERMINAL_WINDOW = APP_ID
+BOOT_RETRY_DELAYS = (1, 2, 4, 8, 15)  # gateway lento no boot: 30 s de espera no total
 
 
 def session_title(project: dict, cli: str, home: Path | None = None) -> str:
@@ -160,6 +161,10 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
     return report["result"]
 
 
+def announce_wait(error: Exception, delay: float, attempt: int, attempts: int) -> None:
+    print(f"  O host ainda não respondeu (tentativa {attempt} de {attempts}); nova tentativa em {delay:g} s.")
+
+
 def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
                 bypass_permissions: bool = False, controlled: bool = False, connection: str | None = None,
                 conversation: str | None = None) -> int:
@@ -174,7 +179,7 @@ def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
         gateway = Gateway.for_project(store, project, connection)
         harness = registry.get(cli)
         print(f"  Conexão: {gateway.name} • {harness.connection_url(gateway) or gateway.url}\n")
-        quota = gateway.verify(tolerate_quota=True)
+        quota = gateway.verify(tolerate_quota=True, retry_delays=BOOT_RETRY_DELAYS, on_wait=announce_wait)
         if quota:
             print(f"  Aviso: {quota}\n")
         plan = build_plan(gateway, cli, project["path"], model, resume, gateway.catalog(), preserve_terminal_title=True,

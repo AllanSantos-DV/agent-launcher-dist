@@ -2,7 +2,7 @@
 
 Abre **Claude Code**, **Codex** e **GitHub Copilot CLI** nos seus projetos, e configura o chat do Copilot no
 **VS Code** e o **GitHub Copilot app**, usando o provedor de modelos que você escolher: um proxy LiteLLM ou host próprio
-(inclusive por túnel/VPN), roteadores como **9router**, **OmniRoute** e **OpenRouter**, as APIs da **Anthropic** e da
+(inclusive na rede ou por VPN), roteadores como **9router**, **OmniRoute** e **OpenRouter**, as APIs da **Anthropic** e da
 **OpenAI**, ou qualquer host compatível com Anthropic Messages, OpenAI Responses ou Chat Completions.
 
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
@@ -196,9 +196,9 @@ No modo texto:
 
 ```powershell
 launcher connectors
-launcher connections add --name "Meu túnel" --connector litellm --set base_url=http://10.0.0.5
+launcher connections add --name "Meu proxy" --connector litellm --set base_url=http://10.0.0.5
 $env:OR_KEY = "sk-or-..."; launcher connections add --name OpenRouter --connector openrouter --secret-env api_key=OR_KEY
-launcher connections default "Meu túnel"
+launcher connections default "Meu proxy"
 launcher connections test OpenRouter
 ```
 

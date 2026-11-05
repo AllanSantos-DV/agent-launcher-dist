@@ -1,4 +1,4 @@
-"""LiteLLM proxy ou host próprio que o expõe (inclusive via túnel/VPN, com a autenticação injetada no host).
+"""LiteLLM proxy ou host próprio que o expõe (inclusive na rede ou por VPN, com a autenticação injetada no host).
 
 /v1/models diz o que está disponível; /v1/model/info (exclusivo do LiteLLM) traz modo, limites e ferramentas por ID.
 O LiteLLM serve /v1/messages, /v1/responses e /v1/chat/completions na mesma base: todos os destinos usam o mesmo endereço.
@@ -13,7 +13,7 @@ from agent_launcher.connectors._http import (KEY_NAME, NO_KEY, TOOL_SEARCH, base
 
 NAME = "litellm"
 LABEL = "LiteLLM / host próprio"
-HINT = "Proxy LiteLLM local, na rede ou por túnel. Sem chave quando o host já injeta a autenticação."
+HINT = "Proxy LiteLLM local ou na rede. Sem chave quando o host já injeta a autenticação."
 EXAMPLE = "http://127.0.0.1:4000"
 FIELDS = (
     {"name": "base_url", "label": "Endereço", "required": True, "placeholder": EXAMPLE,

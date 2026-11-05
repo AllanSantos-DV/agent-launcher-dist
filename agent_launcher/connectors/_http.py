@@ -12,6 +12,7 @@ from agent_launcher.connectors import ConnectorError, QuotaExhausted
 LIMIT = 16 * 1024 * 1024
 NO_KEY = "agent-launcher-no-key"
 ERROR_BODY_LIMIT = 64 * 1024
+TRANSIENT_STATUS = (502, 503, 504)
 # Códigos de error.code dos 429 de crédito e de limite de gasto da OpenAI (developers.openai.com/api/docs/guides/error-codes);
 # o 429 de rate limit não traz nenhum deles.
 OPENAI_QUOTA_CODES = {"credit_balance_exhausted", "organization_spend_limit_exceeded", "project_spend_limit_exceeded",
@@ -106,9 +107,12 @@ def get_json(url: str, headers: dict | None = None, timeout: float = 15, quota=N
         else:
             failure = ConnectorError(f"{url} respondeu HTTP {error.code}.")
         failure.status = error.code  # require_key_routing distingue 403/404 sem depender do texto
+        failure.transient = error.code in TRANSIENT_STATUS
         raise failure from None
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
-        raise ConnectorError(f"Sem resposta de {url}: {getattr(error, 'reason', error)}") from None
+        failure = ConnectorError(f"Sem resposta de {url}: {getattr(error, 'reason', error)}")
+        failure.transient = True
+        raise failure from None
     except (ValueError, UnicodeError):
         raise ConnectorError(f"{url} não devolveu JSON válido.") from None
     if not isinstance(result, dict):

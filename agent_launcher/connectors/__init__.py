@@ -43,7 +43,9 @@ LEGACY = {"claude": "messages", "codex": "responses"}
 
 
 class ConnectorError(Exception):
-    pass
+    """`transient`: o host não respondeu (rede, tempo esgotado, 502/503/504); repetir pode funcionar."""
+
+    transient = False
 
 
 class LoginPending(ConnectorError):

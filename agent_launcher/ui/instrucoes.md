@@ -45,9 +45,9 @@ No modo texto:
 
 ```powershell
 launcher connectors
-launcher connections add --name "Meu túnel" --connector litellm --set base_url=http://10.0.0.5
-launcher connections default "Meu túnel"
-launcher connections test "Meu túnel"
+launcher connections add --name "Meu proxy" --connector litellm --set base_url=http://10.0.0.5
+launcher connections default "Meu proxy"
+launcher connections test "Meu proxy"
 ```
 
 Chaves nunca vão na linha de comando: `--secret-env VARIÁVEL` lê de uma variável de ambiente, e sem ela o comando
