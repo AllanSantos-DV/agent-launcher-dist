@@ -63,6 +63,8 @@ DOWNLOAD_LIMIT = 600 * 1024 * 1024  # instaladores de ~320 MB (Copilot app) e ~2
 # texto e o Windows recusa abri-lo. O Codex não tem postinstall; o binário vem do pacote opcional da plataforma.
 NPM_FLAGS = {"claude": ["--include=optional", "--allow-scripts=@anthropic-ai/claude-code"], "codex": ["--include=optional"]}
 NPM_REPAIR = {cli: f"npm install -g {NPM_PACKAGES[cli]}@latest {' '.join(flags)}" for cli, flags in NPM_FLAGS.items()}
+# npm 11.16.0 (27/05/2026) criou o allow-scripts; o npm anterior avisa "Unknown cli config" e roda os scripts mesmo assim.
+ALLOW_SCRIPTS_SINCE = (11, 16, 0)
 CLAUDE_PLATFORM = Path("node_modules") / "@anthropic-ai" / "claude-code-win32-x64" / "claude.exe"
 CODEX_PLATFORM = (Path("node_modules") / "@openai" / "codex-win32-x64" / "vendor" / "x86_64-pc-windows-msvc" / "bin" / "codex.exe")
 LOG_FILE = data_home() / "cli-install.log"
@@ -184,7 +186,7 @@ def claude_binary(path: Path) -> Path | None:
         invalid = [str(candidate) for candidate in dict.fromkeys(candidates) if candidate.is_file()]
         raise CliInstallError((f"{', '.join(invalid)} não é um executável do Windows (cabeçalho MZ ausente). "
                                if invalid else "Binário nativo do Claude Code não encontrado no pacote do npm. ") +
-                              f"Repare com: {NPM_REPAIR['claude']}")
+                              f"Repare com: {npm_repair('claude', path)}")
     for stub in (candidate for candidate in candidates if candidate.is_file() and candidate != found
                  and candidate.parent.name == "bin" and not is_native(candidate)):
         try:
@@ -195,6 +197,38 @@ def claude_binary(path: Path) -> Path | None:
         except OSError as error:
             print(f"  Aviso: não foi possível reparar {stub} ({error}); usando {found}.")
     return found
+
+
+def npm_prefix(cli: str, path: Path) -> Path | None:
+    """Prefixo global do npm que contém o pacote da CLI aberta por `path` (o shim do PATH ou o próprio bin/), ou None sem
+    pacote do npm em volta. `npm install -g --prefix` nele troca exatamente essa instalação, qualquer que seja o prefixo
+    configurado no npm que está no PATH."""
+    return next((root.parents[2] for root in _package_roots(path, NPM_PACKAGES[cli])
+                 if root.parents[1].name.lower() == "node_modules"), None)
+
+
+def npm_repair(cli: str, path: Path) -> str:
+    """Comando de reparo mostrado ao usuário, com o `--prefix` da instalação que `path` abre quando ela é do npm: sem ele
+    o npm reinstalaria no prefixo configurado, que pode ser outra instalação."""
+    prefix = npm_prefix(cli, path)
+    return NPM_REPAIR[cli] + (f' --prefix "{prefix}"' if prefix else "")
+
+
+def npm_version(npm: str) -> tuple[int, int, int]:
+    """Versão do npm (`npm --version`); erro com a saída quando ele não responde com X.Y.Z."""
+    result = _run([npm, "--version"], timeout=60)
+    found = re.fullmatch(r"\s*(\d+)\.(\d+)\.(\d+)\S*\s*", result.stdout)
+    if result.returncode or not found:
+        raise CliInstallError(f"{npm} --version não informou a versão do npm: {_tail(result)}")
+    return tuple(int(part) for part in found.groups())
+
+
+def npm_flags(cli: str, npm: str) -> list[str]:
+    """NPM_FLAGS da CLI sem o --allow-scripts quando o npm é anterior a ALLOW_SCRIPTS_SINCE (lá ele não existe)."""
+    flags = NPM_FLAGS.get(cli, [])
+    if any(flag.startswith("--allow-scripts") for flag in flags) and npm_version(npm) < ALLOW_SCRIPTS_SINCE:
+        return [flag for flag in flags if not flag.startswith("--allow-scripts")]
+    return list(flags)
 
 
 def codex_platform_binary(path: Path) -> Path | None:
@@ -297,16 +331,22 @@ def install_npm(cli: str) -> None:
     if major is None or major < NODE_MINIMUM[cli]:
         raise CliInstallError(f"{NPM_PACKAGES[cli]} exige Node {NODE_MINIMUM[cli]}+; encontrado: "
                               f"{'nenhum' if major is None else major}.")
-    result = _run([npm, "install", "-g", NPM_PACKAGES[cli], *NPM_FLAGS.get(cli, [])], timeout=900)
+    result = _run([npm, "install", "-g", NPM_PACKAGES[cli], *npm_flags(cli, npm)], timeout=900)
     installed = find(cli)
-    if result.returncode or not installed:
+    if result.returncode:
         _fail(cli, "npm", f"npm install -g {NPM_PACKAGES[cli]} falhou: {_tail(result)}")
+    if not installed:
+        prefix = _run([npm, "prefix", "-g"], timeout=60)
+        where = prefix.stdout.strip() if not prefix.returncode and prefix.stdout.strip() else \
+            f"um prefixo que `npm prefix -g` não informou ({_tail(prefix)})"
+        _fail(cli, "npm", f"npm install -g {NPM_PACKAGES[cli]} terminou sem erro, mas o {cli} não está no PATH: o npm "
+                          f"instalou em {where}. Ponha essa pasta no PATH e abra o launcher de novo.")
     try:
         usable = claude_binary(Path(installed)) if cli == "claude" else codex_platform_binary(Path(installed))
     except CliInstallError as error:
         _fail(cli, "npm", str(error))
     if usable is None and cli == "codex" and Path(installed).suffix.lower() != ".exe":
-        _fail(cli, "npm", f"{NPM_PACKAGES[cli]} instalado sem o binário da plataforma. Repare com: {NPM_REPAIR[cli]}")
+        _fail(cli, "npm", f"{NPM_PACKAGES[cli]} instalado sem o binário da plataforma. Repare com: {npm_repair(cli, Path(installed))}")
 
 
 def install_winget(cli: str) -> None:

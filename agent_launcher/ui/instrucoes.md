@@ -79,7 +79,7 @@ launcher launch --project NOME --cli codex --resume
 launcher conversations --project NOME     # conversas do projeto
 launcher connections test NOME            # testa uma conexão
 launcher doctor                           # confere a instalação e as conexões
-launcher cli --update all                 # atualiza o Claude Code e o Codex
+launcher cli --update all                 # atualiza o Claude Code, o Codex e a Copilot CLI
 launcher update --check                   # só consulta a versão nova
 launcher profiles list
 launcher usage --month 2026-11            # tokens e custo estimados do mês

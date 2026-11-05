@@ -73,7 +73,8 @@ abrir sessão de uma ferramenta que falta pergunta se instala. Não é preciso f
 **Atualização das CLIs.** Cada botão de CLI mostra a versão instalada (`--version`) e, quando o registro do npm tem uma mais
 nova, a faixa de avisos (informativa, separada da de erros) diz "Codex 0.164.0 disponível (instalada 0.162.1)" e aparece **Atualizar Codex 0.162.1 → 0.164.0**.
 Com **Atualizar as CLIs automaticamente** ligado (padrão), o launcher dispara o `update` da própria CLI (ou o
-`npm install -g …@latest` de quem a instalou pelo npm) e avisa "Codex atualizado: 0.162.1 → 0.164.0". Sessão
+`npm install -g …@<versão publicada> --prefix <prefixo>` na instalação do npm que o launcher abre, recusando o shim
+sem pacote do npm ao lado, como os do pnpm e do yarn) e avisa "Codex atualizado: 0.162.1 → 0.164.0". Sessão
 aberta não impede: o Windows deixa renomear um .exe em execução, então a sessão segue na versão antiga e a nova vale na próxima
 abertura (a faixa diz quantas sessões estão nessa situação); só quando a tentativa bate num arquivo preso (npm com a CLI
 rodando) a atualização fica adiada, com o nome do processo e o PID, e tenta de novo na próxima verificação. Falha vira
