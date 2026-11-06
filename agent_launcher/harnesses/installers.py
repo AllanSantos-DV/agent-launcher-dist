@@ -108,9 +108,24 @@ def native_paths(cli: str) -> list[Path]:
     raise ValueError(cli)
 
 
+def _vscode_shim(entry: str) -> bool:
+    """Pasta `copilot-shim` do VS Code (estável ou Insiders) no PATH: o executável dela é do VS Code (assinado pela Microsoft), não o Copilot CLI."""
+    parts = [part.lower() for part in re.split(r"[\\/]+", entry.strip().strip('"'))]
+    return "copilot-shim" in parts and any(part.startswith("microsoft vs code") for part in parts)
+
+
+def _path_without_vscode_shim() -> str:
+    return os.pathsep.join(entry for entry in os.environ.get("PATH", "").split(os.pathsep) if not _vscode_shim(entry))
+
+
+def _inside_profile(path: Path) -> bool:
+    profile = os.path.normcase(os.path.realpath(os.environ.get("USERPROFILE") or Path.home()))
+    return os.path.normcase(os.path.realpath(path)).startswith(profile + os.sep)
+
+
 def find(cli: str) -> str | None:
-    """Executável do CLI: o do PATH, senão o da instalação nativa por usuário."""
-    found = shutil.which(cli)
+    """Executável do CLI: o do PATH (sem o atalho `copilot-shim` do VS Code), senão o da instalação nativa por usuário."""
+    found = shutil.which(cli, path=_path_without_vscode_shim())
     if found:
         return found
     return next((str(path) for path in native_paths(cli) if path.is_file()), None)
@@ -250,7 +265,8 @@ def _signed(path: Path, signer: str) -> bool:
 
 def reject_unsigned(cli: str, paths, step: str, noun: str, after: str = "") -> None:
     """Todo executável de `paths` precisa da assinatura do fabricante. O que não tem, e o que não deu para conferir, é
-    apagado (fica onde `find` o acharia) e o passo `step` é recusado com a causa certa; nunca roda um binário não conferido."""
+    apagado (fica onde `find` o acharia) e o passo `step` é recusado com a causa certa; nunca roda um binário não conferido.
+    Fora do perfil do usuário nada é apagado (não foi o launcher que instalou): o executável é só recusado."""
     unsigned, unchecked = [], {}
     for path in dict.fromkeys(paths):
         try:
@@ -258,12 +274,18 @@ def reject_unsigned(cli: str, paths, step: str, noun: str, after: str = "") -> N
                 unsigned.append(path)
         except SignatureUnchecked as error:
             unchecked[path] = error
+    foreign = [path for path in [*unsigned, *unchecked] if not _inside_profile(path)]
+    unsigned = [path for path in unsigned if path not in foreign]
+    unchecked = {path: error for path, error in unchecked.items() if path not in foreign}
     for path in [*unsigned, *unchecked]:
         try:
             path.unlink()
         except OSError as error:
             _fail(cli, step, f"{path} sem assinatura válida de {SIGNERS[cli]} e não pôde ser apagado ({error}); "
                              "apague-o à mão.")
+    if foreign:
+        _fail(cli, step, f"{', '.join(map(str, foreign))} sem assinatura de {SIGNERS[cli]} e fora do perfil do usuário: "
+                         f"não foi instalado pelo launcher e não foi apagado; a {noun} foi recusada.")
     if unsigned:
         _fail(cli, step, f"{', '.join(map(str, unsigned))} sem assinatura Authenticode válida de {SIGNERS[cli]}{after}; "
                          f"o executável foi apagado e a {noun} recusada.")

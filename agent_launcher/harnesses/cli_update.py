@@ -121,7 +121,7 @@ def installs(cli: str) -> list[str]:
     found = {}
     for folder in os.environ.get("PATH", "").split(os.pathsep):
         folder = folder.strip().strip('"')
-        for ext in extensions if folder else ():
+        for ext in extensions if folder and not installers._vscode_shim(folder) else ():
             candidate = Path(folder) / f"{cli}{ext}"
             if candidate.is_file():
                 found.setdefault(os.path.normcase(os.path.abspath(candidate)), str(candidate))

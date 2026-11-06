@@ -30,6 +30,7 @@ MAX_OUTPUT = 200_000
 REQUEST_KEYS = {"kind", "project", "command", "shell", "timeout", "created", "result"}
 SHELLS = {"powershell": ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"],
           "cmd": ["cmd.exe", "/d", "/s", "/c"]}
+POWERSHELL_UTF8 = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
 
 
 def log(message: str) -> None:
@@ -98,7 +99,9 @@ def token_facts() -> dict:
 def run_command(request: dict, listed: dict) -> dict:
     """Executa o comando elevado na pasta do projeto (a da lista protegida) e devolve saída e código de saída."""
     folder = next(item["path"] for item in listed["projects"] if item.get("id") == request["project"])
-    command = SHELLS[request.get("shell", "powershell")] + [request["command"]]
+    shell = request.get("shell", "powershell")
+    text = POWERSHELL_UTF8 + request["command"] if shell == "powershell" else request["command"]
+    command = SHELLS[shell] + [text]
     answer = {"ok": True, "admin": bool(ctypes.windll.shell32.IsUserAnAdmin())}
     try:
         done = subprocess.run(command, cwd=folder, capture_output=True, timeout=request.get("timeout", 600),
