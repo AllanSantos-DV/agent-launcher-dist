@@ -314,9 +314,10 @@ def task_command(run=subprocess.run) -> str | None:
     return html.unescape(found.group(1)).strip() if found else None
 
 
-def stale_task(run=subprocess.run, system_root: str | None = None) -> str | None:
+def stale_task(run=subprocess.run, system_root: str | None = None, folder: Path | None = None) -> str | None:
     """Motivo se a tarefa instalada precisa ser regravada: aponta para um executável que não existe mais (Python movido
-    ou removido) ou grava o caminho de um Python quando o `pyw.exe` do Windows já resolveria o Python a cada disparo.
+    ou removido), grava o caminho de um Python quando o `pyw.exe` do Windows já resolveria o Python a cada disparo, ou
+    roda um `elevated_runner.py` copiado que difere do desta versão do launcher.
     Regravar exige o clique de UAC de `launcher elevated enable`; a tarefa antiga segue funcionando enquanto o Python
     dela existir."""
     try:
@@ -332,6 +333,21 @@ def stale_task(run=subprocess.run, system_root: str | None = None) -> str | None
     if path.name.lower() in ("python.exe", "pythonw.exe") and Path(task_action(system_root)[0]).name.lower() == "pyw.exe":
         return (f"a tarefa {TASK} grava o caminho de um Python ({command}); rode 'launcher elevated enable' (um clique "
                 "de UAC) para regravá-la pelo pyw.exe, que acha o Python a cada disparo")
+    return stale_runner(folder)
+
+
+def stale_runner(folder: Path | None = None) -> str | None:
+    """Motivo se o `elevated_runner.py` copiado em %ProgramData% difere do desta versão do launcher: só `launcher elevated
+    enable` (um clique de UAC) o regrava, então a atualização do launcher não o renova sozinha."""
+    copy = (folder or protected_dir()) / "elevated_runner.py"
+    try:
+        current = (ROOT / "elevated_runner.py").read_bytes()
+        installed = copy.read_bytes()
+    except OSError as error:
+        return f"não foi possível comparar o runner {copy} com o desta versão do launcher: {error}"
+    if installed != current:
+        return (f"o runner {copy} é de outra versão do launcher; rode 'launcher elevated enable' (um clique de UAC) "
+                "para regravá-lo")
     return None
 
 

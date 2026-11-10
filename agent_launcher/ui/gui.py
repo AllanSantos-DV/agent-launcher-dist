@@ -4,7 +4,7 @@ import re
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QDialog, QFileDialog, QFormLayout, QFrame,
@@ -30,7 +30,10 @@ from agent_launcher.ui import placement
 from agent_launcher.ui.background import deliver
 from agent_launcher.ui.connections import ConnectionsDialog, quota_warning
 from agent_launcher.ui.instructions import InstructionsDialog
-from agent_launcher.ui.theme import GREEN, MUTED, STYLE, CardGrid, CliButton, ElidedLabel, ReadableCombo, icon
+from agent_launcher.ui.theme import (
+    DANGER, GREEN, INFO, MUTED, STYLE, WARN, CardGrid, CliButton, DangerMenu, ElidedLabel, FlowRow, InfoStrip,
+    NoticeStrip, ReadableCombo, icon,
+)
 from agent_launcher.update import updater
 from version import APP_NAME, APP_USER_MODEL_ID, VERSION
 
@@ -53,6 +56,24 @@ def model_name(identifier: str) -> str:
 
 def provider_name(provider: str) -> str:
     return {"bedrock.anthropic": "Bedrock", "vertex_ai.anthropic": "Vertex"}.get(provider, provider or "Direto")
+
+
+def plural(count: int, singular: str, several: str) -> str:
+    return f"{count} {singular if count == 1 else several}"
+
+
+def breakable_path(path: str) -> str:
+    """Texto que quebra linha depois das barras de um caminho (espaço de largura zero), sem mudar o que se lê."""
+    return re.sub(r"([\\/])", "\\1\u200b", path)
+
+
+def catalog_tag(status: str) -> tuple[str, bool]:
+    """Rótulo curto do estado do catálogo, ao lado do título dos modelos (o texto inteiro vai na dica); True = atenção."""
+    if status.startswith("AVISO:"):
+        return ("Cache desatualizado" if "desatualizado" in status else "Catálogo sem confirmação"), True
+    parts = status.split(";")[0].rstrip(".").split(" • ")
+    text = " · ".join(parts[:2] if status.startswith("Cache local") else parts[:1])
+    return text, "indisponível" in text
 
 
 def label(text: str, role: str = "", parent=None) -> QLabel:
@@ -481,10 +502,11 @@ class LauncherWindow(QMainWindow):
         self.cli_checking = False
         self.cli_updating = None
         self.errors: dict[str, str] = {}  # origem -> erro ativo; cada um some só quando a sua origem se resolve
+        self.warnings: dict[str, str] = {}  # origem -> aviso (algo não aconteceu, nada parou de funcionar); some como o erro
         self.infos: dict[str, str] = {}  # origem -> informativo; a mesma origem substitui o seu, origens diferentes convivem
         self.cli_failed = set()
         self.cli_announced = ()
-        self.update_notices: dict[str, str] = {}  # origem ("recuperacao", "falha", "atualizado") -> HTML; convivem
+        self.catalog_size = 0
         self.footer_lines: dict[str, str] = {}  # origem -> rodapé; o de uma operação em curso tem prioridade
         self.footer_busy: set[str] = set()
         self.update_status = "não verificada nesta execução"
@@ -567,11 +589,11 @@ class LauncherWindow(QMainWindow):
         self.profile_options.setToolTip("Novo perfil, renomear, remover, importar ou exportar")
         self.profile_options.setAccessibleName("Opções do perfil")
         self.profile_options.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        profile_menu = QMenu(self)
+        profile_menu = DangerMenu(self)
         profile_menu.addAction("Novo perfil…", self.new_profile)
         self.rename_profile_action = profile_menu.addAction("Renomear perfil…", self.rename_profile)
         self.color_profile_action = profile_menu.addAction("Cor do perfil…", self.color_profile)
-        self.remove_profile_action = profile_menu.addAction("Remover perfil…", self.remove_profile)
+        self.remove_profile_action = profile_menu.add_danger_action("Remover perfil…", self.remove_profile)
         profile_menu.addSeparator()
         self.import_profile_action = profile_menu.addAction("Importar perfil…", self.import_profile)
         self.export_profile_action = profile_menu.addAction("Exportar perfil…", self.export_profile)
@@ -605,7 +627,7 @@ class LauncherWindow(QMainWindow):
         self.project_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.project_list.customContextMenuRequested.connect(self.project_menu)
         rail.addWidget(self.project_list, 1)
-        list_hint = label("Mais recentes primeiro. Botão direito para editar ou remover.", "railMuted")
+        list_hint = label("Mais recentes primeiro. Botão direito ou Shift+F10 para editar ou remover.", "railMuted")
         list_hint.setWordWrap(True)
         rail.addWidget(list_hint)
         add = button("Adicionar projeto", "plus")
@@ -632,6 +654,44 @@ class LauncherWindow(QMainWindow):
         column = QVBoxLayout(content)
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(0)
+        self.restart_banner = QFrame()
+        self.restart_banner.setObjectName("restartBanner")
+        banner = QHBoxLayout(self.restart_banner)
+        banner.setContentsMargins(16, 12, 14, 12)
+        banner.setSpacing(12)
+        restart_mark = QLabel()
+        restart_mark.setPixmap(icon("refresh", GREEN, 22).pixmap(22, 22))
+        banner.addWidget(restart_mark)
+        restart_flow = FlowRow(12)
+        restart_box = QWidget()
+        restart_texts = QVBoxLayout(restart_box)
+        restart_texts.setContentsMargins(0, 0, 0, 0)
+        restart_texts.setSpacing(2)
+        self.restart_title = label("", "restartTitle")
+        self.restart_title.setWordWrap(True)
+        self.restart_detail = label("")
+        self.restart_detail.setWordWrap(True)
+        restart_texts.addWidget(self.restart_title)
+        restart_texts.addWidget(self.restart_detail)
+        restart_flow.add(restart_box, 1, width=lambda: self.restart_title.fontMetrics().horizontalAdvance(
+            self.restart_title.text()) + 8)
+        self.restart_button = button("&Reiniciar agora", "refresh", "primary")
+        self.restart_button.clicked.connect(self.restart)
+        restart_flow.add(self.restart_button, 0, Qt.AlignmentFlag.AlignRight)
+        banner.addWidget(restart_flow, 1)
+        self.restart_banner.hide()
+        self.restart_left = 0
+        self.restart_timer = QTimer(self)
+        self.restart_timer.setInterval(1000)
+        self.restart_timer.timeout.connect(self.tick_restart)
+        self.copied_timer = QTimer(self)
+        self.copied_timer.setSingleShot(True)
+        self.copied_timer.setInterval(InfoStrip.HIDE_MS)
+        self.copied_timer.timeout.connect(lambda: self.end_footer("copia"))
+        banner_row = QHBoxLayout()
+        banner_row.setContentsMargins(32, 14, 32, 0)
+        banner_row.addWidget(self.restart_banner)
+        column.addLayout(banner_row)
         scrolled = QWidget()
         scrolled.setObjectName("page")
         body = QVBoxLayout(scrolled)
@@ -650,28 +710,35 @@ class LauncherWindow(QMainWindow):
         dock.setContentsMargins(32, 12, 32, 18)
         dock.setSpacing(8)
         column.addWidget(dock_frame)
-        top = QHBoxLayout()
+        top = FlowRow(12)
         self.project_title = ElidedLabel("Escolha um projeto")
         self.project_title.setObjectName("title")
         self.project_title.setMinimumHeight(43)
-        top.addWidget(self.project_title, 1)
+        top.add(self.project_title, 1,
+                width=lambda: self.project_title.fontMetrics().horizontalAdvance(self.project_title.full_text) + 8)
+        status_box = QWidget()
+        status_row = QHBoxLayout(status_box)
+        status_row.setContentsMargins(0, 0, 0, 0)
         self.connection = label("Verificando conexão…", "status")
-        top.addWidget(self.connection)
+        status_row.addWidget(self.connection)
         self.options = QToolButton()
         self.options.setObjectName("ghost")
         self.options.setIcon(icon("more"))
         self.options.setToolTip("Opções do projeto e diagnóstico")
         self.options.setAccessibleName("Opções do projeto e diagnóstico")
         self.options.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        menu = QMenu(self)
+        menu = DangerMenu(self)
+        menu.setToolTipsVisible(True)
         menu.addAction("Abrir pasta do projeto", self.open_project)
         menu.addAction("Editar projeto…", self.edit_project)
-        menu.addAction("Remover do launcher…", self.remove_project)
+        menu.add_danger_action("Remover do launcher…", self.remove_project)
         menu.addSeparator()
         menu.addAction("Conexões…", self.manage_connections)
         menu.addAction("Diagnóstico da conexão", self.show_diagnostics)
         self.bypass_preference = QAction("Bypass marcado por padrão", self)
         self.bypass_preference.setCheckable(True)
+        self.bypass_preference.setToolTip("A caixa do Bypass já vem marcada em toda abertura: a sessão abre sem pedir permissão "
+                                          "(no Codex, também sem sandbox).")
         self.bypass_preference.setChecked(self.store.preference("bypass_default"))
         self.bypass_preference.toggled.connect(self.set_bypass_default)
         menu.addAction(self.bypass_preference)
@@ -687,15 +754,16 @@ class LauncherWindow(QMainWindow):
         menu.addAction(self.cli_update_preference)
         menu.addAction("Instruções e comandos…", self.show_instructions)
         self.options.setMenu(menu)
-        top.addWidget(self.options)
-        body.addLayout(top)
+        status_row.addWidget(self.options)
+        top.add(status_box, 0, Qt.AlignmentFlag.AlignLeft)
+        body.addWidget(top)
         project_path_row = QHBoxLayout()
-        self.project_path = ElidedLabel("Seus projetos e suas sessões, em um só lugar.")
-        self.project_path.setObjectName("muted")
+        self.project_path = label("Seus projetos e suas sessões, em um só lugar.", "muted")
+        self.project_path.setWordWrap(True)
         project_path_row.addWidget(self.project_path, 1)
-        self.open_folder = button("Abrir pasta", "folder", "ghost")
+        self.open_folder = button("Abrir &pasta", "folder", "ghost")
         self.open_folder.clicked.connect(self.open_project)
-        project_path_row.addWidget(self.open_folder)
+        project_path_row.addWidget(self.open_folder, 0, Qt.AlignmentFlag.AlignTop)
         body.addLayout(project_path_row)
         body.addSpacing(2)
         self.cli_group = QButtonGroup(self)
@@ -705,11 +773,15 @@ class LauncherWindow(QMainWindow):
             self.cli_group.addButton(widget)
             self.cli_buttons[harness.ID] = widget
             widget.clicked.connect(lambda checked=False, chosen=harness.ID: self.choose_card(chosen))
+            widget.action_requested.connect(lambda chosen=harness.ID: self.update_cli_now(chosen))
         self.cli_buttons["claude"].setChecked(True)
         self.cli_grid = CardGrid(list(self.cli_buttons.values()))
         body.addWidget(self.cli_grid)
         model_heading = QHBoxLayout()
         model_heading.addWidget(label("Modelo da sessão", "section"))
+        self.catalog_tag = label("", "tag")
+        self.catalog_tag.hide()
+        model_heading.addWidget(self.catalog_tag)
         model_heading.addStretch()
         self.model_count = label("", "muted")
         model_heading.addWidget(self.model_count)
@@ -746,82 +818,88 @@ class LauncherWindow(QMainWindow):
         self.model_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.model_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.model_table.setShowGrid(False)
-        self.model_table.setMinimumHeight(110)
+        self.model_table.setMinimumHeight(160)
         self.model_table.itemSelectionChanged.connect(self.select_model)
         body.addWidget(self.model_table, 1)
-        self.empty_models = label("Nenhum modelo encontrado. Limpe a busca ou atualize o catálogo.", "muted")
+        self.empty_models = label("", "muted")
         self.empty_models.setWordWrap(True)
         self.empty_models.hide()
         body.addWidget(self.empty_models)
+        context_card = QFrame()
+        context_card.setObjectName("contextCard")
+        context = QVBoxLayout(context_card)
+        context.setContentsMargins(16, 12, 16, 12)
+        context.setSpacing(4)
         self.model_id = ElidedLabel()
-        self.model_id.setObjectName("muted")
-        body.addWidget(self.model_id)
+        self.model_id.setObjectName("mono")
+        context.addWidget(self.model_id)
         self.context_info = label("Escolha um modelo para ver o contexto.")
         self.context_info.setWordWrap(True)
-        body.addWidget(self.context_info)
+        context.addWidget(self.context_info)
         self.family_info = ElidedLabel()
         self.family_info.setObjectName("muted")
-        body.addWidget(self.family_info)
-        self.notice = label("", "notice")
-        self.notice.setWordWrap(True)
-        self.notice.hide()
-        notice_row = QHBoxLayout()
-        notice_row.addWidget(self.notice, 1)
+        context.addWidget(self.family_info)
+        body.addWidget(context_card)
+        self.info_strip = InfoStrip()
+        self.info_notice = self.info_strip.info
+        self.footer = self.info_strip.status
+        dock.addWidget(self.info_strip)
+        self.problems = QWidget()
+        problems = QVBoxLayout(self.problems)
+        problems.setContentsMargins(0, 0, 0, 0)
+        problems.setSpacing(6)
+        self.error_strip = NoticeStrip("errorStrip", "error", DANGER)
+        self.notice = self.error_strip.text
         self.copy_error = button("Copiar erro", "copy", "ghost")
-        self.copy_error.setToolTip("Copia o aviso com o contexto (versões, Windows, Terminal) para colar num chat de IA")
+        self.copy_error.setToolTip("Copia os erros com o contexto (versões, Windows, Terminal) para colar num chat de IA")
         self.copy_error.clicked.connect(self.copy_notice)
-        self.copy_error.hide()
-        notice_row.addWidget(self.copy_error, 0, Qt.AlignmentFlag.AlignTop)
-        dock.addLayout(notice_row)
-        self.notice.installEventFilter(self)  # o botão aparece e some junto com a faixa
-        self.info_notice = label("", "notice")  # faixa própria do informativo: nunca ocupa o lugar de um erro
-        self.info_notice.setWordWrap(True)
-        self.info_notice.hide()
-        dock.addWidget(self.info_notice)
-        self.update_notice = label("", "notice")
-        self.update_notice.setWordWrap(True)
-        self.update_notice.setTextFormat(Qt.TextFormat.RichText)
-        self.update_notice.linkActivated.connect(lambda _link: self.restart())
-        self.update_notice.hide()
+        self.error_strip.row.addWidget(self.copy_error, 0, Qt.AlignmentFlag.AlignTop)
+        problems.addWidget(self.error_strip)
+        self.warning_strip = NoticeStrip("warningStrip", "alert", WARN)
+        self.warning_notice = self.warning_strip.text
+        problems.addWidget(self.warning_strip)
+        self.problems.hide()
+        dock.addWidget(self.problems)
         if self.store.recovered:
-            self.show_update_notice("recuperacao", self.store.recovered.replace("<", "&lt;"))
-        dock.addWidget(self.update_notice)
-        actions = QHBoxLayout()
-        session_options = QVBoxLayout()
+            self.show_warning(self.store.recovered, origin="recuperacao")
+        actions = FlowRow(12)
+        session_box = QWidget()
+        session_options = QVBoxLayout(session_box)
+        session_options.setContentsMargins(0, 0, 0, 0)
         session_options.setSpacing(4)
         self.bypass_checkbox = QCheckBox("&Bypass de permissões")
         self.bypass_checkbox.setChecked(self.bypass_default)
         self.bypass_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
         self.bypass_checkbox.toggled.connect(self.update_actions)
         session_options.addWidget(self.bypass_checkbox)
+        self.bypass_risk = NoticeStrip("bypassRisk", "alert", WARN)
+        self.bypass_risk.row.setContentsMargins(8, 4, 10, 4)
+        self.bypass_risk.row.setSpacing(6)
+        session_options.addWidget(self.bypass_risk)
         self.session_hint = label("A sessão abre em outra janela.", "muted")
         self.session_hint.setWordWrap(True)
         session_options.addWidget(self.session_hint)
-        actions.addLayout(session_options, 1)
+        actions.add(session_box, 1, width=lambda: self.bypass_checkbox.sizeHint().width())
+        buttons_box = QWidget()
+        buttons = QHBoxLayout(buttons_box)
+        buttons.setContentsMargins(0, 0, 0, 0)
         self.install_cli_button = button("Instalar", "plus")
         self.install_cli_button.setMinimumHeight(44)
         self.install_cli_button.clicked.connect(self.install_cli)
         self.install_cli_button.hide()
-        actions.addWidget(self.install_cli_button)
+        buttons.addWidget(self.install_cli_button)
         self.installing_cli = False
-        self.update_cli_button = button("Atualizar", "refresh")
-        self.update_cli_button.setMinimumHeight(44)
-        self.update_cli_button.clicked.connect(self.update_cli_now)
-        self.update_cli_button.hide()
-        actions.addWidget(self.update_cli_button)
         self.resume_button = button("Retomar última", "resume")
         self.resume_button.setMinimumHeight(44)
         self.resume_button.clicked.connect(lambda: self.launch_session(True))
-        actions.addWidget(self.resume_button)
-        self.build_conversation_menu(actions)
+        buttons.addWidget(self.resume_button)
+        self.build_conversation_menu(buttons)
         self.launch_button = button("Nova sessão", "arrow", "primary")
         self.launch_button.setMinimumHeight(44)
         self.launch_button.clicked.connect(lambda: self.launch_session(False))
-        actions.addWidget(self.launch_button)
-        dock.addLayout(actions)
-        self.footer = ElidedLabel("Consultando a conexão…")
-        self.footer.setObjectName("muted")
-        dock.addWidget(self.footer)
+        buttons.addWidget(self.launch_button)
+        actions.add(buttons_box, 0, Qt.AlignmentFlag.AlignRight)
+        dock.addWidget(actions)
         layout.addWidget(content, 1)
 
     def populate_projects(self, preferred=None):
@@ -862,7 +940,13 @@ class LauncherWindow(QMainWindow):
         if item:
             item.setIcon(icon("folder", GREEN))
         self.project_title.setText(self.project["name"] if self.project else "Seu próximo projeto começa aqui")
-        self.project_path.setText(self.project["path"] if self.project else "Adicione uma pasta para começar. Nenhum arquivo será alterado.")
+        self.project_path.setText(breakable_path(self.project["path"]) if self.project else
+                                  "Adicione uma pasta para começar. Nenhum arquivo será alterado.")
+        self.project_path.setToolTip(self.project["path"] if self.project else "")
+        self.project_path.setAccessibleName(self.project["path"] if self.project else "Pasta do projeto")
+        self.project_path.setObjectName("pathMono" if self.project else "muted")
+        self.project_path.style().unpolish(self.project_path)
+        self.project_path.style().polish(self.project_path)
         self.open_folder.setEnabled(self.project is not None)
         connection = self.project.get("last_connection") if self.project else None
         index = self.connection_picker.findData(connection) if connection else -1
@@ -904,11 +988,11 @@ class LauncherWindow(QMainWindow):
         self.cli_checking = False
         if isinstance(result, Exception):
             clis.record(f"verificação das CLIs falhou: {result}")
-            self.show_error(f"Não foi possível verificar as versões das CLIs: {result}", origin="cli:verificacao")
+            self.show_warning(f"Não foi possível verificar as versões das CLIs: {result}", origin="cli:verificacao")
             return
         self.cli_versions = result
         self.refresh_cli_versions()
-        lines, problems, self.cli_queue = [], [], []
+        problems, self.cli_queue = [], []
         for cli, found in result.items():
             if not found["newer"]:
                 self.clear_error(f"cli:{cli}")  # em dia (atualizada por fora, inclusive): a falha de atualizar não vale mais
@@ -917,37 +1001,41 @@ class LauncherWindow(QMainWindow):
                 continue
             if not found["newer"]:
                 continue
-            head = f"{clis.NAMES[cli]} {found['latest']} disponível (instalada {found['installed']})"
             if self.store.preference("cli_auto_update") and not cli_update.disabled_by_env() \
                     and (cli, found["latest"]) not in self.cli_failed:
-                lines.append(f"{head}; atualizando agora." + self.sessions_note(found["running"]))
                 self.cli_queue.append(cli)
-            else:
-                lines.append(f"{head}. Use o botão Atualizar.")
         if problems:
-            self.show_error("\n".join(problems), origin="cli:verificacao")
+            self.show_warning("\n".join(problems), origin="cli:verificacao")
         else:
             self.clear_error("cli:verificacao")
-        if lines and tuple(lines) != self.cli_announced:
-            self.show_info("\n".join(lines), origin="cli:verificacao")
-        self.cli_announced = tuple(lines)
         self.run_next_cli_update()
         self.update_actions()
 
     @staticmethod
     def sessions_note(count: int) -> str:
-        return (f" {count} sessão(ões) aberta(s) seguem na versão antiga; a nova vale na próxima abertura." if count else "")
+        return (f" {plural(count, 'sessão aberta segue', 'sessões abertas seguem')} na versão antiga; a nova vale na "
+                "próxima abertura." if count else "")
 
     def refresh_cli_versions(self):
+        """Versão instalada na linha do cartão; na faixa dele, a versão nova com Atualizar ou a falha com Tentar de novo."""
         for cli, widget in self.cli_buttons.items():
             found = self.cli_versions.get(cli)
-            widget.set_version("" if not found or not found["installed"] else
-                               f"versão {found['installed']}" + (f" → {found['latest']} disponível" if found["newer"] else ""))
+            widget.set_version(f"versão {found['installed']}" if found and found["installed"] else "")
+            if not found or not found["newer"]:
+                widget.set_offer("")
+            elif (cli, found["latest"]) in self.cli_failed:
+                widget.set_offer(f"Não atualizou para {found['latest']}", "Tentar de novo", WARN, "alert")
+            else:
+                widget.set_offer(f"{found['latest']} disponível", "Atualizar", GREEN, "refresh")
+            widget.action.setEnabled(self.cli_updating is None and not self.cli_checking)
 
     def run_next_cli_update(self):
         if self.cli_updating or not self.cli_queue:
             return
         self.cli_updating = self.cli_queue.pop(0)
+        latest = (self.cli_versions.get(self.cli_updating) or {}).get("latest")
+        self.cli_buttons[self.cli_updating].set_progress(None, f"Atualizando para {latest}…" if latest else "Atualizando…", INFO)
+        self.refresh_cli_versions()
         self.update_actions()
         self.cli_update_task = CliUpdateTask(self.cli_updating)
         self.cli_update_task.signals.completed.connect(self.finish_cli_update)
@@ -960,27 +1048,36 @@ class LauncherWindow(QMainWindow):
         found = self.cli_versions.get(cli) or {}
         if isinstance(result, cli_update.UpdateDeferred):
             self.clear_error(f"cli:{cli}")
+            self.cli_buttons[cli].finish_update("Adiada · sessões abertas")
             self.show_info(str(result), origin=f"cli:{cli}")
         elif isinstance(result, Exception):
             self.cli_failed.add((cli, found.get("latest")))
-            self.show_error(f"Aviso: não foi possível atualizar o {name}: {result}", origin=f"cli:{cli}")
+            self.cli_buttons[cli].finish_update()
+            target = f" para {found['latest']}" if found.get("latest") else ""
+            current = f"na versão {found['installed']}" if found.get("installed") else "na versão de antes"
+            self.show_warning(f"O {name} não atualizou{target} e segue {current}: {result}", origin=f"cli:{cli}")
         elif result["updated"]:
             self.clear_error(f"cli:{cli}")
             found.update(installed=result["after"], newer=False, running=0)
-            self.show_info(f"{name} atualizado: {result['before']} → {result['after']}." + self.sessions_note(result["sessions"]),
-                           origin=f"cli:{cli}")
+            self.cli_buttons[cli].finish_update(f"✓ Atualizado para {result['after']}")
+            if result["sessions"]:
+                self.show_info(f"{name} atualizado: {result['before']} → {result['after']}." + self.sessions_note(result["sessions"]),
+                               origin=f"cli:{cli}")
         else:
             self.clear_error(f"cli:{cli}")
             found.update(installed=result["after"], newer=False, running=0)
-            self.show_info(f"{name} já está em dia ({result['after']}).", origin=f"cli:{cli}")
+            self.cli_buttons[cli].finish_update("✓ Em dia")
         self.refresh_cli_versions()
         self.run_next_cli_update()
         self.update_actions()
 
-    def update_cli_now(self):
-        found = self.cli_versions.get(self.cli)
+    def update_cli_now(self, cli=None):
+        """Atualizar (ou Tentar de novo) da faixa do cartão: entra na frente da fila, inclusive a versão que já falhou."""
+        cli = cli or self.cli
+        found = self.cli_versions.get(cli)
         if found and found["newer"] and not self.cli_updating and not self.cli_checking:
-            self.cli_queue.insert(0, self.cli)
+            self.cli_failed.discard((cli, found["latest"]))
+            self.cli_queue = [cli] + [queued for queued in self.cli_queue if queued != cli]
             self.run_next_cli_update()
 
     def update_portable_terminal(self):
@@ -1026,43 +1123,56 @@ class LauncherWindow(QMainWindow):
             self.update_status = f"falhou: {result}"
         elif isinstance(result, Exception):
             self.update_status = f"falhou: {result}"
-            self.show_update_notice("falha", f"Atualização automática falhou: {result}".replace("<", "&lt;"))
+            self.show_warning(f"{APP_NAME} não se atualizou e segue na versão {VERSION}: {result}", origin="launcher:atualizacao")
         elif result:
             self.update_status = f"atualizado para {result}; reiniciando a interface"
-            self.show_update_notice("atualizado", f"{APP_NAME} atualizado para {result}. Reiniciando a interface em "
-                                    f"{RESTART_DELAY_MS // 1000} s; as sessões abertas continuam. "
-                                    f'<a href="restart">Reiniciar agora</a>')
-            # A janela aberta segue com o código antigo na memória: sem reiniciar, correções não chegam a ela.
-            QTimer.singleShot(RESTART_DELAY_MS, self.restart_if_idle)
+            self.clear_error("launcher:atualizacao")
+            self.announce_restart(result)
         else:
             self.update_status = f"em dia ({VERSION})"
-            self.clear_update_notice("falha")  # só o aviso de falha sai; o de "atualizado, reinicie" e o de recuperação ficam
+            self.clear_error("launcher:atualizacao")
         updater.record(self.update_status)
 
+    def announce_restart(self, version):
+        """Faixa de reinício fixa no topo, com contagem de verdade: a janela aberta segue com o código antigo na memória
+        e, sem reiniciar, as correções não chegam a ela."""
+        self.restart_title.setText(f"{APP_NAME} {version} pronto")
+        self.restart_button.setEnabled(True)
+        self.restart_banner.show()
+        self.restart_left = RESTART_DELAY_MS // 1000
+        if self.restart_left > 0:
+            self.render_countdown()
+            self.restart_timer.start()
+        else:
+            self.restart_timer.stop()
+            QTimer.singleShot(0, self.finish_countdown)
+
+    def tick_restart(self):
+        self.restart_left -= 1
+        if self.restart_left > 0:
+            self.render_countdown()
+        else:
+            self.restart_timer.stop()
+            self.finish_countdown()
+
+    def render_countdown(self):
+        self.restart_detail.setText(f"Reinicia a interface em {self.restart_left} s. As sessões abertas continuam.")
+
+    def finish_countdown(self):
+        self.restart_detail.setText("Reiniciando…")
+        self.restart_button.setEnabled(False)
+        self.restart_if_idle()
+
     def restart_if_idle(self):
-        """Reinicia sozinho, a menos que haja diálogo aberto ou instalação em curso (aí fica a faixa com o link)."""
+        """Reinicia sozinho, a menos que haja diálogo aberto ou instalação em curso (aí a faixa pede o reinício)."""
         busy = (QApplication.activeModalWidget() is not None or self.installing_cli or self.terminal_installing
                 or self.cli_updating is not None)
         if busy:
             self.update_status = self.update_status.replace("reiniciando a interface", "reabra para usar")
-            self.show_update_notice("atualizado", f"{APP_NAME} atualizado. Termine o que está fazendo e "
-                                    f'<a href="restart">reinicie</a> para usar a versão nova.')
+            self.restart_detail.setText("Termine o que está fazendo e reinicie para usar a versão nova.")
+            self.restart_button.setEnabled(True)
             return
         self.restart()
-
-    def show_update_notice(self, origin, html):
-        """Faixa de atualização: cada origem tem o seu aviso (a mesma substitui o seu, origens diferentes convivem)."""
-        self.update_notices[origin] = html
-        self.render_update_notice()
-
-    def clear_update_notice(self, origin):
-        self.update_notices.pop(origin, None)
-        self.render_update_notice()
-
-    def render_update_notice(self):
-        html = "<br>".join(self.update_notices.values())
-        self.update_notice.setText(html)
-        self.update_notice.setVisible(bool(html))
 
     def set_footer(self, origin, text, busy=False):
         """Rodapé: operação em curso (busy) fica na frente até terminar; o que chegar enquanto isso espera a sua vez, e
@@ -1082,7 +1192,13 @@ class LauncherWindow(QMainWindow):
     def render_footer(self):
         busy = [origin for origin in self.footer_lines if origin in self.footer_busy]
         shown = busy[-1] if busy else next(reversed(self.footer_lines), None)
-        self.footer.setText(self.footer_lines.get(shown, ""))
+        self.refresh_info_strip(None, self.footer_lines.get(shown, ""))
+
+    def refresh_info_strip(self, info=None, status=None):
+        """Atualiza a faixa de informativo; o que não vier fica como estava."""
+        info = self.info_notice.text() if info is None else info
+        status = self.footer.full_text if status is None else status
+        self.info_strip.refresh(info, status, bool(self.footer_busy))
 
     def restart(self):
         """Reabre o launcher pela versão instalada e fecha esta janela (as sessões são processos à parte)."""
@@ -1131,7 +1247,7 @@ class LauncherWindow(QMainWindow):
         self.address_label.setToolTip(self.gateway.url if self.gateway else "")
         self.refresh_card_states()
         if not self.gateway:
-            self.connection.setText("Sem conexão")
+            self.connection.setText("✕ Sem conexão")
             self.connection.setProperty("offline", True)
             if not self.store.connections:
                 self.show_error("Adicione uma conexão com um provedor (Gerenciar conexões) para listar modelos e abrir sessões.")
@@ -1237,9 +1353,41 @@ class LauncherWindow(QMainWindow):
         self.model_table.blockSignals(False)
         if self.records:
             self.model_table.selectRow(selected_row)
-        self.empty_models.setVisible(not self.records)
-        self.model_count.setText(f"{len(self.records)} de {len(all_records)} disponíveis")
+        self.catalog_size = len(all_records)
+        self.render_empty_models()
+        self.model_count.setText(f"{len(self.records)} de {len(all_records)} disponíve{'l' if len(all_records) == 1 else 'is'}")
+        self.render_catalog_tag()
         self.select_model()
+
+    def render_empty_models(self):
+        """Lista vazia diz por quê: carregando, catálogo que não veio ou busca sem resultado."""
+        if self.records:
+            self.empty_models.hide()
+            return
+        if self.catalog_size:
+            text = "Nenhum modelo encontrado para esta busca. Limpe a busca ou escolha Todos os providers."
+        elif self.refreshing:
+            text = "Carregando modelos…"
+        elif self.gateway and not self.online and "connection" in self.errors:
+            text = "Não foi possível carregar o catálogo de modelos. Verifique a conexão e clique em Atualizar."
+        elif not self.gateway:
+            text = "Escolha uma conexão para listar os modelos."
+        else:
+            text = "Nenhum modelo neste catálogo para esta ferramenta. Clique em Atualizar para buscar de novo."
+        self.empty_models.setText(text)
+        self.empty_models.show()
+
+    def render_catalog_tag(self):
+        if not self.catalog or not self.catalog.status:
+            self.catalog_tag.hide()
+            return
+        text, stale = catalog_tag(self.catalog.status)
+        self.catalog_tag.setText(text)
+        self.catalog_tag.setToolTip(self.catalog.status.replace("atualizar: r", "atualizar: F5"))
+        self.catalog_tag.setProperty("stale", stale or not self.online)
+        self.catalog_tag.style().unpolish(self.catalog_tag)
+        self.catalog_tag.style().polish(self.catalog_tag)
+        self.catalog_tag.show()
 
     def select_model(self):
         row = self.model_table.currentRow()
@@ -1264,16 +1412,10 @@ class LauncherWindow(QMainWindow):
         self.install_cli_button.setEnabled(not self.installing_cli)
         self.install_cli_button.setText(f"Instalando {registry.get(self.installing_cli).LABEL}…" if self.installing_cli
                                         else f"Instalar {harness.LABEL}")
-        found = self.cli_versions.get(self.cli) if harness.KIND == "terminal" else None
-        self.update_cli_button.setVisible(bool(found and found["newer"]) or self.cli_updating == self.cli)
-        self.update_cli_button.setEnabled(not self.cli_updating)
-        self.update_cli_button.setText(
-            f"Atualizando {harness.LABEL}…" if self.cli_updating == self.cli else
-            f"Atualizar {harness.LABEL} {found['installed']} → {found['latest']}" if found else "Atualizar")
         enabled = bool(self.project and self.gateway and self.selected_model and self.online and not self.refreshing
                        and not missing)
         self.launch_button.setEnabled(enabled)
-        self.launch_button.setText("Nova sessão" if harness.KIND == "terminal" else f"Abrir no {harness.LABEL}")
+        self.launch_button.setText("&Nova sessão" if harness.KIND == "terminal" else f"Abrir no {harness.LABEL}")
         resumable = enabled and "resume" in harness.CAPABILITIES and self.has_previous_conversation()
         self.resume_button.setVisible("resume" in harness.CAPABILITIES)
         self.resume_button.setEnabled(resumable)
@@ -1285,14 +1427,16 @@ class LauncherWindow(QMainWindow):
         description = harness.BYPASS_RISK + " Vale só para a próxima abertura; o padrão fica em Opções → Bypass marcado por padrão."
         self.bypass_checkbox.setToolTip(description)
         self.bypass_checkbox.setAccessibleDescription(description)
-        self.session_hint.setText(harness.BYPASS_HINT if bypass else
-                                  f"{harness.LABEL} não instalado: clique no cartão dele para instalar." if missing and installable else
+        risk = f"Bypass ligado: {harness.BYPASS_HINT[0].lower()}{harness.BYPASS_HINT[1:]}"
+        self.bypass_risk.text.setText(risk)
+        self.bypass_risk.setToolTip(description)
+        self.bypass_risk.setAccessibleName(risk)
+        self.bypass_risk.setAccessibleDescription(description)
+        self.bypass_risk.setVisible(bypass)
+        self.session_hint.setVisible(not bypass)
+        self.session_hint.setText(f"{harness.LABEL} não instalado: clique no cartão dele para instalar." if missing and installable else
                                   harness.MISSING_HINT if missing else harness.SESSION_HINT)
-        self.session_hint.setToolTip(description if bypass else
-                                     session_title(self.project, self.cli, self.store.home) if self.project else "Selecione um projeto")
-        self.session_hint.setProperty("bypass", bypass)
-        self.session_hint.style().unpolish(self.session_hint)
-        self.session_hint.style().polish(self.session_hint)
+        self.session_hint.setToolTip(session_title(self.project, self.cli, self.store.home) if self.project else "Selecione um projeto")
         reason = "Retoma a última sessão nativa deste CLI na pasta do projeto." if enabled else "Escolha projeto, conexão e modelo; a conexão precisa responder."
         self.resume_button.setToolTip(reason if resumable or not enabled else
                                       f"Ainda não há conversa do {harness.LABEL} nesta pasta para retomar: use Nova sessão.")
@@ -1311,7 +1455,7 @@ class LauncherWindow(QMainWindow):
         self.conversation_button.setText("▾")
         self.conversation_button.setMinimumHeight(44)
         self.conversation_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.conversation_button.setAccessibleName("Escolher conversa")
+        self.conversation_button.setAccessibleName("Conversas anteriores")
         self.conversation_button.setToolTip("Escolher qual conversa retomar")
         self.conversation_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QMenu(self.conversation_button)
@@ -1344,6 +1488,7 @@ class LauncherWindow(QMainWindow):
         self.refresh_button.setEnabled(False)
         self.refresh_button.setText("Verificando…")
         self.connection.setText("Verificando conexão…")
+        self.render_empty_models()
         self.update_actions()
         self.refresh_task = RefreshTask(self.store.home, self.gateway.connection["id"], bool(force))
         self.refresh_task.signals.completed.connect(self.finish_refresh)
@@ -1359,7 +1504,7 @@ class LauncherWindow(QMainWindow):
             return  # resposta de uma conexão que já foi trocada
         catalog, error = (None, str(result) or type(result).__name__) if isinstance(result, Exception) else (result, "")
         self.online = not error
-        self.connection.setText(f"Conectado - {self.gateway.name}" if self.online else f"Indisponível - {self.gateway.name}")
+        self.connection.setText(f"✓ Conectado · {self.gateway.name}" if self.online else f"✕ Indisponível · {self.gateway.name}")
         self.connection.setProperty("offline", not self.online)
         self.connection.style().unpolish(self.connection)
         self.connection.style().polish(self.connection)
@@ -1372,7 +1517,6 @@ class LauncherWindow(QMainWindow):
                             origin="connection")
         else:
             self.clear_error("connection")
-        self.set_footer("catalogo", self.catalog.status.replace("atualizar: r", "atualizar: F5") if self.online and self.catalog else error)
         self.populate_providers()
         self.populate_models()
 
@@ -1458,13 +1602,8 @@ class LauncherWindow(QMainWindow):
         finished = [(process, title) for process, title in self.sessions if process.poll() is not None]
         self.sessions = [(process, title) for process, title in self.sessions if process.poll() is None]
         if finished:
-            self.set_footer("sessao", f"Sessão encerrada: {finished[-1][1]} · {len(self.sessions)} janela(s) ainda abertas")
-
-    def eventFilter(self, watched, event):
-        # *ToParent: chegam ao mostrar/esconder a faixa mesmo com a janela ainda invisível (Show/Hide não).
-        if watched is self.notice and event.type() in (QEvent.Type.ShowToParent, QEvent.Type.HideToParent):
-            self.copy_error.setVisible(event.type() == QEvent.Type.ShowToParent)
-        return super().eventFilter(watched, event)
+            self.set_footer("sessao", f"Sessão encerrada: {finished[-1][1]} · "
+                                      f"{plural(len(self.sessions), 'janela ainda aberta', 'janelas ainda abertas')}")
 
     def problem_report(self, message: str) -> str:
         """Aviso + contexto para diagnosticar fora daqui (sem chaves: só versões, caminhos e estado do Terminal)."""
@@ -1484,7 +1623,13 @@ class LauncherWindow(QMainWindow):
 
     def copy_notice(self):
         QApplication.clipboard().setText(self.problem_report(self.notice.toolTip() or self.notice.text()))
-        self.set_footer("copia", "Erro copiado com o contexto: cole num chat de IA ou mande para o suporte.")
+        copied = "Erros copiados" if len(self.errors) > 1 else "Erro copiado"
+        self.confirm_copy(f"{copied} com o contexto: cole num chat de IA ou mande para o suporte.")
+
+    def confirm_copy(self, text):
+        """Confirmação de cópia dura o tempo de um informativo: depois disso não volta junto de outro informativo."""
+        self.set_footer("copia", text)
+        self.copied_timer.start()
 
     def ensure_terminal(self, opened_in_console: bool = False):
         """Sem Terminal: instala sozinho em segundo plano; só avisa de erro se todas as formas falharem."""
@@ -1523,39 +1668,52 @@ class LauncherWindow(QMainWindow):
 
     def render_infos(self):
         text = "\n".join(self.infos.values())
-        self.info_notice.setText(text)
-        self.info_notice.setToolTip(text)
-        self.info_notice.setVisible(bool(text))
+        self.refresh_info_strip(text)
 
     def show_error(self, message, origin=GENERAL_ERROR):
-        """Erro na faixa de erros. Origens diferentes convivem; a mesma origem substitui o seu erro anterior. O erro avulso
-        (origem geral) é de ações diferentes: acumula, sem repetir, e só some quando uma nova ação o limpa."""
+        """Erro na faixa de erros, com Copiar erro. Origens diferentes convivem; a mesma origem substitui o seu erro
+        anterior (e o aviso dela). O erro avulso (origem geral) é de ações diferentes: acumula, sem repetir, e só some
+        quando uma nova ação o limpa."""
         previous = self.errors.get(origin)
         if origin == GENERAL_ERROR and previous:
             message = previous if message in previous.split("\n") else f"{previous}\n{message}"
         self.errors[origin] = message
+        self.warnings.pop(origin, None)
+        self.render_errors()
+
+    def show_warning(self, message, origin=GENERAL_ERROR):
+        """Aviso na faixa âmbar, sem Copiar erro: algo não aconteceu, mas o que já funcionava segue funcionando (a CLI
+        que não atualizou continua na versão de antes). Some pelas mesmas regras do erro da mesma origem."""
+        self.warnings[origin] = message
+        self.errors.pop(origin, None)
         self.render_errors()
 
     def render_errors(self):
-        text = "\n".join(self.errors.values())
-        self.notice.setText(text)
-        self.notice.setToolTip(text)
-        self.notice.setVisible(bool(text))
+        """Erro em cima (com Copiar erro, que copia só os erros), aviso embaixo, sem botão."""
+        for strip, messages in ((self.error_strip, self.errors), (self.warning_strip, self.warnings)):
+            text = "\n".join(messages.values())
+            strip.text.setText(breakable_path(text))
+            strip.text.setToolTip(text)
+            strip.setVisible(bool(text))
+        self.copy_error.setText("Copiar erros" if len(self.errors) > 1 else "Copiar erro")
+        self.problems.setVisible(bool(self.errors or self.warnings))
 
     def clear_error(self, origin=None):
-        """Sem origem, apaga todos os erros; com origem, só o que ela causou (o resto continua valendo)."""
+        """Sem origem, apaga todos os erros e avisos; com origem, só o que ela causou (o resto continua valendo)."""
         if origin is None:
             self.errors.clear()
+            self.warnings.clear()
         else:
             self.errors.pop(origin, None)
+            self.warnings.pop(origin, None)
         self.render_errors()
 
     def clear_transient(self, *origins):
-        """Ação do usuário que não resolve os erros persistentes: some o erro avulso, o informativo e as origens
-        que a ação refaz (ex.: trocar de conexão refaz o erro da conexão)."""
-        self.errors.pop(GENERAL_ERROR, None)
-        for origin in origins:
+        """Ação do usuário que não resolve os erros persistentes: some o erro e o aviso avulsos, o informativo e as
+        origens que a ação refaz (ex.: trocar de conexão refaz o erro da conexão)."""
+        for origin in (GENERAL_ERROR, *origins):
             self.errors.pop(origin, None)
+            self.warnings.pop(origin, None)
         self.render_errors()
         self.clear_info()
 
@@ -1602,19 +1760,25 @@ class LauncherWindow(QMainWindow):
             added, skipped = fresh.import_legacy(Path(path))
             self.store = fresh
             self.populate_projects(self.project["id"] if self.project else None)
-            self.set_footer("importacao", f"{added} projeto(s) importado(s); {skipped} já existentes ou inválidos. Nenhuma credencial importada.")
+            self.set_footer("importacao", f"{plural(added, 'projeto importado', 'projetos importados')}; "
+                                          f"{plural(skipped, 'já existente ou inválido', 'já existentes ou inválidos')}. "
+                                          "Nenhuma credencial importada.")
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(str(error))
 
     def project_menu(self, position):
+        """Menu do projeto pelo botão direito ou pelo teclado (tecla Menu, Shift+F10), que abre no projeto selecionado."""
         item = self.project_list.itemAt(position)
         if item is None:
-            return
+            item = self.project_list.currentItem()
+            if item is None:
+                return
+            position = self.project_list.visualItemRect(item).center()
         self.project_list.setCurrentItem(item)
-        menu = QMenu(self)
+        menu = DangerMenu(self)
         menu.addAction("Abrir pasta", self.open_project)
         menu.addAction("Editar…", self.edit_project)
-        menu.addAction("Remover do launcher…", self.remove_project)
+        menu.add_danger_action("Remover do launcher…", self.remove_project)
         menu.exec(self.project_list.viewport().mapToGlobal(position))
 
     def edit_project(self):
@@ -1970,8 +2134,8 @@ class LauncherWindow(QMainWindow):
         if quota:
             lines.insert(lines.index("Estado: " + ("respondeu" if self.online else "não confirmado")) + 1,
                          "Cota: esgotada na última verificação. " + quota)
-        self.diagnostics_dialog = DiagnosticsDialog("\n".join(lines), self, lambda: self.set_footer(
-            "copia", "Diagnóstico copiado: cole num chat de IA ou mande para o suporte."))
+        self.diagnostics_dialog = DiagnosticsDialog("\n".join(lines), self, lambda: self.confirm_copy(
+            "Diagnóstico copiado: cole num chat de IA ou mande para o suporte."))
         self.diagnostics_dialog.open()
 
 

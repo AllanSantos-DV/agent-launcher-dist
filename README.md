@@ -262,8 +262,8 @@ Implica bypass e:
 Sessão controlada não pode parar esperando clique (o orquestrador já validou o projeto antes de cadastrar). Só nela,
 e só para a pasta do projeto cadastrado:
 
-- **Claude:** antes de abrir, grava `hasTrustDialogAccepted` daquela pasta no `~/.claude.json` (troca atômica, refeita
-  se outra sessão gravou no meio).
+- **Claude:** antes de abrir, grava `hasTrustDialogAccepted` daquela pasta no `~/.claude.json`, inclusive na chave com
+  barra normal (`C:/pasta`) que o Claude Code lê no Windows (troca atômica, refeita se outra sessão gravou no meio).
 - **Codex:** `-c check_for_update_on_startup=false`, confiança da pasta só neste processo
   (`-c projects={"<pasta>"={trust_level="trusted"}}`, nada gravado em disco) e, antes de abrir (conversa nova ou
   retomada), a confiança dos hooks novos ou alterados daquela pasta gravada pelo app-server do Codex (o mesmo "Trust

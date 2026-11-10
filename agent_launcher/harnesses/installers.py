@@ -33,6 +33,7 @@ from pathlib import Path
 
 from agent_launcher.domain.downloads import restricted_redirects
 from agent_launcher.domain.files import append_capped, replace_retrying
+from agent_launcher.harnesses.base import path_without_vscode_shim
 from agent_launcher.platform import terminal
 from version import data_home
 
@@ -40,9 +41,13 @@ NAMES = {"claude": "Claude Code", "codex": "Codex", "copilot": "GitHub Copilot C
 OFFICIAL = {"claude": "https://claude.ai/install.ps1", "codex": "https://chatgpt.com/codex/install.ps1"}
 # Hosts por onde o script oficial pode redirecionar (medido: claude.ai e chatgpt.com respondem 302 para o segundo host).
 OFFICIAL_HOSTS = {"claude": ("downloads.claude.ai",), "codex": ("releases.openai.com",)}
-# Início do Subject do certificado Authenticode dos binários nativos de cada fabricante (lidos dos pacotes oficiais).
-SIGNERS = {"claude": 'CN="Anthropic, PBC"', "codex": 'CN="OpenAI OpCo, LLC"',
-           "copilot": 'CN="GitHub, Inc."', "vscode": "CN=Microsoft Corporation", "copilot_app": 'CN="GitHub, Inc."'}
+# Início do Subject do certificado Authenticode dos binários nativos de cada fabricante (lidos dos pacotes oficiais), até
+# o país: CN, organização, cidade, estado e país fixam a editora, não só o nome.
+_GITHUB = 'CN="GitHub, Inc.", O="GitHub, Inc.", L=San Francisco, S=California, C=US'
+SIGNERS = {"claude": 'CN="Anthropic, PBC", O="Anthropic, PBC", L=San Francisco, S=California, C=US',
+           "codex": 'CN="OpenAI OpCo, LLC", O="OpenAI OpCo, LLC", L=San Francisco, S=California, C=US',
+           "copilot": _GITHUB, "copilot_app": _GITHUB,
+           "vscode": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"}
 NPM_PACKAGES = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex", "copilot": "@github/copilot"}
 NODE_MINIMUM = {"claude": 22, "codex": 18, "copilot": 22}
 WINGET = {"copilot": "GitHub.Copilot", "vscode": "Microsoft.VisualStudioCode", "copilot_app": "GitHub.CopilotApp"}
@@ -108,27 +113,41 @@ def native_paths(cli: str) -> list[Path]:
     raise ValueError(cli)
 
 
-def _vscode_shim(entry: str) -> bool:
-    """Pasta `copilot-shim` do VS Code (estável ou Insiders) no PATH: o executável dela é do VS Code (assinado pela Microsoft), não o Copilot CLI."""
-    parts = [part.lower() for part in re.split(r"[\\/]+", entry.strip().strip('"'))]
-    return "copilot-shim" in parts and any(part.startswith("microsoft vs code") for part in parts)
-
-
-def _path_without_vscode_shim() -> str:
-    return os.pathsep.join(entry for entry in os.environ.get("PATH", "").split(os.pathsep) if not _vscode_shim(entry))
-
-
 def _inside_profile(path: Path) -> bool:
     profile = os.path.normcase(os.path.realpath(os.environ.get("USERPROFILE") or Path.home()))
     return os.path.normcase(os.path.realpath(path)).startswith(profile + os.sep)
 
 
+_REFUSED: set[tuple] = set()
+
+
+def _identity(path: Path | str) -> tuple:
+    """Arquivo recusado por identidade (caminho real, tamanho e data): um executável trocado no mesmo lugar volta a valer."""
+    status = os.stat(path)
+    return os.path.normcase(os.path.realpath(path)), status.st_size, status.st_mtime_ns
+
+
+def _refused(path: Path | str) -> bool:
+    try:
+        return _identity(path) in _REFUSED
+    except OSError:
+        return False
+
+
 def find(cli: str) -> str | None:
-    """Executável do CLI: o do PATH (sem o atalho `copilot-shim` do VS Code), senão o da instalação nativa por usuário."""
-    found = shutil.which(cli, path=_path_without_vscode_shim())
-    if found:
-        return found
-    return next((str(path) for path in native_paths(cli) if path.is_file()), None)
+    """Executável do CLI: o primeiro do PATH (sem o atalho `copilot-shim` do VS Code), senão o da instalação nativa por
+    usuário, pulando os que `reject_unsigned` recusou nesta execução (o próximo candidato assume)."""
+    path = path_without_vscode_shim()
+    while found := shutil.which(cli, path=path):
+        if not _refused(found):
+            return found
+        folder = os.path.normcase(os.path.normpath(os.path.dirname(found)))
+        rest = os.pathsep.join(entry for entry in path.split(os.pathsep)
+                               if os.path.normcase(os.path.normpath(entry)) != folder)
+        if rest == path:
+            break
+        path = rest
+    return next((str(path) for path in native_paths(cli) if path.is_file() and not _refused(path)), None)
 
 
 def _run(command: list[str], timeout: int, environment: dict | None = None) -> subprocess.CompletedProcess:
@@ -277,6 +296,7 @@ def reject_unsigned(cli: str, paths, step: str, noun: str, after: str = "") -> N
     foreign = [path for path in [*unsigned, *unchecked] if not _inside_profile(path)]
     unsigned = [path for path in unsigned if path not in foreign]
     unchecked = {path: error for path, error in unchecked.items() if path not in foreign}
+    _REFUSED.update(_identity(path) for path in foreign)
     for path in [*unsigned, *unchecked]:
         try:
             path.unlink()

@@ -212,7 +212,8 @@ def signature_ok(executable: Path, signer: str = SIGNER) -> bool:
     não confundir "não consegui conferir" com "não é assinado"."""
     script = ("$ErrorActionPreference = 'Stop'; try { "
               "$s = Get-AuthenticodeSignature -LiteralPath $env:AL_FILE; "
-              "if ($s.Status -eq 'Valid' -and $s.SignerCertificate.Subject -like ($env:AL_SIGNER + ',*')) { exit 0 }; exit 1 "
+              "$subject = $s.SignerCertificate.Subject; "
+              "if ($s.Status -eq 'Valid' -and ($subject -eq $env:AL_SIGNER -or $subject -like ($env:AL_SIGNER + ',*'))) { exit 0 }; exit 1 "
               "} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 2 }")
     result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
                             env=powershell_env({"AL_FILE": str(executable), "AL_SIGNER": signer}),

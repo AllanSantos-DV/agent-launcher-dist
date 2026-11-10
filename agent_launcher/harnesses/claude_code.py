@@ -137,7 +137,9 @@ def trust_claude_folder(path: Path, config: Path | None = None, attempts: int = 
         projects = data.get("projects")
         if not isinstance(projects, dict):
             raise LauncherError(f"Formato inesperado em {config} (sem 'projects'); confiança da pasta não gravada.")
-        keys = [name for name in projects if name.replace("\\", "/").casefold() == key.casefold()] or [key]
+        keys = [name for name in projects if name.replace("\\", "/").casefold() == key.casefold()]
+        if key not in keys:
+            keys.append(key)  # o Claude Code no Windows lê a chave com barra normal
         if all(isinstance(projects.get(name), dict) and projects[name].get("hasTrustDialogAccepted") is True
                for name in keys):
             return False

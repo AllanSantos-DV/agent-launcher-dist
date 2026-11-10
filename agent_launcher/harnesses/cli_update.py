@@ -16,6 +16,7 @@ from pathlib import Path
 
 from agent_launcher.domain.files import remove_tree
 from agent_launcher.harnesses import installers
+from agent_launcher.harnesses.base import vscode_shim
 from agent_launcher.harnesses.installers import NAMES, NPM_PACKAGES, CliInstallError
 from agent_launcher.platform import processes
 from agent_launcher.update import updater
@@ -121,7 +122,7 @@ def installs(cli: str) -> list[str]:
     found = {}
     for folder in os.environ.get("PATH", "").split(os.pathsep):
         folder = folder.strip().strip('"')
-        for ext in extensions if folder and not installers._vscode_shim(folder) else ():
+        for ext in extensions if folder and not vscode_shim(folder) else ():
             candidate = Path(folder) / f"{cli}{ext}"
             if candidate.is_file():
                 found.setdefault(os.path.normcase(os.path.abspath(candidate)), str(candidate))
@@ -189,6 +190,10 @@ def clean_staging(cli: str, path: str) -> None:
     scope, name = NPM_PACKAGES[cli].split("/")
     for folder in sorted((prefix / "node_modules" / scope).glob(f".{name}-*")):
         if not folder.is_dir():
+            continue
+        if not installers._inside_profile(folder):
+            installers.record(f"{installers.label(cli)}: {folder} (versão velha deixada pelo npm) fica fora do perfil do "
+                              "usuário e não foi apagada: o launcher não instalou esse prefixo.")
             continue
         if _held(folder):
             installers.record(f"{installers.label(cli)}: {folder} (versão velha deixada pelo npm) segue em uso ou sem "

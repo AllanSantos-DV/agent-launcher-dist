@@ -1,10 +1,11 @@
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QByteArray, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
-    QAbstractButton, QComboBox, QGridLayout, QLabel, QLayout, QSizePolicy, QStyledItemDelegate, QWidget,
+    QAbstractButton, QBoxLayout, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLayout, QMenu, QPushButton,
+    QSizePolicy, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 
@@ -12,6 +13,15 @@ INK = "#233e32"
 MUTED = "#526659"
 GREEN = "#286046"
 PALE = "#a3b3a8"
+DANGER = "#a32018"
+DANGER_BG = "#fbe8e5"
+INFO = "#0d5568"
+INFO_BG = "#e1f0f3"
+WARN = "#7e4216"
+WARN_BG = "#f4e5ce"
+SURFACE = "#f5f6f1"
+MENU_BACKGROUND = "#ffffff"
+MENU_SELECTED = "#e3eddf"
 MIN_TEXT_PX = 13
 PATHS = {
     "folder": '<path d="M3 7V5h6l2 2h10v12H3Z"/>',
@@ -29,6 +39,9 @@ PATHS = {
     "more": '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
     "import": '<path d="M12 3v12m-5-5 5 5 5-5M4 15v6h16v-6"/>',
     "check": '<path d="m5 12 4 4L19 6"/>',
+    "info": '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.01"/>',
+    "alert": '<path d="M12 4 2.5 20h19Z"/><path d="M12 10v4.5M12 17.5v.01"/>',
+    "error": '<circle cx="12" cy="12" r="9"/><path d="M12 7v6M12 16.5v.01"/>',
 }
 
 
@@ -75,12 +88,20 @@ class ElidedLabel(QLabel):
 
 class CliButton(QAbstractButton):
     """Cartão de uma ferramenta. Pronta: marcável, como sempre. Não instalada: ícone apagado e "clique para instalar".
-    Instalando: barra no rodapé e ícone pintado na mesma fração; sem fração conhecida (instalador do fabricante em
-    silêncio) a barra e o ícone mostram movimento sem fingir porcentagem."""
+    A faixa de baixo, separada por um fio, é o lugar de tudo que a instalação e a atualização da ferramenta dizem:
+    andamento (texto e barra de 8 px; sem fração conhecida, movimento sem fingir porcentagem), o resultado que fica um
+    instante e a oferta que fica (versão nova com Atualizar, falha com Tentar de novo), com o botão numa linha própria
+    para o texto caber inteiro no cartão estreito."""
 
     INSTALLED_HOLD_MS = 900
+    UPDATED_HOLD_MS = 3500
     HEIGHT = 88
+    BAND = 54
+    OFFER_BAND = 72
+    BAR = 8
     TEXT_LEFT = 58
+    BAND_LEFT = 19
+    action_requested = Signal()
 
     def __init__(self, title: str, subtitle: str, symbol: str, parent=None):
         super().__init__(parent)
@@ -92,39 +113,54 @@ class CliButton(QAbstractButton):
         self.installing = False
         self.fraction: float | None = None
         self.stage = ""
+        self.tone = GREEN
+        self.offer = ""
+        self.offer_tone = GREEN
+        self.offer_symbol = "refresh"
         self.phase = 0.0
         self.animation = QTimer(self)
         self.animation.setInterval(40)
         self.animation.timeout.connect(self._advance)
+        self.action = QPushButton(self)
+        self.action.setObjectName("cardAction")
+        self.action.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.action.clicked.connect(self.action_requested)
+        self.action.hide()
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAccessibleName(title)
         self.setAccessibleDescription(subtitle)
         self.setMinimumHeight(self.HEIGHT)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
     def set_version(self, text: str) -> None:
         self.version = text
-        self._describe()
-        self.update()
+        self._relayout()
 
     def set_installed(self, installed: bool) -> None:
         self.installed = installed
         self.setCheckable(installed)
-        self._describe()
-        self.update()
+        self._relayout()
 
-    def set_progress(self, fraction: float | None, stage: str) -> None:
+    def set_offer(self, text: str, action: str = "", tone: str = GREEN, symbol: str = "refresh") -> None:
+        """Oferta que fica na faixa enquanto valer (versão nova, atualização que falhou); texto vazio a tira."""
+        self.offer, self.offer_tone, self.offer_symbol = text, tone, symbol
+        self.action.setText(action)
+        self.action.setIcon(icon(symbol, GREEN) if action else QIcon())
+        self.action.setAccessibleName(f"{action} {self.title}" if action else "")
+        self._relayout()
+
+    def set_progress(self, fraction: float | None, stage: str, tone: str = GREEN) -> None:
         self.installing = True
+        self.tone = tone
         self.fraction = None if fraction is None else max(0.0, min(float(fraction), 1.0))
         self.stage = stage
         if self.fraction is None:
             self.animation.start()
         else:
             self.animation.stop()
-        self._describe()
-        self.update()
+        self._relayout()
 
     def finish_install(self, installed: bool) -> None:
         """Instalado: a barra completa fica à vista um instante antes de o cartão voltar ao normal."""
@@ -137,25 +173,64 @@ class CliButton(QAbstractButton):
             self._stop_installing()
         self.set_installed(installed)
 
+    def finish_update(self, stage: str = "") -> None:
+        """Atualização concluída ou adiada: o resultado fica na faixa um instante e dá lugar à oferta. Sem resultado
+        (a falha, que a oferta "Tentar de novo" já conta), a oferta volta na hora."""
+        self.animation.stop()
+        if not stage:
+            self._stop_installing()
+            return
+        self.installing, self.fraction, self.stage, self.tone = True, 1.0, stage, INFO
+        self._relayout()
+        QTimer.singleShot(self.UPDATED_HOLD_MS, self._stop_installing)
+
     def _stop_installing(self) -> None:
         self.installing, self.fraction, self.stage = False, None, ""
-        self._describe()
-        self.update()
+        self._relayout()
 
     def _advance(self) -> None:
         self.phase = (self.phase + 0.02) % 1.0
         self.update()
 
+    def has_band(self) -> bool:
+        return self.installing or bool(self.offer)
+
+    def band_height(self) -> int:
+        if not self.has_band():
+            return 0
+        return self.OFFER_BAND if not self.installing and self.action.text() else self.BAND
+
+    def bar_rect(self) -> QRectF:
+        return QRectF(self.BAND_LEFT, self.HEIGHT + 30, self.width() - 2 * self.BAND_LEFT, self.BAR)
+
+    def _relayout(self) -> None:
+        self.action.setVisible(bool(self.offer and self.action.text()) and not self.installing)
+        self.setMinimumHeight(self.HEIGHT + self.band_height())
+        self._place_action()
+        self._describe()
+        self.updateGeometry()
+        self.update()
+        if isinstance(self.parentWidget(), CardGrid):
+            self.parentWidget().refit()
+
+    def _place_action(self) -> None:
+        self.action.adjustSize()
+        self.action.move(self.width() - 12 - self.action.width(), self.HEIGHT + 30)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._place_action()
+
     def _describe(self) -> None:
-        state = (self.stage if self.installing else self.version if self.installed
-                 else "Não instalado. Clique para instalar")
-        self.setAccessibleDescription(f"{self.subtitle}. {state}" if state else self.subtitle)
+        state = (self.version if self.installed else "Não instalado. Clique para instalar")
+        band = self.stage if self.installing else self.offer
+        self.setAccessibleDescription(". ".join(part for part in (self.subtitle, state, band) if part))
 
     def sizeHint(self):
-        return QSize(240, self.HEIGHT)
+        return QSize(240, self.minimumHeight())
 
     def minimumSizeHint(self):
-        return QSize(CardGrid.MIN_CARD, self.HEIGHT)
+        return QSize(CardGrid.MIN_CARD, self.minimumHeight())
 
     @staticmethod
     def card_font(pixels: int, weight=QFont.Weight.Normal) -> QFont:
@@ -164,12 +239,13 @@ class CliButton(QAbstractButton):
         font.setWeight(weight)
         return font
 
-    def _text(self, painter: QPainter, font: QFont, color: str, baseline: int, text: str, right: int) -> None:
+    def _text(self, painter: QPainter, font: QFont, color: str, baseline: int, text: str, right: int,
+              left: int = TEXT_LEFT) -> None:
         painter.setFont(font)
         painter.setPen(QColor(color))
-        room = max(0, right - self.TEXT_LEFT)
+        room = max(0, right - left)
         shown = painter.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, room)
-        painter.drawText(self.TEXT_LEFT, baseline, shown)
+        painter.drawText(left, baseline, shown)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -194,33 +270,49 @@ class CliButton(QAbstractButton):
                     painter.setClipRect(QRectF(19 - 10 + 35 * self.phase, top, 10, 25))
                 else:
                     painter.setClipRect(QRectF(19, top + 25 * (1 - self.fraction), 25, 25 * self.fraction))
-                icon(self.symbol, GREEN, 25).paint(painter, 19, top, 25, 25)
+                icon(self.symbol, self.tone, 25).paint(painter, 19, top, 25, 25)
                 painter.restore()
         right = self.width() - (40 if active else 14)
         self._text(painter, self.card_font(15, QFont.Weight.DemiBold), INK, 31, self.title, right)
         self._text(painter, self.card_font(MIN_TEXT_PX), MUTED, 54, self.subtitle, self.width() - 14)
-        line, color = ((self.stage, GREEN) if self.installing else
-                       (self.version, GREEN if "disponível" in self.version else MUTED) if self.installed else
-                       ("Não instalado · clique para instalar", MUTED))
+        line = self.version if self.installed else "" if self.installing else "Não instalado · clique para instalar"
         if line:
-            self._text(painter, self.card_font(MIN_TEXT_PX), color, 74, line, self.width() - 14)
-        if self.installing:
-            track = QRectF(14, self.height() - 7, self.width() - 28, 3)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#dfe7dc"))
-            painter.drawRoundedRect(track, 1.5, 1.5)
-            if self.fraction is None:
-                width = track.width() * 0.28
-                left = track.left() - width + (track.width() + width) * self.phase
-                painter.setClipRect(track)
-                fill = QRectF(left, track.top(), width, track.height())
-            else:
-                fill = QRectF(track.left(), track.top(), track.width() * self.fraction, track.height())
-            painter.setBrush(QColor(GREEN))
-            painter.drawRoundedRect(fill, 1.5, 1.5)
-            painter.setClipping(False)
+            self._text(painter, self.card_font(MIN_TEXT_PX), MUTED, 74, line, self.width() - 14)
+        if self.has_band():
+            self._paint_band(painter)
         if active:
             icon("check", GREEN, 17).paint(painter, self.width() - 32, 17, 17, 17)
+
+    def _paint_band(self, painter: QPainter) -> None:
+        line = self.HEIGHT - 2
+        painter.setPen(QPen(QColor("#d8e1d7"), 1))
+        painter.drawLine(14, line, self.width() - 14, line)
+        if self.installing:
+            text, tone, symbol, baseline = self.stage, self.tone, "", self.HEIGHT + 20
+        else:
+            text, tone, symbol, baseline = self.offer, self.offer_tone, self.offer_symbol, self.HEIGHT + 21
+        left = self.BAND_LEFT
+        if symbol:
+            icon(symbol, tone, 16).paint(painter, left, baseline - 13, 16, 16)
+            left += 23
+        self._text(painter, self.card_font(MIN_TEXT_PX, QFont.Weight.DemiBold), tone, baseline, text, self.width() - 14, left)
+        if not self.installing:
+            return
+        track = self.bar_rect()
+        radius = self.BAR / 2
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#dfe7dc"))
+        painter.drawRoundedRect(track, radius, radius)
+        if self.fraction is None:
+            width = track.width() * 0.28
+            left = track.left() - width + (track.width() + width) * self.phase
+            painter.setClipRect(track)
+            fill = QRectF(left, track.top(), width, track.height())
+        else:
+            fill = QRectF(track.left(), track.top(), track.width() * self.fraction, track.height())
+        painter.setBrush(QColor(self.tone))
+        painter.drawRoundedRect(fill, radius, radius)
+        painter.setClipping(False)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -286,6 +378,170 @@ class ReadableCombo(QComboBox):
         super().showPopup()
 
 
+class DangerMenu(QMenu):
+    """Menu whose destructive actions are written in the danger colour; the stylesheet cannot colour a single item, so
+    the item is painted over after the stylesheet drew it, with the same padding, radius and selection colour."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.danger_actions: set[QAction] = set()
+
+    def add_danger_action(self, text: str, slot) -> QAction:
+        action = self.addAction(text, slot)
+        self.danger_actions.add(action)
+        return action
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for action in self.danger_actions:
+            area = self.actionGeometry(action)
+            if not action.isVisible() or not area.isValid():
+                continue
+            selected = action is self.activeAction() and action.isEnabled()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(MENU_SELECTED if selected else MENU_BACKGROUND))
+            painter.drawRoundedRect(area, 6, 6)
+            painter.setPen(QColor(DANGER))
+            painter.setFont(self.font())
+            text_area = area.adjusted(12, 0, -24, 0)
+            painter.drawText(text_area, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, action.text())
+
+
+class WrappingLabel(QLabel):
+    """Rótulo de linha de status que quebra em vez de cortar; guarda o texto inteiro em `full_text`."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.full_text = ""
+        self.setWordWrap(True)
+
+    def setText(self, text: str) -> None:
+        self.full_text = text
+        super().setText(text)
+
+
+class NoticeStrip(QFrame):
+    """Faixa de um nível de problema (erro ou aviso): ícone do nível, texto puro que quebra linha e, à direita, uma ação
+    opcional (`row`). Visível só com texto."""
+
+    def __init__(self, name: str, symbol: str, color: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName(name)
+        self.row = QHBoxLayout(self)
+        self.row.setContentsMargins(14, 10, 10, 10)
+        self.row.setSpacing(10)
+        mark = QLabel()
+        mark.setPixmap(icon(symbol, color, 18).pixmap(18, 18))
+        self.row.addWidget(mark, 0, Qt.AlignmentFlag.AlignTop)
+        self.text = QLabel()
+        self.text.setWordWrap(True)
+        self.text.setTextFormat(Qt.TextFormat.PlainText)
+        self.text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.row.addWidget(self.text, 1)
+        self.hide()
+
+
+class InfoStrip(QFrame):
+    """Informativo e andamento num lugar reservado do layout (acima dos problemas), sem cobrir nada. Some sozinho em
+    HIDE_MS, com o relógio parado enquanto o ponteiro está em cima; com operação em curso (busy) fica à vista."""
+
+    HIDE_MS = 7000
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("infoStrip")
+        self.busy = False
+        row = QHBoxLayout(self)
+        row.setContentsMargins(14, 8, 8, 8)
+        row.setSpacing(10)
+        mark = QLabel()
+        mark.setPixmap(icon("info", INFO, 18).pixmap(18, 18))
+        row.addWidget(mark, 0, Qt.AlignmentFlag.AlignTop)
+        column = QVBoxLayout()
+        column.setSpacing(2)
+        self.info = QLabel()
+        self.info.setWordWrap(True)
+        self.info.setTextFormat(Qt.TextFormat.PlainText)
+        self.status = WrappingLabel()
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        column.addWidget(self.info)
+        column.addWidget(self.status)
+        row.addLayout(column, 1)
+        self.close_button = QPushButton("Fechar")
+        self.close_button.setObjectName("ghost")
+        self.close_button.setAccessibleName("Fechar")
+        self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_button.clicked.connect(self.hide)
+        row.addWidget(self.close_button, 0, Qt.AlignmentFlag.AlignTop)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(self.HIDE_MS)
+        self.timer.timeout.connect(self.hide)
+        self.info.hide()
+        self.status.hide()
+        self.hide()
+
+    def refresh(self, info: str, status: str, busy: bool) -> None:
+        self.busy = busy
+        self.info.setText(info)
+        self.info.setVisible(bool(info))
+        self.status.setText(status)
+        self.status.setVisible(bool(status))
+        if not (info or status):
+            self.timer.stop()
+            self.hide()
+            return
+        self.show()
+        if busy or self.underMouse():
+            self.timer.stop()
+        else:
+            self.timer.start()
+
+    def enterEvent(self, event):
+        self.timer.stop()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if not self.busy and self.isVisible():
+            self.timer.start()
+        super().leaveEvent(event)
+
+
+class FlowRow(QWidget):
+    """Partes lado a lado que viram coluna quando não cabem na largura recebida, em vez de cortar texto ou botão."""
+
+    def __init__(self, spacing: int, parent=None):
+        super().__init__(parent)
+        self.box = QBoxLayout(QBoxLayout.Direction.LeftToRight, self)
+        self.box.setContentsMargins(0, 0, 0, 0)
+        self.box.setSpacing(spacing)
+        self.box.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+        self.widths = []
+
+    def add(self, widget: QWidget, stretch: int = 0, alignment=Qt.AlignmentFlag(0), width=None) -> None:
+        """`width` devolve a largura que a parte pede para ficar na mesma linha (padrão: o sizeHint dela)."""
+        self.box.addWidget(widget, stretch, alignment)
+        self.widths.append((widget, width or (lambda: widget.sizeHint().width())))
+
+    def fits(self, width: int) -> bool:
+        needed = [natural() for widget, natural in self.widths if widget.isVisibleTo(self)]
+        return width >= sum(needed) + self.box.spacing() * (len(needed) - 1)
+
+    def minimumSizeHint(self):
+        widest = max((widget.minimumSizeHint().width() for widget, _ in self.widths if widget.isVisibleTo(self)),
+                     default=0)
+        return QSize(widest, super().minimumSizeHint().height())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        direction = QBoxLayout.Direction.LeftToRight if self.fits(event.size().width()) \
+            else QBoxLayout.Direction.TopToBottom
+        if self.box.direction() != direction:
+            self.box.setDirection(direction)
+
+
 class CardGrid(QWidget):
     """Tool cards in three columns, or two when the area is too narrow for three readable cards."""
 
@@ -317,8 +573,15 @@ class CardGrid(QWidget):
                 self.grid.addWidget(card, index // columns, index % columns)
             for column in range(3):
                 self.grid.setColumnStretch(column, 1 if column < columns else 0)
-        rows = -(-len(self.cards) // columns)
-        self.setFixedHeight(rows * CliButton.HEIGHT + (rows - 1) * self.SPACING)
+        self.refit()
+
+    def refit(self) -> None:
+        """Cada linha tem a altura do seu cartão mais alto (o que mostra a faixa de andamento ou de oferta)."""
+        if not self.columns:
+            return
+        rows = [self.cards[start:start + self.columns] for start in range(0, len(self.cards), self.columns)]
+        self.setFixedHeight(sum(max(card.minimumHeight() for card in row) for row in rows)
+                            + (len(rows) - 1) * self.SPACING)
 
     def sizeHint(self):
         return QSize(3 * 240 + 2 * self.SPACING, self.height())
@@ -333,12 +596,30 @@ QMainWindow, QDialog { background: #f5f6f1; }
 QWidget { font-family: 'Segoe UI'; font-size: 14px; color: #233e32; }
 QLabel { background: transparent; }
 QLabel#muted { color: #526659; }
-QLabel#muted[bypass="true"] { color: #7e4216; }
 QLabel#title { font-size: 29px; font-weight: 600; }
 QLabel#section { font-size: 14px; font-weight: 600; }
 QLabel#status { color: #286046; background: #e3eddf; padding: 7px 12px; border-radius: 12px; }
 QLabel#status[offline="true"] { color: #7e4216; background: #f4e5ce; }
-QLabel#notice { color: #7e4216; background: #f4e5ce; padding: 10px 14px; border-radius: 8px; }
+QLabel#notice { color: #a32018; background: #fbe8e5; padding: 10px 14px; border-radius: 8px; }
+QFrame#errorStrip { background: #fbe8e5; border: 1px solid #eec3bd; border-radius: 8px; }
+QFrame#errorStrip QLabel { color: #a32018; }
+QFrame#errorStrip QPushButton#ghost { color: #a32018; font-weight: 600; }
+QFrame#errorStrip QPushButton#ghost:hover { background: #f6d5d0; }
+QFrame#warningStrip, QFrame#bypassRisk { background: #f4e5ce; border: 1px solid #e2c79f; border-radius: 8px; }
+QFrame#warningStrip QLabel, QFrame#bypassRisk QLabel { color: #7e4216; }
+QFrame#infoStrip { background: #e1f0f3; border: 1px solid #b9d3da; border-radius: 8px; }
+QFrame#infoStrip QLabel { color: #233e32; }
+QFrame#infoStrip QPushButton#ghost { color: #0d5568; }
+QFrame#infoStrip QPushButton#ghost:hover { background: #cde5ea; }
+QFrame#restartBanner { background: #e3eddf; border: 1px solid #b7cdb0; border-left: 6px solid #286046; border-radius: 10px; }
+QFrame#restartBanner QLabel { color: #233e32; }
+QFrame#restartBanner QLabel#restartTitle { font-size: 15px; font-weight: 600; }
+QFrame#contextCard { background: #ffffff; border: 1px solid #d8e1d7; border-radius: 10px; }
+QLabel#mono { font-family: 'Cascadia Mono', 'Consolas'; font-size: 13px; color: #233e32; }
+QLabel#pathMono { font-family: 'Cascadia Mono', 'Consolas'; font-size: 13px; color: #526659; }
+QPushButton#cardAction { padding: 5px 12px; font-size: 13px; }
+QLabel#tag { color: #286046; background: #e3eddf; padding: 3px 10px; border-radius: 10px; font-size: 13px; }
+QLabel#tag[stale="true"] { color: #7e4216; background: #f4e5ce; }
 QFrame#sidebar { background: #193d32; }
 QFrame#sidebar QLabel { color: #d6e4d6; }
 QFrame#sidebar QLabel#brand { color: #f2f7ec; font-size: 19px; font-weight: 600; }

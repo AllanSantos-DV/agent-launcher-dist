@@ -50,6 +50,15 @@ def work_area(screen) -> QRect:
     return screen.availableGeometry().adjusted(VISIBLE_EDGE, 0, -VISIBLE_EDGE, -VISIBLE_EDGE)
 
 
+def popup_area(screen) -> QRect:
+    """Available area for popups: one logical pixel smaller at the right and bottom on a fractional scale, where the
+    physical rectangle Qt derives from the rounded logical one can end a pixel past the area."""
+    area = screen.availableGeometry()
+    if screen.devicePixelRatio() == int(screen.devicePixelRatio()):
+        return area
+    return area.adjusted(0, 0, -1, -1)
+
+
 def fitted(frame: QRect, available: QRect) -> QRect:
     """Frame shrunk to the available area and moved fully inside it when any part is outside."""
     result = QRect(frame)
@@ -179,7 +188,7 @@ class PopupKeeper(QObject):
         self.fixing.add(key)
         try:
             frame = QRect(popup.pos(), wanted)
-            target = fitted(frame, screen_for(frame).availableGeometry())
+            target = fitted(frame, popup_area(screen_for(frame)))
             if popup.size() != target.size():
                 popup.resize(target.size())
             if popup.pos() != target.topLeft():

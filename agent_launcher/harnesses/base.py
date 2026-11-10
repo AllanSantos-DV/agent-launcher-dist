@@ -39,6 +39,17 @@ class Conversation:
                 "title": self.title, "messages": self.messages}
 
 
+def vscode_shim(entry: str) -> bool:
+    """Pasta `copilot-shim` do VS Code (estável ou Insiders) no PATH: o executável dela é do VS Code (assinado pela Microsoft), não o Copilot CLI."""
+    parts = [part.lower() for part in re.split(r"[\\/]+", entry.strip().strip('"'))]
+    return "copilot-shim" in parts and any(part.startswith("microsoft vs code") for part in parts)
+
+
+def path_without_vscode_shim() -> str:
+    """PATH do processo sem as pastas `copilot-shim` do VS Code."""
+    return os.pathsep.join(entry for entry in os.environ.get("PATH", "").split(os.pathsep) if not vscode_shim(entry))
+
+
 def conversation_title(text) -> str:
     """Primeira mensagem do usuário em uma linha, até 80 caracteres (sem colagem entre colchetes do terminal)."""
     text = re.sub(r"\x1b?\[20[01]~", "", str(text or ""))
@@ -151,7 +162,7 @@ class Harness:
 
     def find_executable(self) -> str | None:
         """Executável do destino: o do PATH, senão o da instalação nativa por usuário."""
-        found = shutil.which(self.EXECUTABLE) if self.EXECUTABLE else None
+        found = shutil.which(self.EXECUTABLE, path=path_without_vscode_shim()) if self.EXECUTABLE else None
         if found:
             return found
         return next((str(path) for path in self.native_paths() if path.is_file()), None)
