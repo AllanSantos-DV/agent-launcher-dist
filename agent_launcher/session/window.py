@@ -64,8 +64,8 @@ def session_title(project: dict, cli: str, home: Path | None = None) -> str:
 
 
 def tab_color(harness, home: Path | None = None) -> str:
-    """Cor da aba: fora do perfil padrão, a do perfil (o título já leva o nome); no padrão, a do CLI."""
-    if home is not None and profiles.label(home) is not None:
+    """Cor da aba: a do perfil, quando ele tem uma (no Padrão, só depois de escolhida); senão, a do CLI."""
+    if home is not None:
         color = profiles.profile_of_home(home, profiles.base_of(home)).get("color")
         if color:
             return color

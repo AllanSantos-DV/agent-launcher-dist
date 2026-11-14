@@ -759,9 +759,7 @@ class LauncherWindow(QMainWindow):
         self.options.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = DangerMenu(self)
         menu.setToolTipsVisible(True)
-        menu.addAction("Abrir pasta do projeto", self.open_project)
-        menu.addAction("Editar projeto…", self.edit_project)
-        menu.add_danger_action("Remover do launcher…", self.remove_project)
+        self.add_project_actions(menu, context=False)
         menu.addSeparator()
         menu.addAction("Conexões…", self.manage_connections)
         menu.addAction("Diagnóstico da conexão", self.show_diagnostics)
@@ -1826,13 +1824,17 @@ class LauncherWindow(QMainWindow):
             position = self.project_list.visualItemRect(item).center()
         self.project_list.setCurrentItem(item)
         menu = DangerMenu(self)
-        menu.addAction("Abrir pasta", self.open_project)
-        code = vscode.find_code()
-        if code:
-            menu.addAction("Abrir no VS Code", lambda: self.open_in_vscode(code))
-        menu.addAction("Editar…", self.edit_project)
-        menu.add_danger_action("Remover do launcher…", self.remove_project)
+        self.add_project_actions(menu, context=True)
         menu.exec(self.project_list.viewport().mapToGlobal(position))
+
+    def add_project_actions(self, menu, context):
+        """Abrir pasta, Editar e Remover do projeto atual. No menu da lista (context) os rótulos são curtos, porque o
+        projeto já está apontado, e entra Abrir no VS Code quando ele está instalado."""
+        menu.addAction("Abrir pasta" if context else "Abrir pasta do projeto", self.open_project)
+        if context and (code := vscode.find_code()):
+            menu.addAction("Abrir no VS Code", lambda: self.open_in_vscode(code))
+        menu.addAction("Editar…" if context else "Editar projeto…", self.edit_project)
+        menu.add_danger_action("Remover do launcher…", self.remove_project)
 
     def edit_project(self):
         if not self.project:
@@ -1925,7 +1927,6 @@ class LauncherWindow(QMainWindow):
         self.profile_picker.blockSignals(False)
         extra = current["id"] != profiles.DEFAULT
         self.rename_profile_action.setEnabled(extra)
-        self.color_profile_action.setEnabled(extra)
         self.remove_profile_action.setEnabled(extra)
         self.profile_strip.setStyleSheet(f"background: {current['color']};" if current["color"] else "")
         self.profile_strip.setVisible(bool(current["color"]))
@@ -1998,11 +1999,11 @@ class LauncherWindow(QMainWindow):
     def color_profile(self, color: str | None = None):
         """Menu do perfil → Cor do perfil… (QColorDialog). `color` (#RRGGBB) pula o diálogo (testes)."""
         current = profiles.profile_of_home(self.store.home, self.profile_base)
-        if current["id"] == profiles.DEFAULT:
-            return
         if color is None:
             from PySide6.QtWidgets import QColorDialog
-            chosen = QColorDialog.getColor(QColor(current["color"] or profiles.COLORS[0]), self, "Cor do perfil")
+            start = current["color"] or (registry.get("claude").TAB_COLOR if current["id"] == profiles.DEFAULT
+                                         else profiles.COLORS[0])
+            chosen = QColorDialog.getColor(QColor(start), self, "Cor do perfil")
             if not chosen.isValid():
                 return
             color = chosen.name()

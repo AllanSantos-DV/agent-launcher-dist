@@ -155,7 +155,8 @@ cada perfil ficam num arquivo próprio. Quem não cria perfil continua no **Padr
 - **Uso do mês…**: tokens e custo estimado por destino e modelo, lidos das conversas e do endpoint deste perfil.
   É estimativa local; o custo usa o preço que o host informa no catálogo. **Copiar relatório** copia a tabela com os
   valores separados por tabulação: colada numa planilha, cada valor cai na sua coluna.
-- Fora do Padrão, a aba do Terminal usa a cor do perfil.
+- A aba do Terminal usa a cor do perfil (**Cor do perfil…**, também no Padrão). Sem cor escolhida, o Padrão fica com
+  a cor de cada CLI (laranja no Claude).
 - Modo texto: `launcher profiles [list|add NOME|rename|remove|use|import ARQUIVO|export REF ARQUIVO]`,
   `launcher usage [--month AAAA-MM]` e `launcher --profile NOME <comando>`.
 - Os perfis extras ficam em `~/.agent-launcher/profiles/<id>/`; o orquestrador lista e abre projetos de todos.
@@ -172,14 +173,22 @@ Conexão usada pelo VS Code ou pelo Copilot app mostra o endpoint local dela: po
 
 | Conector | Claude Code | Codex | Modelos | Contexto |
 | --- | --- | --- | --- | --- |
-| LiteLLM / host próprio | `{endereço}` | `{endereço}/v1` | só `claude-*` / só `gpt-*`, `o*` (ou qualquer um, opcional) | `/v1/model/info` |
+| LiteLLM / host próprio | `{endereço}` | `{endereço}/v1` | só `claude-*` / só `gpt-*`, `o*` (ou qualquer um, opcional) | `/v1/model/info`; sem ele, `mode`, `max_input_tokens` e `max_output_tokens` do `/v1/models` |
 | 9router | `{endereço}` | `{endereço}/v1` | qualquer modelo nos dois | `capabilities` |
 | OmniRoute | `{endereço}` | `{endereço}/v1` | qualquer modelo nos dois | `context_length`, `max_input_tokens` |
 | OpenRouter | `https://openrouter.ai/api` | `https://openrouter.ai/api/v1` | qualquer modelo com ferramentas | `context_length` |
 | Anthropic API | `https://api.anthropic.com` (x-api-key) | — | Claude | `max_input_tokens` |
 | OpenAI API | — | `https://api.openai.com/v1` | GPT/o | não informado |
-| Compatível com Anthropic | `{endereço}` | — | o que o host listar + extras | se o host informar |
-| Compatível com OpenAI | — | `{endereço}` (Responses) | o que o host listar + extras | se o host informar |
+| Compatível com Anthropic | `{endereço}` | — | o que o host listar + extras | se o host informar (grafias abaixo) |
+| Compatível com OpenAI | — | `{endereço}` (Responses) | o que o host listar + extras | se o host informar (grafias abaixo) |
+
+Os conectores, exceto o LiteLLM, leem de cada item do `/v1/models` o primeiro valor que vier, nesta ordem:
+
+| Capacidade | Grafias aceitas |
+| --- | --- |
+| Entrada (contexto) | `max_input_tokens`, `context_length`, `top_provider.context_length`, `capabilities.contextWindow`, `context_window`, `limits.input`, `max_model_len` |
+| Saída | `max_output_tokens`, `max_tokens`, `max_completion_tokens`, `top_provider.max_completion_tokens`, `capabilities.maxOutput`, `limits.output` |
+| Ferramentas | `capabilities.tools`, `capabilities.tool_calling`, `tools` em `supported_parameters` |
 
 Conexões que levam o Claude Code a hosts de terceiros (LiteLLM, 9router, OmniRoute, OpenRouter, compatíveis com
 Anthropic) têm a opção **Tool search de MCP no Claude Code**: fora da Anthropic o Claude Code carrega todas as

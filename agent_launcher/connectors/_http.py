@@ -168,14 +168,16 @@ def _first(*values) -> int | None:
 
 def router_records(entries: list, extra: str = "") -> tuple[list[ModelInfo], bool]:
     """Lista /v1/models com os metadados que cada roteador publica: max_input_tokens/max_output_tokens (Anthropic,
-    OmniRoute), context_length/top_provider/supported_parameters (OpenRouter) e capabilities (9router, OmniRoute).
-    Campo ausente continua desconhecido: nunca vira capacidade positiva."""
+    OmniRoute), context_length/top_provider/supported_parameters (OpenRouter), capabilities (9router, OmniRoute),
+    context_window na raiz, limits.input/limits.output e max_model_len (vLLM). Campo ausente continua desconhecido:
+    nunca vira capacidade positiva."""
     records = {}
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not MODEL_PATTERN.fullmatch(entry["id"]):
             continue
         capabilities = entry.get("capabilities") if isinstance(entry.get("capabilities"), dict) else {}
         top = entry.get("top_provider") if isinstance(entry.get("top_provider"), dict) else {}
+        limits = entry.get("limits") if isinstance(entry.get("limits"), dict) else {}
         architecture = entry.get("architecture") if isinstance(entry.get("architecture"), dict) else {}
         tools = next((value for value in (capabilities.get("tools"), capabilities.get("tool_calling"))
                       if type(value) is bool), None)
@@ -187,9 +189,10 @@ def router_records(entries: list, extra: str = "") -> tuple[list[ModelInfo], boo
         records[identifier] = ModelInfo(
             identifier, mode,
             _first(entry.get("max_input_tokens"), entry.get("context_length"), top.get("context_length"),
-                   capabilities.get("contextWindow")),
+                   capabilities.get("contextWindow"), entry.get("context_window"), limits.get("input"),
+                   entry.get("max_model_len")),
             _first(entry.get("max_output_tokens"), entry.get("max_tokens"), entry.get("max_completion_tokens"),
-                   top.get("max_completion_tokens"), capabilities.get("maxOutput")),
+                   top.get("max_completion_tokens"), capabilities.get("maxOutput"), limits.get("output")),
             tools,
         )
     for record in plain_records([], extra):

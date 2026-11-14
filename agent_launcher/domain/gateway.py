@@ -101,6 +101,18 @@ class Gateway:
                                       "metadata_available": metadata,
                                       "records": [record.to_cache() for record in records]})
 
+    def _models(self) -> tuple[list[ModelInfo], bool]:
+        """models() do conector conferido contra o contrato (list[ModelInfo], bool)."""
+        result = self.module.models(self.options)
+        received = type(result).__name__
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], list) and isinstance(result[1], bool):
+            wrong = next((item for item in result[0] if not isinstance(item, ModelInfo)), None)
+            if wrong is None:
+                return result
+            received = f"uma lista com {type(wrong).__name__}"
+        raise LauncherError(f"{self.name}: o conector {self.connection['connector']!r} devolveu {received} em models(); "
+                            "o esperado é (lista de ModelInfo, contexto confirmado como bool).")
+
     def catalog(self, refresh: bool = False, offline: bool = False, save_cache: bool = True) -> Catalog:
         cached = self.empty_catalog()
         fetched_at = 0
@@ -126,7 +138,7 @@ class Gateway:
         if cached.records and not refresh and fresh and (metadata_available or age < 60):
             return cached
         try:
-            records, metadata_available = self.module.models(self.options)
+            records, metadata_available = self._models()
             if not records:
                 raise ConnectorError("o host não retornou modelos para este acesso.")
         except ConnectorError as error:

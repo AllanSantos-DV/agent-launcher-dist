@@ -1,8 +1,8 @@
 """Perfis de trabalho: cada perfil é uma pasta de dados completa (config.json, secrets.json, cache...).
 
-O padrão é a raiz (~/.agent-launcher ou AGENT_LAUNCHER_HOME), id "default", e nunca aparece em profiles.json. Os extras
-ficam em <raiz>/profiles/<id>/. Conectores e adaptadores do usuário, portas do endpoint local, logs e preferências de
-app ficam na raiz e valem para todos os perfis.
+O padrão é a raiz (~/.agent-launcher ou AGENT_LAUNCHER_HOME), id "default", e fica fora da lista de profiles.json (de
+lá só vem a cor escolhida para ele, em "default_color"). Os extras ficam em <raiz>/profiles/<id>/. Conectores e
+adaptadores do usuário, portas do endpoint local, logs e preferências de app ficam na raiz e valem para todos os perfis.
 
 `Store()` sem argumento continua sendo o padrão (o orquestrador depende disso): quem abre um perfil passa
 `Store(home_of(id))`."""
@@ -40,7 +40,9 @@ def _read(base: Path | None = None) -> dict:
                 and isinstance(item.get("id"), str) and ID_PATTERN.match(item["id"]) and item["id"] != DEFAULT
                 and isinstance(item.get("name"), str) and item["name"].strip()]
     active = data.get("active") if data.get("active") in {DEFAULT, *(item["id"] for item in profiles)} else DEFAULT
-    return {"schema": 1, "active": active, "profiles": profiles}
+    color = data.get("default_color")
+    color = color if isinstance(color, str) and COLOR_PATTERN.fullmatch(color) else None
+    return {"schema": 1, "active": active, "profiles": profiles, "default_color": color}
 
 
 def _write(data: dict, base: Path | None = None) -> None:
@@ -55,13 +57,15 @@ def _write(data: dict, base: Path | None = None) -> None:
             pass
 
 
-def default_profile() -> dict:
-    return {"id": DEFAULT, "name": "Padrão", "color": None}
+def default_profile(data: dict) -> dict:
+    """O perfil Padrão, com a cor escolhida para ele (None até alguém escolher: a aba fica com a cor do CLI)."""
+    return {"id": DEFAULT, "name": "Padrão", "color": data["default_color"]}
 
 
 def list_profiles(base: Path | None = None) -> list[dict]:
     """O padrão primeiro, depois os extras na ordem de criação."""
-    return [default_profile(), *(dict(item) for item in _read(base)["profiles"])]
+    data = _read(base)
+    return [default_profile(data), *(dict(item) for item in data["profiles"])]
 
 
 def find(reference: str, base: Path | None = None) -> dict:
@@ -86,16 +90,17 @@ def profile_of_home(home: Path, base: Path | None = None) -> dict:
     """Perfil dono de uma pasta de dados. Pasta fora da raiz (testes, AGENT_LAUNCHER_HOME de outro lugar) = padrão."""
     base = (base or root()).resolve()
     home = Path(home).resolve()
+    data = _read(base)
     if home.parent == base / FOLDER:
-        for item in _read(base)["profiles"]:
+        for item in data["profiles"]:
             if item["id"] == home.name:
                 return dict(item)
-    return default_profile()
+    return default_profile(data)
 
 
 def active(base: Path | None = None) -> dict:
     data = _read(base)
-    return next((dict(item) for item in data["profiles"] if item["id"] == data["active"]), default_profile())
+    return next((dict(item) for item in data["profiles"] if item["id"] == data["active"]), default_profile(data))
 
 
 def set_active(profile_id: str, base: Path | None = None) -> None:
@@ -148,12 +153,14 @@ def rename(profile_id: str, name: str, base: Path | None = None) -> dict:
 
 
 def set_color(profile_id: str, color: str, base: Path | None = None) -> dict:
-    """Troca a cor do perfil (faixa da janela e ícone do seletor). Só #RRGGBB; o padrão não tem cor."""
+    """Troca a cor do perfil (aba do Terminal, faixa da janela e ícone do seletor). Só #RRGGBB."""
     if not isinstance(color, str) or not COLOR_PATTERN.fullmatch(color.strip()):
         raise LauncherError(f"Cor inválida {color!r}: use #RRGGBB.")
-    if profile_id == DEFAULT:
-        raise LauncherError("O perfil padrão não tem cor.")
     data = _read(base)
+    if profile_id == DEFAULT:
+        data["default_color"] = color.strip()
+        _write(data, base)
+        return default_profile(data)
     for item in data["profiles"]:
         if item["id"] == profile_id:
             item["color"] = color.strip()

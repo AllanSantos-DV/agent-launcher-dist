@@ -19,6 +19,18 @@ Um conector é um módulo Python com:
            levante QuotaExhausted(mensagem) só quando login e assinatura estão válidos e a cota acabou (a conexão é
            gravada com o aviso e o estado "cota esgotada")
   models(options) -> (list[ModelInfo], contexto_confirmado: bool)
+           ModelInfo leva entrada (max_input_tokens), saída (max_output_tokens), ferramentas (tools) e modo; campo
+           ausente fica None (desconhecido). Os conectores HTTP embutidos usam _http.router_records, que aceita em
+           cada item de /v1/models (vale o primeiro inteiro positivo, nesta ordem):
+             entrada      max_input_tokens, context_length, top_provider.context_length, capabilities.contextWindow,
+                          context_window, limits.input, max_model_len
+             saída        max_output_tokens, max_tokens, max_completion_tokens, top_provider.max_completion_tokens,
+                          capabilities.maxOutput, limits.output
+             ferramentas  capabilities.tools, capabilities.tool_calling, "tools" em supported_parameters
+             modo         architecture.output_modalities sem "text" vira "other"
+           O LiteLLM lê model_info de /v1/model/info (mode, max_input_tokens, max_output_tokens,
+           supports_function_calling, supports_responses_api); host sem essa rota tem os mesmos campos lidos da raiz
+           de cada item de /v1/models. contexto_confirmado é True quando algum modelo traz a entrada.
 
 Várias conexões e perfis:
   - O mesmo conector serve quantas conexões o usuário quiser; cada conexão guarda as suas opções e a sua chave.
