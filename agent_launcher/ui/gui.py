@@ -22,14 +22,15 @@ from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
 from agent_launcher.harnesses import cli_update
 from agent_launcher.harnesses import installers as clis
-from agent_launcher.harnesses import registry
-from agent_launcher.platform import terminal
+from agent_launcher.harnesses import registry, vscode
+from agent_launcher.platform import keys, terminal
 from agent_launcher.session.conversations import conversations_for, has_conversation_for
 from agent_launcher.session.window import session_title, start_session
 from agent_launcher.ui import placement
 from agent_launcher.ui.background import deliver
 from agent_launcher.ui.connections import ConnectionsDialog, quota_warning
 from agent_launcher.ui.instructions import InstructionsDialog
+from agent_launcher.ui.text import label_of
 from agent_launcher.ui.theme import (
     DANGER, GREEN, INFO, MUTED, STYLE, WARN, CardGrid, CliButton, DangerMenu, ElidedLabel, FlowRow, InfoStrip,
     NoticeStrip, ReadableCombo, icon,
@@ -427,6 +428,16 @@ def usage_rows(report: dict) -> list[tuple[str, str, str, str, str]]:
     return rows
 
 
+USAGE_HEADER = ("Destino", "Modelo", "Entrada", "Saída", "Custo")
+
+
+def usage_text(report: dict) -> str:
+    """O relatório de uso separado por tabulação: colado numa planilha, cada valor cai na sua coluna."""
+    lines = [f"Mês {report['month']}", "\t".join(USAGE_HEADER)]
+    lines += ["\t".join(row) for row in usage_rows(report)]
+    return "\n".join(lines)
+
+
 class UsageDialog(QDialog):
     from agent_launcher.domain.usage import NOTE
 
@@ -441,18 +452,31 @@ class UsageDialog(QDialog):
         self.error.setWordWrap(True)
         self.error.hide()
         layout.addWidget(self.error)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Destino", "Modelo", "Entrada", "Saída", "Custo"])
+        self.table = QTableWidget(0, len(USAGE_HEADER))
+        self.table.setHorizontalHeaderLabels(list(USAGE_HEADER))
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table, 1)
         note = QLabel(self.NOTE)
         note.setWordWrap(True)
         layout.addWidget(note)
+        actions = QHBoxLayout()
+        self.copy_button = QPushButton("Copiar relatório")
+        self.copy_button.setEnabled(False)
+        self.copy_button.clicked.connect(self.copy)
+        actions.addWidget(self.copy_button)
+        self.copied = QLabel("")
+        self.copied.setObjectName("muted")
+        actions.addWidget(self.copied)
+        actions.addStretch()
         close = QPushButton("Fechar")
         close.clicked.connect(self.accept)
-        layout.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+        actions.addWidget(close)
+        layout.addLayout(actions)
+        self.report = None
         self.task = UsageTask(home)
         self.task.signals.completed.connect(self.show_report)
         QThreadPool.globalInstance().start(self.task)
@@ -465,6 +489,8 @@ class UsageDialog(QDialog):
             return
         self.error.hide()
         rows = usage_rows(report)
+        self.report = report if rows else None
+        self.copy_button.setEnabled(self.report is not None)
         self.status.setText(f"Mês {report['month']}" + ("" if rows else ": nenhum uso encontrado."))
         self.table.setRowCount(len(rows))
         for number, row in enumerate(rows):
@@ -473,9 +499,13 @@ class UsageDialog(QDialog):
                 if column >= 2:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(number, column, item)
-        self.table.resizeColumnsToContents()
+
+    def copy(self) -> None:
+        QApplication.clipboard().setText(usage_text(self.report))
+        self.copied.setText("Relatório copiado: cole numa planilha, cada valor vai para a sua coluna.")
 
 
+PROJECT_TEXT = Qt.ItemDataRole.UserRole + 1  # texto e dica do projeto sem a marca de sessão aberta
 GENERAL_ERROR = "geral"  # origem do erro avulso de uma ação; os erros persistentes têm origem própria
 
 
@@ -909,16 +939,18 @@ class LauncherWindow(QMainWindow):
         for project in self.store.projects:
             item = QListWidgetItem(icon("folder", "#c8d9c7"), project["name"])
             item.setData(Qt.ItemDataRole.UserRole, project["id"])
-            item.setToolTip(project["path"])
+            item.setData(PROJECT_TEXT, (project["name"], project["path"]))
             if not Path(project["path"]).is_dir():
-                item.setText(project["name"] + "  (pasta não encontrada)")
-                item.setToolTip(f"Pasta não encontrada: {project['path']}\nBotão direito → Editar para apontar a nova pasta.")
+                item.setData(PROJECT_TEXT, (project["name"] + "  (pasta não encontrada)",
+                                            f"Pasta não encontrada: {project['path']}\n"
+                                            "Botão direito → Editar para apontar a nova pasta."))
                 font = item.font()
                 font.setItalic(True)
                 item.setFont(font)
             self.project_list.addItem(item)
             if project["id"] == preferred:
                 selected = item
+        self.mark_open_sessions()
         self.project_list.blockSignals(False)
         self.project_count.setText(str(len(self.store.projects)))
         self.filter_projects()
@@ -926,6 +958,23 @@ class LauncherWindow(QMainWindow):
             self.project_list.setCurrentItem(selected or self.project_list.item(0))
         else:
             self.select_project(None)
+
+    def mark_open_sessions(self):
+        """Marca na lista os projetos com sessão aberta agora, aberta por esta ou por outra instância do launcher."""
+        open_clis: dict[str, list[str]] = {}
+        for session in keys.sessions():
+            open_clis.setdefault(session.get("project_id"), []).append(label_of(session.get("cli", "")))
+        for index in range(self.project_list.count()):
+            item = self.project_list.item(index)
+            text, tip = item.data(PROJECT_TEXT)
+            clis_open = open_clis.get(item.data(Qt.ItemDataRole.UserRole), [])
+            if clis_open:
+                count = len(clis_open)
+                text += "  · aberta" if count == 1 else f"  · {count} abertas"
+                tip += f"\n{plural(count, 'sessão aberta', 'sessões abertas')}: {', '.join(sorted(set(clis_open)))}"
+            if item.text() != text:
+                item.setText(text)
+            item.setToolTip(tip)
 
     def filter_projects(self):
         query = self.project_search.text().strip().casefold()
@@ -1599,6 +1648,7 @@ class LauncherWindow(QMainWindow):
         self.update_actions()
 
     def check_sessions(self):
+        self.mark_open_sessions()
         finished = [(process, title) for process, title in self.sessions if process.poll() is not None]
         self.sessions = [(process, title) for process, title in self.sessions if process.poll() is None]
         if finished:
@@ -1777,6 +1827,9 @@ class LauncherWindow(QMainWindow):
         self.project_list.setCurrentItem(item)
         menu = DangerMenu(self)
         menu.addAction("Abrir pasta", self.open_project)
+        code = vscode.find_code()
+        if code:
+            menu.addAction("Abrir no VS Code", lambda: self.open_in_vscode(code))
         menu.addAction("Editar…", self.edit_project)
         menu.add_danger_action("Remover do launcher…", self.remove_project)
         menu.exec(self.project_list.viewport().mapToGlobal(position))
@@ -1814,6 +1867,15 @@ class LauncherWindow(QMainWindow):
     def open_project(self):
         if self.project and not QDesktopServices.openUrl(QUrl.fromLocalFile(self.project["path"])):
             self.show_error("Não foi possível abrir a pasta. Verifique se ela ainda existe.")
+
+    def open_in_vscode(self, code: str):
+        """A pasta no VS Code do usuário (o perfil dele, não o "Agent Launcher" das conexões)."""
+        if not self.project:
+            return
+        try:
+            vscode.start_code(code, project_path(self.project["path"]))
+        except (LauncherError, OSError) as error:
+            self.show_error(f"Não foi possível abrir no VS Code: {error}")
 
     def open_outside_terminal(self, harness):
         """VS Code e Copilot app: o adaptador configura o destino (perfil, provider) e o abre na pasta do projeto."""

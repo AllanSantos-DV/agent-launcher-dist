@@ -153,7 +153,8 @@ cada perfil ficam num arquivo próprio. Quem não cria perfil continua no **Padr
   **Exportar perfil…** gera esse arquivo. O arquivo nunca leva chave: se a conexão pede uma, o launcher pergunta.
 - **Remover perfil** (ou conexão) oferece tirar também o provider do Copilot app e do VS Code e parar o endpoint local.
 - **Uso do mês…**: tokens e custo estimado por destino e modelo, lidos das conversas e do endpoint deste perfil.
-  É estimativa local; o custo usa o preço que o host informa no catálogo.
+  É estimativa local; o custo usa o preço que o host informa no catálogo. **Copiar relatório** copia a tabela com os
+  valores separados por tabulação: colada numa planilha, cada valor cai na sua coluna.
 - Fora do Padrão, a aba do Terminal usa a cor do perfil.
 - Modo texto: `launcher profiles [list|add NOME|rename|remove|use|import ARQUIVO|export REF ARQUIVO]`,
   `launcher usage [--month AAAA-MM]` e `launcher --profile NOME <comando>`.
@@ -164,6 +165,8 @@ cada perfil ficam num arquivo próprio. Quem não cria perfil continua no **Padr
 Na interface, use **Gerenciar conexões** → **Adicionar**, escolha o tipo e preencha os campos. **Testar e salvar**
 consulta a lista de modelos antes de gravar: conexão que não responde não é salva. Pode haver várias conexões; cada
 projeto lembra a última conexão, o CLI e o modelo usados.
+**Duplicar** abre o formulário preenchido com os campos da conexão selecionada e o nome "(cópia)", para cadastrar
+outra conta do mesmo provedor sem redigitar endereço e opções; a chave não é copiada e é pedida de novo.
 Conexão usada pelo VS Code ou pelo Copilot app mostra o endpoint local dela: porta, rodando ou parado, requisições,
 **Iniciar/Parar** e **Iniciar com o Windows**.
 
@@ -216,8 +219,10 @@ conversas do projeto (data, título, mensagens) para retomar qualquer uma, não 
 sessão nova, com um aviso na janela, em vez de parar em "No conversation found to continue". Com o Windows Terminal instalado, cada sessão vira
 uma aba da janela **agent-launcher** (laranja para Claude Code, verde para Codex), com o título
 **Projeto — Claude Code/Codex**; sem ele, cada sessão abre num console próprio. A sessão confere a conexão antes de iniciar. Fechar o launcher não encerra as
-sessões. A lista de projetos fica do mais recente para o mais antigo e se reordena a cada abertura; o botão
-direito em um projeto edita (nome e pasta) ou remove o cadastro. `Ctrl+K` busca projetos, `Ctrl+F` modelos, `Ctrl+N` adiciona projeto e `F5` atualiza o catálogo.
+sessões. A lista de projetos fica do mais recente para o mais antigo e se reordena a cada abertura; projeto com sessão
+aberta agora (por esta ou por outra janela do launcher) aparece com "· aberta" ou "· 2 abertas", e a dica diz quais CLIs.
+O botão direito em um projeto abre a pasta, abre no VS Code (só com o VS Code instalado, no seu perfil normal), edita
+(nome e pasta) ou remove o cadastro. `Ctrl+K` busca projetos, `Ctrl+F` modelos, `Ctrl+N` adiciona projeto e `F5` atualiza o catálogo.
 
 Cada sessão recebe a configuração só no próprio processo; `~/.claude/settings.json` e `~/.codex/config.toml` não são
 alterados.

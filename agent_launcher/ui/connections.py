@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import time
 from pathlib import Path
 
@@ -192,17 +193,30 @@ class LoginPanel(QWidget):
             QApplication.clipboard().setText(self.login.code)
 
 
-class ConnectionForm(QDialog):
-    """Formulário gerado pelos FIELDS do conector. Editar: chave em branco mantém a salva."""
+def copy_name(name: str, taken: set[str]) -> str:
+    """Nome livre para a cópia de uma conexão ("X (cópia)", "X (cópia 2)"…), dentro do limite de 60 caracteres."""
+    taken = {item.casefold() for item in taken}
+    for number in itertools.count(1):
+        suffix = " (cópia)" if number == 1 else f" (cópia {number})"
+        candidate = name[:60 - len(suffix)].rstrip() + suffix
+        if candidate.casefold() not in taken:
+            return candidate
 
-    def __init__(self, home: Path, connection: dict | None = None, parent=None):
+
+class ConnectionForm(QDialog):
+    """Formulário gerado pelos FIELDS do conector. Editar: chave em branco mantém a salva. Duplicar (`source`): vem
+    preenchido com os campos da conexão de origem e salva uma conexão nova; a chave não é copiada."""
+
+    def __init__(self, home: Path, connection: dict | None = None, parent=None, source: dict | None = None):
         super().__init__(parent)
         self.home = home
         self.connection = connection
+        self.source = connection or source
         self.saved = None
         self.inputs = {}
-        self.modules, errors = Store(home).connectors()
-        self.setWindowTitle("Editar conexão" if connection else "Nova conexão")
+        store = Store(home)
+        self.modules, errors = store.connectors()
+        self.setWindowTitle("Editar conexão" if connection else "Duplicar conexão" if source else "Nova conexão")
         self.setMinimumWidth(560)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 20)
@@ -211,15 +225,18 @@ class ConnectionForm(QDialog):
         self.kind.setAccessibleName("Tipo de provedor")
         for name, module in self.modules.items():
             self.kind.addItem(module.LABEL, name)
-        if connection:
-            self.kind.setCurrentIndex(max(0, self.kind.findData(connection["connector"])))
+        if self.source:
+            self.kind.setCurrentIndex(max(0, self.kind.findData(self.source["connector"])))
         layout.addWidget(_label("Tipo de provedor", "section"))
         layout.addWidget(self.kind)
         self.hint = _label("", "muted")
         layout.addWidget(self.hint)
         if errors:
             layout.addWidget(_label("Conectores do usuário com erro: " + "; ".join(errors), "notice"))
-        self.name = QLineEdit(connection["name"] if connection else "")
+        initial = connection["name"] if connection else ""
+        if source and not connection:
+            initial = copy_name(source["name"], {item["name"] for item in store.connections})
+        self.name = QLineEdit(initial)
         self.name.setAccessibleName("Nome da conexão")
         self.name.setPlaceholderText("Ex.: Meu proxy, OpenRouter pessoal")
         self.fields_host = QWidget()
@@ -260,7 +277,7 @@ class ConnectionForm(QDialog):
         self.inputs = {}
         module = self.module
         same = self.connection is not None and self.connection["connector"] == module.NAME
-        stored = self.connection["options"] if same else {}
+        stored = self.source["options"] if self.source and self.source["connector"] == module.NAME else {}
         self.hint.setText(getattr(module, "HINT", ""))
         labels = {candidate.LABEL for candidate in self.modules.values()}
         self.name = QLineEdit(typed if typed and typed not in labels else module.LABEL)
@@ -520,6 +537,7 @@ class ConnectionsDialog(QDialog):
         buttons = QVBoxLayout()
         self.buttons = {}
         for key, text, callback in (("add", "Adicionar…", self.add), ("edit", "Editar…", self.edit),
+                                    ("duplicate", "Duplicar…", self.duplicate),
                                     ("test", "Testar", self.test), ("default", "Tornar padrão", self.make_default),
                                     ("remove", "Remover…", self.remove)):
             widget = QPushButton(text)
@@ -581,7 +599,7 @@ class ConnectionsDialog(QDialog):
         return Store(self.home).find_connection(item.data(Qt.ItemDataRole.UserRole)) if item else None
 
     def update_buttons(self, *_args):
-        for key in ("edit", "test", "default", "remove"):
+        for key in ("edit", "duplicate", "test", "default", "remove"):
             self.buttons[key].setEnabled(self.list.currentItem() is not None)
         item = self.list.currentItem()
         self.endpoint.show_for(item.data(Qt.ItemDataRole.UserRole) if item else None)
@@ -595,6 +613,13 @@ class ConnectionsDialog(QDialog):
         connection = self.current()
         if connection:
             form = ConnectionForm(self.home, connection, self)
+            if form.exec() and form.saved:
+                self.populate(form.saved["id"])
+
+    def duplicate(self):
+        connection = self.current()
+        if connection:
+            form = ConnectionForm(self.home, parent=self, source=connection)
             if form.exec() and form.saved:
                 self.populate(form.saved["id"])
 

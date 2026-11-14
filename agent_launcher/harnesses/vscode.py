@@ -47,6 +47,13 @@ def find_code() -> str | None:
     return next((str(path) for path in candidates if path.is_file()), None)
 
 
+def start_code(code: str, directory: Path, *options: str) -> None:
+    """Abre a pasta no Code.exe sem herdar variáveis que o fariam rodar como Node ou em modo de desenvolvimento."""
+    environment = {key: value for key, value in os.environ.items() if key not in ("ELECTRON_RUN_AS_NODE", "VSCODE_DEV")}
+    subprocess.Popen([code, *options, str(directory)], cwd=directory, env=environment, close_fds=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def profile_folder(data_dir: Path | None = None) -> Path | None:
     """Pasta do perfil "Agent Launcher" pelo registro do VS Code (só leitura); None se ainda não existe."""
     data_dir = data_dir or user_data_dir()
@@ -220,9 +227,7 @@ class VsCode(Harness):
         folder = profile_folder()
         if folder is not None:
             write_profile(folder, self.provider_name(gateway), entries, selected.id)
-        environment = {key: value for key, value in os.environ.items() if key not in ("ELECTRON_RUN_AS_NODE", "VSCODE_DEV")}
-        subprocess.Popen([code, "--profile", PROFILE, str(directory)], cwd=directory, env=environment, close_fds=True,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        start_code(code, directory, "--profile", PROFILE)
         if folder is None:
             # Primeira vez: o VS Code cria o perfil ao abrir; os modelos entram assim que a pasta aparece (ele observa
             # a pasta do perfil, então não precisa reiniciar).
