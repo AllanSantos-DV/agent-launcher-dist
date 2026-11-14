@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import msvcrt
 import os
 import random
 import shutil
@@ -148,6 +147,7 @@ class LockBusy(LauncherError):
 def file_lock(path, timeout: float = 10.0):
     """Exclusão mútua entre processos para ler-alterar-gravar `path`: bloqueio do sistema num arquivo ao lado
     (<nome>.lock), solto sozinho se o processo morre, então nunca fica velho. Passado `timeout`, levanta."""
+    import msvcrt  # fora do topo: os scripts de release importam este módulo no runner Linux do Actions
     lock = Path(path).with_name(Path(path).name + ".lock")
     lock.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(lock, os.O_CREAT | os.O_RDWR)
