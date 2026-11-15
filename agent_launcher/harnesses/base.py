@@ -152,6 +152,7 @@ class Harness:
     SESSION_HINT = "Terminal com título do projeto"
     MISSING_HINT = ""               # como instalar à mão
     SCRUB = frozenset()             # variáveis herdadas que saem do ambiente da sessão (além das genéricas)
+    RESUME_BY_ID = False            # "retomar última" vai pelo id da conversa mais recente da pasta, não pelo CLI
     SCRUB_PREFIXES: tuple = ()
     EXECUTABLE = ""                 # nome no PATH
 
@@ -214,6 +215,9 @@ class Harness:
 
     def prepare(self, plan) -> None:
         """Efeitos antes de abrir (confiança da pasta, perfil...). Falha visível, nunca silenciosa."""
+
+    def ensure_resumable(self, plan) -> None:
+        """Antes de abrir a janela: LauncherError se a conversa a retomar não pode ser retomada agora."""
 
     def final_command(self, plan, directory: Path) -> tuple[list[str], str]:
         """Comando final, com arquivos temporários em `directory` se o destino precisar; (comando, aviso)."""

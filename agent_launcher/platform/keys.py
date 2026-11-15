@@ -217,11 +217,17 @@ def char_records(text: str):
     return records
 
 
-def paste(kernel32, console_in, text: str) -> None:
-    """Escreve a colagem em blocos e espera a sessão consumir tudo (a fila de entrada esvaziar)."""
-    payload = PASTE_START + text + PASTE_END
+def paste(kernel32, console_in, text: str, bracketed: bool = True) -> None:
+    """Escreve a colagem em blocos e espera a sessão consumir tudo (a fila de entrada esvaziar). Sem bracketed, vai
+    sem os marcadores de colagem e cada quebra de linha vira Ctrl+J (nova linha sem enviar)."""
+    payload = PASTE_START + text + PASTE_END if bracketed else text
     for start in range(0, len(payload), PASTE_CHUNK):
-        write_records(kernel32, console_in, char_records(payload[start:start + PASTE_CHUNK]))
+        records = char_records(payload[start:start + PASTE_CHUNK])
+        if not bracketed:
+            for record in records:
+                if record.key.uChar == "\n":
+                    record.key.wVirtualKeyCode, record.key.dwControlKeyState = 0x4A, LEFT_CTRL_PRESSED
+        write_records(kernel32, console_in, records)
     pending, end = wintypes.DWORD(1), time.monotonic() + PASTE_DRAIN_TIMEOUT
     while time.monotonic() < end:
         if not kernel32.GetNumberOfConsoleInputEvents(console_in, ctypes.byref(pending)) or not pending.value:
@@ -232,12 +238,23 @@ def paste(kernel32, console_in, text: str) -> None:
     time.sleep(PASTE_SETTLE)
 
 
+def pastes_bracketed(pid: int) -> bool:
+    """A sessão entende os marcadores de colagem (ESC[200~ … ESC[201~)? O Codex no Windows lê a entrada como teclas,
+    não como sequência de terminal: o marcador chegava como Esc e o texto "[200~" ia parar na caixa de mensagem."""
+    try:
+        cli = json.loads((SESSIONS_DIR / f"{pid}.json").read_text(encoding="utf-8")).get("cli")
+    except (OSError, ValueError, AttributeError):
+        return True
+    return cli != "codex"
+
+
 def inject(pid: int, keys: list) -> None:
     kernel32, console_in, console_out = attached(pid)
+    bracketed = pastes_bracketed(pid)
     try:
         for key in keys:
             if isinstance(key, Paste):
-                paste(kernel32, console_in, key.text)
+                paste(kernel32, console_in, key.text, bracketed)
                 continue
             vk, char, extended, modifiers = key
             state = modifiers | (ENHANCED_KEY if extended else 0)

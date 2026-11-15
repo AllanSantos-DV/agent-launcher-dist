@@ -64,10 +64,15 @@ def stop_tree(process: subprocess.Popen) -> None:
     if process.poll() is not None:
         return
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        kill_tree(process.pid)
     else:
         process.terminate()
+
+
+def kill_tree(pid: int) -> None:
+    """taskkill da árvore do pid (Windows)."""
+    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, stdin=subprocess.DEVNULL,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 def free_port() -> int:

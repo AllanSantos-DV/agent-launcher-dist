@@ -121,8 +121,9 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
         print(f"Aviso: verificação de atualização não iniciou ({error}).", file=sys.stderr)
     directory = project_path(project["path"])
     gateway = Gateway.for_project(store, project, connection)
-    build_plan(gateway, cli, str(directory), model, resume, gateway.catalog(offline=True),
-               bypass_permissions=bypass_permissions, controlled=controlled, conversation=conversation)
+    plan = build_plan(gateway, cli, str(directory), model, resume, gateway.catalog(offline=True),
+                      bypass_permissions=bypass_permissions, controlled=controlled, conversation=conversation)
+    harness.ensure_resumable(plan)
     command = [str(console_python()), str(ROOT / "desktop.py"), "--home", str(store.home.resolve()),
                "--project", project["id"], "--connection", gateway.connection["id"], "--cli", cli, "--model", model]
     if resume:

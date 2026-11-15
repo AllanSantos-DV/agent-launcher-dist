@@ -83,6 +83,52 @@ def descendants(root: int) -> list[int]:
     return found
 
 
+def image_of(pid: int) -> str | None:
+    """Caminho do executável do processo (None se morreu ou não pode ser inspecionado)."""
+    if os.name != "nt":
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    return _image(kernel32, pid)
+
+
+class _RmUniqueProcess(ctypes.Structure):
+    _fields_ = [("dwProcessId", wintypes.DWORD), ("ProcessStartTime", wintypes.FILETIME)]
+
+
+class _RmProcessInfo(ctypes.Structure):
+    _fields_ = [("Process", _RmUniqueProcess), ("strAppName", wintypes.WCHAR * 256),
+                ("strServiceShortName", wintypes.WCHAR * 64), ("ApplicationType", ctypes.c_int),
+                ("AppStatus", wintypes.ULONG), ("TSSessionId", wintypes.DWORD), ("bRestartable", wintypes.BOOL)]
+
+
+def file_users(path: Path) -> list[int]:
+    """PIDs dos processos que estão com o arquivo aberto agora (Restart Manager do Windows). Erro da API vira OSError."""
+    if os.name != "nt":
+        return []
+    manager = ctypes.WinDLL("rstrtmgr")
+    session, key = wintypes.DWORD(), ctypes.create_unicode_buffer(64)
+    if code := manager.RmStartSession(ctypes.byref(session), 0, key):
+        raise OSError(f"RmStartSession falhou (código {code})")
+    try:
+        files = (wintypes.LPCWSTR * 1)(str(path))
+        if code := manager.RmRegisterResources(session, 1, files, 0, None, 0, None):
+            raise OSError(f"RmRegisterResources falhou para {path} (código {code})")
+        capacity = 8
+        while True:
+            needed, count, reasons = wintypes.UINT(), wintypes.UINT(capacity), wintypes.DWORD()
+            infos = (_RmProcessInfo * capacity)()
+            code = manager.RmGetList(session, ctypes.byref(needed), ctypes.byref(count), infos, ctypes.byref(reasons))
+            if code == 234:  # ERROR_MORE_DATA: a lista cresceu entre as chamadas
+                capacity = needed.value + 4
+                continue
+            if code:
+                raise OSError(f"RmGetList falhou para {path} (código {code})")
+            return [infos[index].Process.dwProcessId for index in range(count.value)]
+    finally:
+        manager.RmEndSession(session)
+
+
 def _key(path) -> str:
     return os.path.normcase(os.path.realpath(str(path)))
 

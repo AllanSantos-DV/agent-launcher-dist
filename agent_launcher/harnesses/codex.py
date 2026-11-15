@@ -41,21 +41,83 @@ INTERACTIVE_SOURCES = ("cli", "vscode")  # sessões que o `codex resume --last` 
 CONTEXT_PREFIXES = ("<environment_context", "<user_instructions", "<permissions", "# AGENTS.md")  # injetadas pelo Codex
 
 
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
 def codex_sessions() -> Path:
-    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
+    return codex_home() / "sessions"
 
 
 def _rollout_meta(rollout: Path) -> dict | None:
-    """payload da 1ª linha (session_meta) de um rollout interativo; None nos demais."""
+    """payload da 1ª linha (session_meta) de um rollout interativo aberto pelo launcher; None nos demais. As conversas
+    da conta do usuário no Codex (outro provider, ex.: o app do Codex) ficam com ela e não são listadas nem retomadas."""
     try:
         with rollout.open(encoding="utf-8", errors="replace") as stream:
             meta = json.loads(stream.readline() or "{}")
     except (OSError, ValueError):
         return None
     payload = (meta.get("payload") or {}) if isinstance(meta, dict) else {}
-    if not isinstance(payload, dict) or payload.get("source", "cli") not in INTERACTIVE_SOURCES:
+    if (not isinstance(payload, dict) or payload.get("source", "cli") not in INTERACTIVE_SOURCES
+            or payload.get("model_provider") != CODEX_PROVIDER):
         return None
     return {**payload, "_timestamp": meta.get("timestamp")}
+
+
+def _launcher_owner(pid: int, controlled: list[dict], sessions_dir: Path | None) -> str | None:
+    """A sessão aberta do launcher a que o processo pertence (controlada ou janela comum); None se não for uma."""
+    from agent_launcher.platform import keys
+    from agent_launcher.platform.processes import descendants
+    for entry in controlled:
+        if pid in (entry["serverPid"], *descendants(entry["serverPid"])):
+            return f"na sessão controlada do projeto {entry.get('project')} (janela pid {entry['pid']})"
+    for session in keys.sessions(sessions_dir):
+        if pid in descendants(int(session["pid"])):
+            return f"na janela \"{session.get('title')}\" (pid {session['pid']})"
+    return None
+
+
+def release_closed_sessions(controlled_dir: Path) -> tuple[list[dict], bool]:
+    """(registros de sessão controlada com janela viva, algum app-server encerrado?). Janela que já fechou: o app-server
+    que sobrou dela é encerrado (é ele que prende a conversa e faz a sessão fechada continuar contando como aberta) e o
+    registro é apagado."""
+    from agent_launcher.platform import keys
+    from agent_launcher.platform.jobs import kill_tree
+    live, released = [], False
+    for path in controlled_dir.glob("*.json"):
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+            window, server, started = int(entry["pid"]), int(entry["serverPid"]), entry.get("startedAt")
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if keys.alive(window, started):
+            live.append({**entry, "pid": window, "serverPid": server})
+            continue
+        if keys.alive(server, started):
+            kill_tree(server)
+            released = True
+        path.unlink(missing_ok=True)
+    return live, released
+
+
+def free_conversation(thread_id: str, controlled_dir: Path | None = None, sessions_dir: Path | None = None,
+                      timeout: float = 10) -> None:
+    """Conversa pronta para ser retomada: a trava de escritor do Codex (thread-writer-locks/<id>.lock, presa pelo
+    processo que tem a conversa aberta) está livre ou é liberada encerrando o app-server de uma sessão que já fechou.
+    Aberta numa sessão viva ou em outro programa: LauncherError dizendo quem a tem, em vez de uma TUI só de leitura."""
+    from agent_launcher.platform.processes import file_users, image_of
+    lock = codex_home() / "thread-writer-locks" / f"{thread_id}.lock"
+    if not lock.exists() or not file_users(lock):
+        return
+    live, released = release_closed_sessions(controlled_dir or controlled_state.CODEX_CONTROLLED_DIR)
+    deadline = time.monotonic() + (timeout if released else 0)
+    while (holders := file_users(lock)) and time.monotonic() < deadline:
+        time.sleep(0.3)
+    if holders:
+        pid = holders[0]
+        owner = _launcher_owner(pid, live, sessions_dir) or f"em outro programa ({image_of(pid) or 'processo'}, pid {pid})"
+        raise LauncherError(f"A conversa {thread_id} do Codex já está aberta {owner}. Feche lá para retomá-la "
+                            "aqui, ou abra uma sessão nova.")
 
 
 def _codex_user_text(entry: dict) -> str | None:
@@ -105,6 +167,9 @@ class Codex(Harness):
     BYPASS_HINT = "Sem sandbox ou confirmações"
     EXECUTABLE = "codex"
     SCRUB = frozenset({CODEX_KEY_VARIABLE})
+    # Pela TUI conectada por --remote, "resume --last" pega a conversa mais recente de qualquer pasta (verificado no
+    # 0.169): a de outro projeto, presa pela sessão dele, abre só de leitura ("open in another app").
+    RESUME_BY_ID = True
 
     def find_executable(self) -> str | None:
         return installers.find(self.ID)
@@ -190,6 +255,13 @@ class Codex(Harness):
 
     def final_command(self, plan, directory: Path) -> tuple[list[str], str]:
         return prepare_codex_command(plan, directory, self.command)
+
+    def ensure_resumable(self, plan) -> None:
+        if plan.resume and plan.session_id:
+            free_conversation(plan.session_id)
+
+    def prepare(self, plan) -> None:
+        self.ensure_resumable(plan)
 
     def run(self, plan, project: dict) -> int:
         if plan.controlled:
@@ -350,6 +422,7 @@ def controlled_codex_commands(plan: LaunchPlan, url: str, token_sha256: str = "<
 def run_controlled_codex(plan: LaunchPlan, project: str) -> int:
     """Codex controlável: o orchestrador encontra o app-server pelo registro e manda turnos na janela visível.
     O registro (codex-controlled/<porta>.json) tem "project", "cwd", "url", "pid", "serverPid", "token", "startedAt"."""
+    release_closed_sessions(controlled_state.CODEX_CONTROLLED_DIR)
     try:
         approved = approve_codex_hooks(plan.directory, plan.environment, options=codex_options(plan))
     except OSError as error:

@@ -71,7 +71,8 @@ def has_conversation_for(home: Path | None, cli: str, directory) -> bool:
 def resume_target(home: Path | None, harness: Harness, directory: Path, conversation: str | None,
                   warnings: list[str]) -> tuple[bool, str | None]:
     """(retomar?, id) para o plano. Com id: confere que é uma conversa desta pasta. Sem id: a última (--continue), ou,
-    em pasta compartilhada, a última deste perfil por id. Sem conversa: sessão nova com aviso."""
+    em pasta compartilhada ou destino com RESUME_BY_ID, a última (deste perfil) por id. Sem conversa: sessão nova com
+    aviso."""
     cli = harness.ID
     if conversation:
         if not ID_PATTERN.fullmatch(str(conversation)):
@@ -81,7 +82,7 @@ def resume_target(home: Path | None, harness: Harness, directory: Path, conversa
             warnings.append(f"Conversa {conversation} do {cli} não encontrada nesta pasta: abrindo uma sessão nova.")
             return False, None
         return True, conversation
-    if lists_conversations(harness) and shared_folder(home, directory):
+    if lists_conversations(harness) and (harness.RESUME_BY_ID or shared_folder(home, directory)):
         mine = conversations_for(home, harness, directory)
         if mine:
             return True, mine[0].id

@@ -222,7 +222,11 @@ forma oculta.
 
 Selecione projeto, conexão, CLI e modelo; **Nova sessão** ou **Retomar última**. **Retomar última** só fica habilitado
 quando há conversa daquele CLI na pasta, conferida ao selecionar o projeto: as do terminal e do app contam; as de
-`claude -p`, do SDK e do `codex exec` não, porque o `--continue` e o `codex resume --last` as ignoram. A seta ao lado abre **Escolher conversa…**: a lista das
+`claude -p`, do SDK e do `codex exec` não, porque o `--continue` e o `codex resume --last` as ignoram. No Codex só contam
+as conversas abertas pelo launcher: as da conta do usuário no próprio Codex (o app, a assinatura) ficam com ela, e o Codex
+também não as mistura com as do launcher. A última conversa do Codex é retomada pelo id, sempre a da pasta do projeto;
+se ela estiver aberta em outra janela ou programa, a sessão não abre e o aviso diz onde ela está (uma sessão que já
+fechou e deixou o Codex preso é liberada sozinha). A seta ao lado abre **Escolher conversa…**: a lista das
 conversas do projeto (data, título, mensagens) para retomar qualquer uma, não só a última. Em modo texto:
 `launcher conversations --project X` e `launch --resume --conversation ID`. Sem conversa anterior (inclusive numa sessão aberta pelo orquestrador), a retomada vira
 sessão nova, com um aviso na janela, em vez de parar em "No conversation found to continue". Com o Windows Terminal instalado, cada sessão vira
@@ -353,7 +357,7 @@ launcher keys --list
 
 | Parâmetro | Significado |
 | --- | --- |
-| `TECLA` | `enter esc up down left right tab shift+tab space backspace ctrl+c home end pageup pagedown delete`, um caractere (`1`, `y`) ou `text:ALGO` (cola ALGO de uma vez, entre os marcadores de colagem, sem tocar na área de transferência; 20 mil caracteres em poucos segundos; a linha de comando do Windows limita o texto a cerca de 30 mil caracteres). Enviadas em ordem; o `enter` que vem depois do `text:` é uma tecla à parte. |
+| `TECLA` | `enter esc up down left right tab shift+tab space backspace ctrl+c home end pageup pagedown delete`, um caractere (`1`, `y`) ou `text:ALGO` (cola ALGO de uma vez, entre os marcadores de colagem, sem tocar na área de transferência; no Codex, que no Windows lê a entrada como teclas, vai sem os marcadores e cada quebra de linha vira Ctrl+J, nova linha sem enviar; 20 mil caracteres em poucos segundos; a linha de comando do Windows limita o texto a cerca de 30 mil caracteres). Enviadas em ordem; o `enter` que vem depois do `text:` é uma tecla à parte. |
 | `--project` | Nome, ID ou caminho do projeto da sessão. `--cli` desempata Claude e Codex. |
 | `--pid` | pid da janela da sessão (de `--list`); dispensa `--project`. |
 | `--screen` | Imprime o que a sessão mostra agora (antes das teclas, se houver), para decidir o que enviar. |
