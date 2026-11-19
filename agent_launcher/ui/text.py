@@ -9,7 +9,8 @@ import sys
 from pathlib import Path
 
 from agent_launcher import ROOT
-from agent_launcher.domain import profiles
+from agent_launcher.domain import profiles, usage
+from agent_launcher.domain.conversation_usage import conversation_usage, resume_window_warning
 from agent_launcher.domain.catalog import CLAUDE_FAMILIES, base_model, token_label
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.gateway import Gateway
@@ -317,6 +318,11 @@ def launch(store: Store, project: dict, gateway: Gateway, cli: str, model: str, 
         return 0
     plan = build_plan(gateway, cli, project["path"], model, resume, catalog, controlled=controlled,
                       conversation=conversation)
+    if resume:
+        warning = resume_window_warning(store.home, conversations_for(store.home, harness, plan.directory), conversation,
+                                        catalog.find(plan.model), catalog.verified)
+        if warning:
+            plan.warnings.append(warning)
     if dry_run:
         controlled_commands = harness.dry_run_extra(plan) or None
         hidden = {gateway.token} - {""}
@@ -359,7 +365,14 @@ def list_conversations(store: Store, project: dict, cli: str | None = None) -> l
     for harness in registry.terminals():
         if cli is None or harness.ID == cli:
             found += conversations_for(store.home, harness, directory)
-    return [item.as_json() for item in sorted(found, key=lambda item: item.updated, reverse=True)]
+    cache, tables = usage.FileCache(store.home), usage.price_table(store.home)
+    items = []
+    for item in sorted(found, key=lambda item: item.updated, reverse=True):
+        used = conversation_usage(store.home, item.cli, item.id, tables, cache)
+        items.append({**item.as_json(), "context_tokens": used.context,
+                      "cost_usd": None if used.cost is None else round(used.cost, 6)})
+    cache.save()
+    return items
 
 
 def confirm_in_console(question: str) -> bool:

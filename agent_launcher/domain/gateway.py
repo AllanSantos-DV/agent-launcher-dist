@@ -13,6 +13,7 @@ from agent_launcher.domain.files import atomic_json
 from agent_launcher.domain.store import secret_values
 
 CACHE_TTL = 6 * 60 * 60
+CACHE_SCHEMA = 4
 
 
 class Gateway:
@@ -97,7 +98,7 @@ class Gateway:
         return Catalog(list(records), status, verified, self.clis, self.any_model, frozenset(self.protocols))
 
     def _save(self, records, fetched_at: float, metadata: bool) -> None:
-        atomic_json(self.cache_path, {"schema": 3, "fingerprint": self.fingerprint, "fetched_at": fetched_at,
+        atomic_json(self.cache_path, {"schema": CACHE_SCHEMA, "fingerprint": self.fingerprint, "fetched_at": fetched_at,
                                       "metadata_available": metadata,
                                       "records": [record.to_cache() for record in records]})
 
@@ -119,7 +120,7 @@ class Gateway:
         metadata_available = False
         try:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
-            if data.get("schema") == 3 and data.get("fingerprint") == self.fingerprint:
+            if data.get("schema") == CACHE_SCHEMA and data.get("fingerprint") == self.fingerprint:
                 fetched_at = float(data["fetched_at"])
                 cached.records = [ModelInfo.from_cache(record) for record in data["records"]]
                 metadata_available = data.get("metadata_available") is True

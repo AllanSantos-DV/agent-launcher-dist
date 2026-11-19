@@ -84,7 +84,7 @@ def model_entries(gateway, catalog: Catalog, selected: ModelInfo, base: str) -> 
         if protocol is None:
             continue
         entry = {"id": record.id, "name": record.id, "url": base + ROUTES[protocol], "apiType": API_TYPES[protocol],
-                 "toolCalling": record.tools is not False, "vision": False,
+                 "toolCalling": record.tools is not False, "vision": record.vision is True,
                  "maxInputTokens": (record.max_input_tokens if catalog.verified and record.max_input_tokens else DEFAULT_INPUT),
                  "maxOutputTokens": (record.max_output_tokens if catalog.verified and record.max_output_tokens else DEFAULT_OUTPUT)}
         if protocol == "responses":

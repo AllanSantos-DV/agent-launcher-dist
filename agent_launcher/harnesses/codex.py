@@ -251,7 +251,7 @@ class Codex(Harness):
             command += ["-c", f"projects={{{json.dumps(str(context.directory), ensure_ascii=True)}={{trust_level=\"trusted\"}}}}"]
         return LaunchPlan(self.ID, model, context.directory, command, context.environment, overrides, context.input_limit,
                           context_window, auto_compact_limit, {}, warnings, context.controlled, gateway.name,
-                          (CODEX_KEY_VARIABLE,))
+                          (CODEX_KEY_VARIABLE,), vision=selected.vision)
 
     def final_command(self, plan, directory: Path) -> tuple[list[str], str]:
         return prepare_codex_command(plan, directory, self.command)
@@ -357,11 +357,13 @@ def approve_codex_hooks(directory: Path, environment: dict | None = None, comman
 
 
 def prepare_codex_command(plan: LaunchPlan, directory: Path, resolve=None) -> tuple[list[str], str]:
-    """Catálogo nativo temporário para o Codex aplicar o contexto do host a um ID com prefixo de provider.
-    Sem metadados nativos correspondentes (modelo de outro fornecedor via roteador), segue sem o catálogo e avisa."""
+    """Catálogo nativo temporário para o Codex aplicar ao ID com prefixo de provider o contexto do host e se o modelo
+    aceita imagem (input_modalities). Sem metadados nativos correspondentes (modelo de outro fornecedor via roteador),
+    segue sem o catálogo e avisa."""
     command = list(plan.command)
-    if plan.cli != "codex" or plan.context_window is None:
+    if plan.cli != "codex" or (plan.context_window is None and plan.vision is None):
         return command, ""
+    needs_context = plan.context_window is not None
     environment = dict(plan.environment)
     environment["CODEX_HOME"] = str(directory / "native-config")
     try:
@@ -378,6 +380,9 @@ def prepare_codex_command(plan: LaunchPlan, directory: Path, resolve=None) -> tu
         if not isinstance(records, list):
             raise ValueError("Formato de catálogo inválido.")
     except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+        if not needs_context:
+            return command, ("Não foi possível ler os metadados do Codex instalado: o que o conector informou sobre "
+                             "imagem não foi repassado, e o CLI segue com o que ele mesmo sabe.")
         raise LauncherError(
             "Não foi possível ler os metadados do Codex instalado (debug models --bundled). "
             "A sessão não foi iniciada para evitar uma janela de contexto incorreta. Verifique a versão do CLI."
@@ -389,13 +394,15 @@ def prepare_codex_command(plan: LaunchPlan, directory: Path, resolve=None) -> tu
     ]
     if not candidates:
         return command, (f"O Codex não tem metadados nativos de {plan.model}: o contexto informado pelo host foi "
-                         "repassado, mas o CLI pode usar uma janela menor.")
+                         "repassado, mas o CLI pode usar uma janela menor." if needs_context else
+                         f"O Codex não tem metadados nativos de {plan.model}: o que o conector informou sobre imagem não foi repassado.")
     record = dict(max(candidates, key=lambda candidate: len(candidate["slug"])))
-    record.update({
-        "slug": plan.model, "display_name": plan.model, "visibility": "list",
-        "context_window": plan.context_window, "max_context_window": plan.context_window,
-        "upgrade": None,
-    })
+    record.update({"slug": plan.model, "display_name": plan.model, "visibility": "list", "upgrade": None})
+    if needs_context:
+        record.update({"context_window": plan.context_window, "max_context_window": plan.context_window})
+    if plan.vision is not None:
+        modalities = [item for item in record.get("input_modalities") or ["text"] if item != "image"]
+        record["input_modalities"] = modalities + (["image"] if plan.vision else [])
     catalog_path = directory / "codex-model-catalog.json"
     atomic_json(catalog_path, {"models": [record]})
     command += ["-c", "model_catalog_json=" + json.dumps(str(catalog_path), ensure_ascii=True)]

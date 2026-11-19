@@ -42,11 +42,17 @@ PATHS = {
     "info": '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.01"/>',
     "alert": '<path d="M12 4 2.5 20h19Z"/><path d="M12 10v4.5M12 17.5v.01"/>',
     "error": '<circle cx="12" cy="12" r="9"/><path d="M12 7v6M12 16.5v.01"/>',
+    "vision": '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>',
+    "audio": '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
+    "video": '<rect x="2" y="6" width="14" height="12" rx="2"/><path d="m16 10 6-3v10l-6-3Z"/>',
 }
+STRIKE = '<path d="M3 3 21 21"/>'
 
 
-def icon(name: str, color: str = INK, size: int = 20) -> QIcon:
-    svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">{PATHS[name]}</svg>'
+def icon(name: str, color: str = INK, size: int = 20, fill: str = "none", struck: bool = False) -> QIcon:
+    """Ícone de traço da biblioteca PATHS; `fill` preenche as formas e `struck` cruza o ícone com uma barra."""
+    shapes = PATHS[name] + (STRIKE if struck else "")
+    svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="{fill}" stroke="{color}" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">{shapes}</svg>'
     pixmap = QPixmap(size * 2, size * 2)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
@@ -605,8 +611,8 @@ QFrame#errorStrip { background: #fbe8e5; border: 1px solid #eec3bd; border-radiu
 QFrame#errorStrip QLabel { color: #a32018; }
 QFrame#errorStrip QPushButton#ghost { color: #a32018; font-weight: 600; }
 QFrame#errorStrip QPushButton#ghost:hover { background: #f6d5d0; }
-QFrame#warningStrip, QFrame#bypassRisk { background: #f4e5ce; border: 1px solid #e2c79f; border-radius: 8px; }
-QFrame#warningStrip QLabel, QFrame#bypassRisk QLabel { color: #7e4216; }
+QFrame#warningStrip, QFrame#bypassRisk, QFrame#mediaNotice { background: #f4e5ce; border: 1px solid #e2c79f; border-radius: 8px; }
+QFrame#warningStrip QLabel, QFrame#bypassRisk QLabel, QFrame#mediaNotice QLabel { color: #7e4216; }
 QFrame#infoStrip { background: #e1f0f3; border: 1px solid #b9d3da; border-radius: 8px; }
 QFrame#infoStrip QLabel { color: #233e32; }
 QFrame#infoStrip QPushButton#ghost { color: #0d5568; }

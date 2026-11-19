@@ -1,7 +1,8 @@
 """LiteLLM proxy ou host próprio que o expõe (inclusive na rede ou por VPN, com a autenticação injetada no host).
 
-/v1/models diz o que está disponível; /v1/model/info (exclusivo do LiteLLM) traz modo, limites e ferramentas por ID.
-Host sem /v1/model/info que publica mode/max_input_tokens/max_output_tokens na própria /v1/models tem esses campos lidos.
+/v1/models diz o que está disponível; /v1/model/info (exclusivo do LiteLLM; /model/info quando o host só serve a rota
+sem /v1) traz modo, limites e ferramentas por ID.
+Host sem nenhuma das duas rotas que publica mode/max_input_tokens/max_output_tokens na própria /v1/models tem esses campos lidos.
 O LiteLLM serve /v1/messages, /v1/responses e /v1/chat/completions na mesma base: todos os destinos usam o mesmo endereço.
 Com "Nome da chave no host" (key_name), a raiz vira {endereço}/k/<nome> em todas as URLs (catálogo,
 verificação e destinos), e o /healthz precisa anunciar key_routing: true antes de listar ou verificar.
@@ -51,15 +52,25 @@ def verify(options):
     listed(get_json(url + "/v1/models", headers, timeout=10), url + "/v1/models")
 
 
+def _model_info(url, headers):
+    """Metadados por modelo do LiteLLM: /v1/model/info e, quando o host só serve a rota sem /v1, /model/info; None se nenhuma existir."""
+    for path in ("/v1/model/info", "/model/info"):
+        try:
+            return listed(get_json(url + path, headers, timeout=25), url + path)
+        except ConnectorError:
+            continue
+    return None
+
+
 def models(options):
+    """Modelos do host com limites, modo e ferramentas; devolve (registros, contexto_confirmado)."""
     headers = bearer(options.get("api_key") or NO_KEY)
     url = _routed(options, headers)
     available = listed(get_json(url + "/v1/models", headers), url + "/v1/models")
-    try:
-        metadata = listed(get_json(url + "/v1/model/info", headers, timeout=25), url + "/v1/model/info")
-    except ConnectorError:
-        records = merge_records(available, [{"model_name": base_model(entry["id"]), "model_info": entry}
-                                            for entry in available
-                                            if isinstance(entry, dict) and isinstance(entry.get("id"), str)])
-        return records, any(record.max_input_tokens for record in records)
-    return merge_records(available, metadata), True
+    metadata = _model_info(url, headers)
+    if metadata is not None:
+        return merge_records(available, metadata), True
+    records = merge_records(available, [{"model_name": base_model(entry["id"]), "model_info": entry}
+                                        for entry in available
+                                        if isinstance(entry, dict) and isinstance(entry.get("id"), str)])
+    return records, any(record.max_input_tokens for record in records)

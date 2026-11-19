@@ -14,8 +14,9 @@ from PySide6.QtWidgets import (
 )
 
 from agent_launcher import ROOT
-from agent_launcher.domain import profiles
-from agent_launcher.domain.catalog import base_model, token_label
+from agent_launcher.domain import profiles, usage
+from agent_launcher.domain.conversation_usage import conversation_usage, resume_window_warning, window_warning
+from agent_launcher.domain.catalog import base_model, media_states, price_label, token_label
 from agent_launcher.domain.errors import LauncherBusy, LauncherError
 from agent_launcher.domain.files import project_path
 from agent_launcher.domain.gateway import Gateway
@@ -32,7 +33,7 @@ from agent_launcher.ui.connections import ConnectionsDialog, quota_warning
 from agent_launcher.ui.instructions import InstructionsDialog
 from agent_launcher.ui.text import label_of
 from agent_launcher.ui.theme import (
-    DANGER, GREEN, INFO, MUTED, STYLE, WARN, CardGrid, CliButton, DangerMenu, ElidedLabel, FlowRow, InfoStrip,
+    DANGER, GREEN, INFO, MENU_SELECTED, MUTED, STYLE, WARN, CardGrid, CliButton, DangerMenu, ElidedLabel, FlowRow, InfoStrip,
     NoticeStrip, ReadableCombo, icon,
 )
 from agent_launcher.update import updater
@@ -57,6 +58,20 @@ def model_name(identifier: str) -> str:
 
 def provider_name(provider: str) -> str:
     return {"bedrock.anthropic": "Bedrock", "vertex_ai.anthropic": "Vertex"}.get(provider, provider or "Direto")
+
+
+MEDIA_COLUMNS = (("vision", "Visão", "vision"), ("audio_input", "Áudio", "audio"), ("video_input", "Vídeo", "video"))
+UNKNOWN_MEDIA = "o conector não informou"
+FIRST_MEDIA_COLUMN = 4
+MEDIA_FILTERS = (("Todas as entradas", None),) + tuple((f"Com {title.lower()}", field) for field, title, _symbol in MEDIA_COLUMNS)
+
+
+def media_cell(title: str, state: bool | None) -> tuple[str, str]:
+    """Texto e dica da célula de uma entrada de mídia na lista de modelos: sem texto (só o ícone) quando o conector
+    informou, traço quando não informou."""
+    if state is None:
+        return "—", f"{title}: {UNKNOWN_MEDIA}"
+    return "", f"{title}: {'aceita' if state else 'não aceita'} (informado pelo conector)"
 
 
 def plural(count: int, singular: str, several: str) -> str:
@@ -174,10 +189,23 @@ class DiagnosticsDialog(QDialog):
             on_copy()
 
 
+def conversation_usage_cells(result, record, verified: bool) -> tuple[str, str]:
+    """Contexto (com a parte da janela do modelo escolhido, quando confirmada) e custo estimado; traço = desconhecido."""
+    if result is None:
+        return "—", "—"
+    window = record.max_input_tokens if record and verified else None
+    context = "—" if result.context is None else (f"{round(result.context / 1000)}k" if result.context >= 1000 else str(result.context))
+    if result.context and window:
+        context += f" ({round(result.context * 100 / window)}%)"
+    cost = "—" if result.cost is None else f"US$ {result.cost:.2f}".replace(".", ",")
+    return context, cost
+
+
 class ConversationsDialog(QDialog):
     """Conversas do CLI nesta pasta (as deste perfil, se a pasta é compartilhada): duplo clique ou Retomar."""
 
-    def __init__(self, conversations: list, parent=None, cli_label: str = ""):
+    def __init__(self, conversations: list, parent=None, cli_label: str = "", usages: dict | None = None,
+                 record=None, verified: bool = False):
         super().__init__(parent)
         from datetime import datetime
         self.setWindowTitle(f"Conversas do {cli_label}" if cli_label else "Escolher conversa")
@@ -186,8 +214,9 @@ class ConversationsDialog(QDialog):
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(12)
         layout.addWidget(label("Escolha a conversa a retomar (mais recente primeiro).", "muted"))
-        self.table = QTableWidget(len(conversations), 4)
-        self.table.setHorizontalHeaderLabels(["Data", "CLI", "Título", "Mensagens"])
+        usages = usages or {}
+        self.table = QTableWidget(len(conversations), 6)
+        self.table.setHorizontalHeaderLabels(["Data", "CLI", "Título", "Mensagens", "Contexto", "Custo (est.)"])
         self.table.setAccessibleName("Conversas")
         self.table.verticalHeader().hide()
         self.table.setAlternatingRowColors(True)
@@ -197,18 +226,29 @@ class ConversationsDialog(QDialog):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        for column in (0, 1, 3):
+        for column in (0, 1, 3, 4, 5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         for row, conversation in enumerate(conversations):
             values = (datetime.fromtimestamp(conversation.updated).strftime("%d/%m/%Y %H:%M"),
                       registry.get(conversation.cli).LABEL if registry.find(conversation.cli) else conversation.cli,
                       conversation.title or "(sem título)",
-                      "" if conversation.messages is None else str(conversation.messages))
+                      "" if conversation.messages is None else str(conversation.messages),
+                      *conversation_usage_cells(usages.get(conversation.id), record, verified))
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, conversation.id)
                 if column == 2:
                     item.setToolTip(f"{conversation.title}\nID: {conversation.id}")
+                elif column == 4:
+                    warning = window_warning(getattr(usages.get(conversation.id), "context", None), record, verified)
+                    item.setToolTip(warning or "Tokens do último pedido da conversa: o que a retomada carrega.")
+                    if warning:
+                        item.setForeground(QColor(WARN))
+                elif column == 5:
+                    item.setToolTip("Estimativa pelo preço que o host informa para cada modelo usado; não é fatura. "
+                                    "Traço: o host não informou o preço de algum modelo, ou o CLI não guarda o uso.")
+                if column >= 3:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(row, column, item)
         if conversations:
             self.table.selectRow(0)
@@ -438,6 +478,20 @@ def usage_text(report: dict) -> str:
     return "\n".join(lines)
 
 
+MODELS_HEADER = ("Modelo", "Provider", "Entrada", "Saída", "Preço (US$ por 1M, entrada/saída)", *(title for _, title, _ in MEDIA_COLUMNS))
+
+
+def models_text(records: list, catalog) -> str:
+    """A lista de modelos separada por tabulação: colada numa planilha, cada valor cai na sua coluna."""
+    lines = ["\t".join(MODELS_HEADER)]
+    for record in records:
+        states = ["—" if state is None else "sim" if state else "não" for _title, state in media_states(record)]
+        output = "—" if record.max_output_tokens is None else token_label(record.max_output_tokens)
+        lines.append("\t".join([record.id, provider_name(record.provider), token_label(record.max_input_tokens), output,
+                                 price_label(record) or "—", *states]))
+    return "\n".join(lines)
+
+
 class UsageDialog(QDialog):
     from agent_launcher.domain.usage import NOTE
 
@@ -445,15 +499,30 @@ class UsageDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(f"Uso do mês — {profile_name}")
         self.resize(760, 420)
+        self.home = home
         layout = QVBoxLayout(self)
+        choice = QHBoxLayout()
+        self.month_label = QLabel("Mês")
+        choice.addWidget(self.month_label)
+        self.month_choice = ReadableCombo()
+        self.month_choice.setAccessibleName("Mês do uso")
+        for month in usage.recent_months():
+            self.month_choice.addItem(month, month)
+        self.month_label.setBuddy(self.month_choice)
+        choice.addWidget(self.month_choice)
         self.status = QLabel("Calculando…")
-        layout.addWidget(self.status)
+        choice.addWidget(self.status, 1)
+        layout.addLayout(choice)
         self.error = label("", "notice")  # erro no estilo de erro da janela principal, nunca na linha de status
         self.error.setWordWrap(True)
         self.error.hide()
         layout.addWidget(self.error)
         self.table = QTableWidget(0, len(USAGE_HEADER))
         self.table.setHorizontalHeaderLabels(list(USAGE_HEADER))
+        for column in range(2, len(USAGE_HEADER)):
+            self.table.horizontalHeaderItem(column).setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        for column in range(2):
+            self.table.horizontalHeaderItem(column).setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
@@ -477,9 +546,19 @@ class UsageDialog(QDialog):
         actions.addWidget(close)
         layout.addLayout(actions)
         self.report = None
-        self.task = UsageTask(home)
-        self.task.signals.completed.connect(self.show_report)
-        QThreadPool.globalInstance().start(self.task)
+        self.month_choice.currentIndexChanged.connect(self.calculate)
+        self.calculate()
+
+    def calculate(self) -> None:
+        """Calcula o mês escolhido; o resultado de uma escolha anterior que chega depois é descartado."""
+        self.status.setText("Calculando…")
+        self.error.hide()
+        self.report = None
+        self.copy_button.setEnabled(False)
+        self.table.setRowCount(0)
+        task = self.task = UsageTask(self.home, self.month_choice.currentData())
+        task.signals.completed.connect(lambda report, text="": task is self.task and self.show_report(report, text))
+        QThreadPool.globalInstance().start(task)
 
     def show_report(self, report, _text: str = ""):
         if isinstance(report, Exception):
@@ -491,13 +570,20 @@ class UsageDialog(QDialog):
         rows = usage_rows(report)
         self.report = report if rows else None
         self.copy_button.setEnabled(self.report is not None)
-        self.status.setText(f"Mês {report['month']}" + ("" if rows else ": nenhum uso encontrado."))
+        self.status.setText("" if rows else f"Nenhum uso encontrado em {report['month']}.")
         self.table.setRowCount(len(rows))
         for number, row in enumerate(rows):
+            total = number == len(rows) - 1
             for column, value in enumerate(row):
                 item = QTableWidgetItem(value)
                 if column >= 2:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if total:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                if column == 4 and (value == "sem preço" or value.endswith("(parcial)")):
+                    item.setForeground(QColor(MUTED))
                 self.table.setItem(number, column, item)
 
     def copy(self) -> None:
@@ -825,23 +911,40 @@ class LauncherWindow(QMainWindow):
         self.provider_filter.setAccessibleName("Filtrar provider")
         self.provider_filter.currentIndexChanged.connect(self.populate_models)
         search_row.addWidget(self.provider_filter)
+        self.media_filter = ReadableCombo()
+        self.media_filter.setAccessibleName("Filtrar por entrada")
+        for text, field in MEDIA_FILTERS:
+            self.media_filter.addItem(text, field)
+        self.media_filter.currentIndexChanged.connect(self.populate_models)
+        search_row.addWidget(self.media_filter)
+        self.copy_models_button = button("Copiar lista", "copy", "ghost")
+        self.copy_models_button.setToolTip("Copia a lista como está filtrada, separada por tabulação, para colar numa planilha")
+        self.copy_models_button.clicked.connect(self.copy_models)
+        search_row.addWidget(self.copy_models_button)
         self.refresh_button = button("Atualizar", "refresh")
         self.refresh_button.setToolTip("Atualizar catálogo e verificar proxy (F5)")
         self.refresh_button.clicked.connect(lambda: self.refresh_catalog(True))
         search_row.addWidget(self.refresh_button)
         body.addLayout(search_row)
-        self.model_table = QTableWidget(0, 3)
-        self.model_table.setAccessibleName("Modelos disponíveis: nome, provider e entrada")
-        self.model_table.setHorizontalHeaderLabels(["Modelo", "Provider", "Entrada"])
+        self.model_table = QTableWidget(0, FIRST_MEDIA_COLUMN + len(MEDIA_COLUMNS))
+        self.model_table.setAccessibleName("Modelos disponíveis: nome, provider, entrada, saída, visão, áudio e vídeo")
+        self.model_table.setHorizontalHeaderLabels(["Modelo", "Provider", "Entrada", "Saída", *(title for _, title, _ in MEDIA_COLUMNS)])
         self.model_table.verticalHeader().hide()
         self.model_table.verticalHeader().setDefaultSectionSize(40)
         self.model_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.model_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         self.model_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self.model_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.model_table.horizontalHeaderItem(2).setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.model_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        for column in (2, 3):
+            self.model_table.horizontalHeaderItem(column).setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.model_table.setColumnWidth(1, 115)
-        self.model_table.setColumnWidth(2, 100)
+        self.model_table.setColumnWidth(2, 90)
+        self.model_table.setColumnWidth(3, 80)
+        for column in range(FIRST_MEDIA_COLUMN, FIRST_MEDIA_COLUMN + len(MEDIA_COLUMNS)):
+            self.model_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+            self.model_table.horizontalHeaderItem(column).setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.model_table.setColumnWidth(column, 64)
         self.model_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.model_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.model_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -867,6 +970,9 @@ class LauncherWindow(QMainWindow):
         self.family_info = ElidedLabel()
         self.family_info.setObjectName("muted")
         context.addWidget(self.family_info)
+        self.media_notice = NoticeStrip("mediaNotice", "alert", WARN)
+        self.media_notice.row.setContentsMargins(8, 4, 10, 4)
+        context.addWidget(self.media_notice)
         body.addWidget(context_card)
         self.info_strip = InfoStrip()
         self.info_notice = self.info_strip.info
@@ -1377,8 +1483,10 @@ class LauncherWindow(QMainWindow):
             preferred = self.store.last_model(self.project, self.gateway.connection, self.cli)
         query = self.model_search.text().strip().casefold()
         provider = self.provider_filter.currentData()
+        media = self.media_filter.currentData()
         all_records = self.catalog.for_cli(self.cli) if self.catalog else []
         self.records = [record for record in all_records if (provider is None or record.provider == provider)
+                        and (media is None or getattr(record, media) is True)
                         and (query in record.id.casefold() or query in model_name(record.id).casefold())]
         families = {"opus": 0, "sonnet": 1, "haiku": 2}
         self.records.sort(key=lambda record: record.version, reverse=True)
@@ -1388,13 +1496,16 @@ class LauncherWindow(QMainWindow):
         self.model_table.setRowCount(len(self.records))
         selected_row = 0
         for row, record in enumerate(self.records):
-            values = (model_name(record.id), provider_name(record.provider), token_label(record.max_input_tokens).replace(".", ","))
+            values = (model_name(record.id), provider_name(record.provider), token_label(record.max_input_tokens).replace(".", ","),
+                      "—" if record.max_output_tokens is None else token_label(record.max_output_tokens).replace(".", ","))
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                item.setToolTip(record.id if column != 2 else self.catalog.describe(record))
-                if column == 2:
+                item.setToolTip(record.id if column < 2 else self.catalog.describe(record))
+                if column >= 2:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.model_table.setItem(row, column, item)
+            for column, (field, title, symbol) in enumerate(MEDIA_COLUMNS, start=FIRST_MEDIA_COLUMN):
+                self.model_table.setItem(row, column, self.media_item(title, symbol, getattr(record, field)))
             if record.id == preferred:
                 selected_row = row
         self.model_table.blockSignals(False)
@@ -1406,13 +1517,24 @@ class LauncherWindow(QMainWindow):
         self.render_catalog_tag()
         self.select_model()
 
+    @staticmethod
+    def media_item(title: str, symbol: str, state: bool | None) -> QTableWidgetItem:
+        text, tip = media_cell(title, state)
+        item = QTableWidgetItem(text)
+        item.setToolTip(tip)
+        item.setData(Qt.ItemDataRole.AccessibleTextRole, tip)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if state is not None:
+            item.setIcon(icon(symbol, GREEN, fill=MENU_SELECTED) if state else icon(symbol, MUTED, struck=True))
+        return item
+
     def render_empty_models(self):
         """Lista vazia diz por quê: carregando, catálogo que não veio ou busca sem resultado."""
         if self.records:
             self.empty_models.hide()
             return
         if self.catalog_size:
-            text = "Nenhum modelo encontrado para esta busca. Limpe a busca ou escolha Todos os providers."
+            text = "Nenhum modelo encontrado para esta busca. Limpe a busca ou os filtros."
         elif self.refreshing:
             text = "Carregando modelos…"
         elif self.gateway and not self.online and "connection" in self.errors:
@@ -1449,6 +1571,9 @@ class LauncherWindow(QMainWindow):
         else:
             self.context_info.setText("Contexto não confirmado. Nenhum aumento será forçado." if record else "Escolha um modelo da lista.")
             self.family_info.setText("Este host não informa limites (ou o cache venceu); os CLIs usam os seus próprios." if record else "")
+        refuses_images = bool(record) and record.vision is False
+        self.media_notice.text.setText(f"{model_name(record.id)} não aceita imagem (o conector informou)." if refuses_images else "")
+        self.media_notice.setVisible(refuses_images)
         self.update_actions()
 
     def update_actions(self):
@@ -1523,9 +1648,26 @@ class LauncherWindow(QMainWindow):
         if not found:
             self.show_info(f"Ainda não há conversa do {registry.get(self.cli).LABEL} nesta pasta.", origin="conversa")
             return
-        dialog = ConversationsDialog(found, self, registry.get(self.cli).LABEL)
+        dialog = ConversationsDialog(found, self, registry.get(self.cli).LABEL, self.conversation_usages(found),
+                                     self.selected_model, bool(self.catalog and self.catalog.verified))
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected():
             self.launch_session(True, conversation=dialog.selected())
+
+    def conversation_usages(self, conversations: list) -> dict:
+        """Custo e contexto de cada conversa da lista, lidos dos transcripts (cache por arquivo)."""
+        cache, tables = usage.FileCache(self.store.home), usage.price_table(self.store.home)
+        found = {item.id: conversation_usage(self.store.home, item.cli, item.id, tables, cache) for item in conversations}
+        cache.save()
+        return found
+
+    def warn_resume_window(self, conversation: str | None):
+        """Avisa quando a conversa que será retomada já enche a janela do modelo escolhido."""
+        warning = resume_window_warning(self.store.home, self.conversation_list(), conversation, self.selected_model,
+                                        bool(self.catalog and self.catalog.verified))
+        if warning:
+            self.show_warning(warning, origin="janela")
+        else:
+            self.clear_error("janela")
 
     @Slot()
     def refresh_catalog(self, force=False):
@@ -1571,6 +1713,10 @@ class LauncherWindow(QMainWindow):
         if not self.project or not self.gateway or not self.selected_model or not self.online or self.refreshing:
             return
         self.clear_transient()
+        if resume:
+            self.warn_resume_window(conversation)
+        else:
+            self.clear_error("janela")
         harness = registry.get(self.cli)
         if harness.KIND != "terminal":
             self.open_outside_terminal(harness)
@@ -1668,6 +1814,10 @@ class LauncherWindow(QMainWindow):
             f"PATH do processo: {len(path)} caracteres, contém WindowsApps={'WindowsApps' in path}",
             f"Atualização automática: {self.update_status}",
         ])
+
+    def copy_models(self):
+        QApplication.clipboard().setText(models_text(self.records, self.catalog))
+        self.confirm_copy(f"{plural(len(self.records), 'modelo copiado', 'modelos copiados')}: cole numa planilha, cada valor vai para a sua coluna.")
 
     def copy_notice(self):
         QApplication.clipboard().setText(self.problem_report(self.notice.toolTip() or self.notice.text()))

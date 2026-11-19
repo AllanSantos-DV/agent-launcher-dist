@@ -39,6 +39,7 @@ class LaunchPlan:
     secret_variables: tuple = ()
     session_id: str | None = None   # id da conversa conhecido na abertura (Claude novo: --session-id; retomada por id)
     resume: bool = False            # retomada de fato (retomar sem conversa vira sessão nova)
+    vision: bool | None = None      # o conector diz se o modelo aceita imagem; None = não informou
 
     @property
     def public_overrides(self) -> dict[str, str]:

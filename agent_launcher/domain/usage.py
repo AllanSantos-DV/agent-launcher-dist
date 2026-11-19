@@ -35,8 +35,10 @@ from agent_launcher.session import registry
 DESTINATIONS = ("claude", "codex", "copilot", "vscode", "copilot_app", "endpoint")
 ATTRIBUTION_WINDOW = 10 * 60
 CACHE_FILE = "usage.json"
-CACHE_SCHEMA = 1
+CACHE_SCHEMA = 2  # 2: resultado com "context" e o ponto de continuação ("resume")
 USAGE_FILE = "usage.jsonl"
+RECENT_IDS = 64  # ids do Claude lembrados entre leituras: os blocos de uma mensagem vêm em linhas próximas
+SAVE_EVERY = 30  # s entre gravações do cache durante uma leitura longa (a primeira leitura de um mês pode levar minutos)
 NOTE = "Estimativa local, a partir das conversas e do endpoint deste perfil; o host não informa consumo."
 FIELDS = ("input_tokens", "output_tokens", "cache_read", "cache_write")
 
@@ -54,6 +56,16 @@ def month_bounds(month: str | None) -> tuple[str, float, float]:
     days = calendar.monthrange(year, number)[1]
     end = time.mktime((year, number, days, 0, 0, 0, 0, 0, -1)) + 86400
     return f"{year:04d}-{number:02d}", start, end
+
+
+def recent_months(count: int = 12, today: tuple[int, int] | None = None) -> list[str]:
+    """Os `count` últimos meses (AAAA-MM), do corrente para trás; `today` é (ano, mês) e só existe para os testes."""
+    year, number = today or (int(time.strftime("%Y")), int(time.strftime("%m")))
+    months = []
+    for _ in range(count):
+        months.append(f"{year:04d}-{number:02d}")
+        year, number = (year - 1, 12) if number == 1 else (year, number - 1)
+    return months
 
 
 def parse_time(value) -> float | None:
@@ -87,13 +99,52 @@ def _key(folder) -> str:
 
 
 # ------------------------------------------------------------------------------------------------------ leitores
-def read_claude(path: Path) -> dict:
-    """{"months": {mês: {modelo: [entrada, saída, cache_lido, cache_gravado]}}} de um transcript do Claude Code."""
-    seen = {}
-    with open(path, encoding="utf-8", errors="replace") as stream:
-        for line in stream:
-            if '"usage"' not in line or '"assistant"' not in line:
-                continue
+def _resume_point(stream, resume: dict | None) -> int:
+    """Onde continuar a leitura: o offset salvo, se os bytes antes dele ainda são os mesmos (arquivo só cresceu); senão 0."""
+    if not resume or not isinstance(resume.get("offset"), int):
+        return 0
+    offset, tail = resume["offset"], bytes.fromhex(str(resume.get("tail", "")))
+    if offset < len(tail):
+        return 0
+    stream.seek(offset - len(tail))
+    if stream.read(len(tail)) != tail:
+        stream.seek(0)
+        return 0
+    return offset
+
+
+def _lines(stream, offset: int, markers: tuple[bytes, ...], position: list):
+    """Linhas completas a partir de offset que têm todos os marcadores; position[0] acompanha o fim da última linha
+    completa (a linha que o CLI ainda está gravando fica para a próxima leitura)."""
+    position[0] = offset
+    for raw in stream:
+        if not raw.endswith(b"\n"):
+            break
+        position[0] += len(raw)
+        if all(marker in raw for marker in markers):
+            yield raw.decode("utf-8", "replace")
+
+
+def _resume_state(stream, offset: int, **state) -> dict:
+    stream.seek(max(0, offset - 64))
+    return {"offset": offset, "tail": stream.read(offset - max(0, offset - 64)).hex(), **state}
+
+
+def _months_copy(result: dict) -> dict:
+    return json.loads(json.dumps(result.get("months") or {}))
+
+
+def read_claude(path: Path, resume: dict | None = None) -> dict:
+    """{"months": {mês: {modelo: [entrada, saída, cache_lido, cache_gravado]}}, "resume": ...} de um transcript do Claude
+    Code. Com `resume` (o resultado anterior do mesmo arquivo) lê só o que foi acrescentado depois dele."""
+    with open(path, "rb") as stream:
+        offset = _resume_point(stream, (resume or {}).get("resume"))
+        state = resume["resume"] if offset else {}
+        months = _months_copy(resume) if offset else {}
+        recent = {item[0]: item[1:] for item in state.get("recent", [])}
+        count, context = state.get("count", 0), (resume or {}).get("context") if offset else None
+        position = [offset]
+        for line in _lines(stream, offset, (b'"usage"', b'"assistant"'), position):
             try:
                 entry = json.loads(line)
             except ValueError:
@@ -104,18 +155,27 @@ def read_claude(path: Path) -> dict:
             model = entry.get("requestedModel") if isinstance(entry.get("requestedModel"), str) else message.get("model")
             if not isinstance(model, str) or model.startswith("<"):
                 continue  # <synthetic>: mensagem gerada localmente, sem chamada ao modelo
+            usage = message["usage"]
+            values = [_number(usage.get("input_tokens")), _number(usage.get("output_tokens")),
+                      _number(usage.get("cache_read_input_tokens")), _number(usage.get("cache_creation_input_tokens"))]
+            # resposta interrompida grava uso zerado: o contexto que vale é o do último pedido que chegou ao host
+            context = values[0] + values[2] + values[3] or context
             at = parse_time(entry.get("timestamp"))
             if at is None:
                 continue
-            usage = message["usage"]
-            values = (_number(usage.get("input_tokens")), _number(usage.get("output_tokens")),
-                      _number(usage.get("cache_read_input_tokens")), _number(usage.get("cache_creation_input_tokens")))
-            identifier = message.get("id") if isinstance(message.get("id"), str) else f"linha-{len(seen)}"
-            seen[identifier] = (month_of(at), base_model(model), values)
-    months: dict = {}
-    for month, model, values in seen.values():
-        _add(months, month, model, values)
-    return {"months": months}
+            identifier = message.get("id") if isinstance(message.get("id"), str) else f"linha-{count}"
+            count += 1
+            # o Claude grava uma linha por bloco com o mesmo id e o mesmo usage: vale a última, contada uma vez
+            if identifier in recent:
+                old_month, old_model, old_values = recent.pop(identifier)
+                _add(months, old_month, old_model, [-value for value in old_values])
+            recent[identifier] = (month_of(at), base_model(model), values)
+            _add(months, *recent[identifier])
+            while len(recent) > RECENT_IDS:
+                recent.pop(next(iter(recent)))
+        state = _resume_state(stream, position[0], count=count,
+                              recent=[[identifier, *item] for identifier, item in recent.items()])
+    return {"months": months, "context": context, "resume": state}
 
 
 def codex_meta(path: Path) -> dict:
@@ -132,11 +192,16 @@ def codex_meta(path: Path) -> dict:
             "created": parse_time(payload.get("timestamp")) or parse_time(first.get("timestamp"))}
 
 
-def read_codex(path: Path) -> dict:
-    months: dict = {}
-    model, previous = "", None
-    with open(path, encoding="utf-8", errors="replace") as stream:
-        for line in stream:
+def read_codex(path: Path, resume: dict | None = None) -> dict:
+    """Como read_claude, para um rollout do Codex: soma o crescimento do acumulado entre eventos token_count."""
+    with open(path, "rb") as stream:
+        offset = _resume_point(stream, (resume or {}).get("resume"))
+        state = resume["resume"] if offset else {}
+        months = _months_copy(resume) if offset else {}
+        model, previous = state.get("model", ""), state.get("previous")
+        context = (resume or {}).get("context") if offset else None
+        position = [offset]
+        for line in _lines(stream, offset, (), position):
             if '"turn_context"' not in line and '"token_count"' not in line:
                 continue
             try:
@@ -151,21 +216,25 @@ def read_codex(path: Path) -> dict:
                 continue
             if payload.get("type") != "token_count" or not isinstance(payload.get("info"), dict):
                 continue
+            latest = payload["info"].get("last_token_usage")
+            if isinstance(latest, dict) and _number(latest.get("input_tokens")):
+                context = _number(latest.get("input_tokens"))
             total = payload["info"].get("total_token_usage")
             at = parse_time(entry.get("timestamp"))
             if not isinstance(total, dict) or at is None:
                 continue
             cached = _number(total.get("cached_input_tokens"))
-            current = (max(0, _number(total.get("input_tokens")) - cached), _number(total.get("output_tokens")), cached,
-                       _number(total.get("cache_write_input_tokens")))
+            current = [max(0, _number(total.get("input_tokens")) - cached), _number(total.get("output_tokens")), cached,
+                       _number(total.get("cache_write_input_tokens"))]
             if previous is not None and all(now >= before for now, before in zip(current, previous)):
-                delta = tuple(now - before for now, before in zip(current, previous))
+                delta = [now - before for now, before in zip(current, previous)]
             else:
                 delta = current  # primeiro evento (ou contador zerado)
             previous = current
             if any(delta):
                 _add(months, month_of(at), model, delta)
-    return {"months": months}
+        state = _resume_state(stream, position[0], model=model, previous=previous)
+    return {"months": months, "context": context, "resume": state}
 
 
 def copilot_meta(folder: Path) -> dict:
@@ -194,7 +263,7 @@ def _copilot_values(usage: dict) -> tuple:
 
 
 def read_copilot(path: Path) -> dict:
-    records, shutdowns = {}, []
+    records, shutdowns, context = {}, [], None
     with open(path, encoding="utf-8", errors="replace") as stream:
         for line in stream:
             if '"session.usage_record"' not in line and '"session.shutdown"' not in line:
@@ -212,13 +281,15 @@ def read_copilot(path: Path) -> dict:
                 accounting = usage.get("accounting") if isinstance(usage.get("accounting"), dict) else {}
                 identifier = accounting.get("usageId") or usage.get("apiCallId") or entry.get("id") or len(records)
                 records[str(identifier)] = (month_of(at), str(usage.get("model") or "?"), _copilot_values(usage))
+                # inputTokens já inclui o cache lido: é o contexto inteiro do pedido
+                context = _number(usage.get("inputTokens")) or context
             elif entry.get("type") == "session.shutdown" and isinstance(data.get("modelMetrics"), dict):
                 shutdowns.append((at, data["modelMetrics"]))
     months: dict = {}
     if records:
         for month, model, values in records.values():
             _add(months, month, model, values)
-        return {"months": months}
+        return {"months": months, "context": context}
     previous: dict = {}
     for at, metrics in shutdowns:  # acumulado por modelo: soma só o que cresceu desde o último encerramento
         for model, metric in metrics.items():
@@ -247,8 +318,10 @@ class FileCache:
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             self.files = {}
         self.used, self.changed = set(), False
+        self.saved_at = time.monotonic()
 
     def get(self, path: Path, reader, stat=None) -> dict:
+        """Resultado do arquivo; o que mudou é relido, e o reader que sabe continuar (resume) lê só o que cresceu."""
         key = str(path)
         try:
             stat = stat or os.stat(path)
@@ -257,23 +330,28 @@ class FileCache:
         signature = [stat.st_mtime, stat.st_size]
         self.used.add(key)
         cached = self.files.get(key)
-        if isinstance(cached, dict) and cached.get("signature") == signature and isinstance(cached.get("result"), dict):
-            return cached["result"]
+        previous = cached.get("result") if isinstance(cached, dict) and isinstance(cached.get("result"), dict) else None
+        if previous is not None and cached.get("signature") == signature:
+            return previous
         try:
-            result = reader(path)
+            result = reader(path, previous) if previous and isinstance(previous.get("resume"), dict) else reader(path)
         except OSError:
             return {"months": {}}
         self.files[key] = {"signature": signature, "result": result}
         self.changed = True
+        if time.monotonic() - self.saved_at >= SAVE_EVERY:
+            self.save()
         return result
 
     def save(self) -> None:
         stale = [key for key in self.files if key not in self.used and not os.path.exists(key)]
         for key in stale:
             del self.files[key]
+        self.saved_at = time.monotonic()
         if self.changed or stale:
             try:
                 atomic_json(self.path, {"schema": CACHE_SCHEMA, "files": self.files})
+                self.changed = False
             except OSError:
                 pass
 

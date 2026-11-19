@@ -6,7 +6,7 @@ import json
 import re
 import urllib.parse
 
-from agent_launcher.domain.catalog import MODEL_PATTERN, ModelInfo, base_model, positive_integer
+from agent_launcher.domain.catalog import MODEL_PATTERN, ModelInfo, base_model, positive_integer, price
 from agent_launcher.connectors import ConnectorError, QuotaExhausted
 
 LIMIT = 16 * 1024 * 1024
@@ -166,6 +166,22 @@ def _first(*values) -> int | None:
     return next((value for value in map(positive_integer, values) if value is not None), None)
 
 
+def _accepts(inputs: object, kind: str, declared: object = None) -> bool | None:
+    """Entrada de mídia em três estados: o booleano declarado vale; senão a lista input_modalities, quando existe, diz
+    sim ou não; sem nenhum dos dois, desconhecido."""
+    if type(declared) is bool:
+        return declared
+    return kind in inputs if isinstance(inputs, list) else None
+
+
+def _price_text(value: object) -> float | None:
+    """US$ por token que o OpenRouter publica como texto; fora de [0, 1) (o -1 de preço variável) ou ilegível = desconhecido."""
+    try:
+        return price(float(value)) if isinstance(value, str) else None
+    except ValueError:
+        return None
+
+
 def router_records(entries: list, extra: str = "") -> tuple[list[ModelInfo], bool]:
     """Lista /v1/models com os metadados que cada roteador publica: max_input_tokens/max_output_tokens (Anthropic,
     OmniRoute), context_length/top_provider/supported_parameters (OpenRouter), capabilities (9router, OmniRoute),
@@ -185,6 +201,8 @@ def router_records(entries: list, extra: str = "") -> tuple[list[ModelInfo], boo
             tools = "tools" in entry["supported_parameters"]
         outputs = architecture.get("output_modalities")
         mode = "other" if isinstance(outputs, list) and "text" not in outputs else None
+        inputs = architecture.get("input_modalities")
+        pricing = entry.get("pricing") if isinstance(entry.get("pricing"), dict) else {}
         identifier = base_model(entry["id"])
         records[identifier] = ModelInfo(
             identifier, mode,
@@ -194,6 +212,13 @@ def router_records(entries: list, extra: str = "") -> tuple[list[ModelInfo], boo
             _first(entry.get("max_output_tokens"), entry.get("max_tokens"), entry.get("max_completion_tokens"),
                    top.get("max_completion_tokens"), capabilities.get("maxOutput"), limits.get("output")),
             tools,
+            input_cost_per_token=_price_text(pricing.get("prompt")),
+            output_cost_per_token=_price_text(pricing.get("completion")),
+            cache_read_input_token_cost=_price_text(pricing.get("input_cache_read")),
+            cache_creation_input_token_cost=_price_text(pricing.get("input_cache_write")),
+            vision=_accepts(inputs, "image", capabilities.get("vision")),
+            audio_input=_accepts(inputs, "audio"),
+            video_input=_accepts(inputs, "video"),
         )
     for record in plain_records([], extra):
         records.setdefault(record.id, record)

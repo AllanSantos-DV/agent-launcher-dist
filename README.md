@@ -6,7 +6,16 @@ Abre **Claude Code**, **Codex** e **GitHub Copilot CLI** nos seus projetos, e co
 **OpenAI**, ou qualquer host compatível com Anthropic Messages, OpenAI Responses ou Chat Completions.
 
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
-saída máxima, ferramentas) e configura cada sessão só com o que foi confirmado. Nada de catálogo fixo no código.
+saída máxima, ferramentas, entrada de imagem, áudio e vídeo) e configura cada sessão só com o que foi confirmado. Nada
+de catálogo fixo no código. A lista mostra, para cada modelo, se ele aceita imagem (Visão), áudio e vídeo: ícone quando
+o host diz que aceita, ícone riscado quando diz que não e traço quando o conector não informou.
+O filtro "Entrada" lista só os modelos com visão, áudio ou vídeo; o modelo escolhido que o host diz não aceitar imagem
+ganha um aviso; **Copiar lista** copia a lista filtrada, separada por tabulação. O que o host informa sobre imagem também
+vai para o chat do VS Code (anexar imagem) e para o Codex (modelo declarado só de texto não recebe imagem); `launcher models`
+mostra visão, áudio e vídeo só do que o host informou.
+A lista também traz a saída máxima e, na dica e na cópia, o preço por 1M de tokens (traço quando o host não informa). A lista de
+conversas para retomar mostra o contexto e o custo estimado de cada conversa (Claude Code e Codex) e o launcher avisa ao
+retomar uma conversa que já enche a janela do modelo escolhido.
 
 Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). Para Windows 10/11.
 
@@ -173,7 +182,7 @@ Conexão usada pelo VS Code ou pelo Copilot app mostra o endpoint local dela: po
 
 | Conector | Claude Code | Codex | Modelos | Contexto |
 | --- | --- | --- | --- | --- |
-| LiteLLM / host próprio | `{endereço}` | `{endereço}/v1` | só `claude-*` / só `gpt-*`, `o*` (ou qualquer um, opcional) | `/v1/model/info`; sem ele, `mode`, `max_input_tokens` e `max_output_tokens` do `/v1/models` |
+| LiteLLM / host próprio | `{endereço}` | `{endereço}/v1` | só `claude-*` / só `gpt-*`, `o*` (ou qualquer um, opcional) | `/v1/model/info` ou `/model/info`; sem elas, `mode`, `max_input_tokens` e `max_output_tokens` do `/v1/models` |
 | 9router | `{endereço}` | `{endereço}/v1` | qualquer modelo nos dois | `capabilities` |
 | OmniRoute | `{endereço}` | `{endereço}/v1` | qualquer modelo nos dois | `context_length`, `max_input_tokens` |
 | OpenRouter | `https://openrouter.ai/api` | `https://openrouter.ai/api/v1` | qualquer modelo com ferramentas | `context_length` |
@@ -189,6 +198,11 @@ Os conectores, exceto o LiteLLM, leem de cada item do `/v1/models` o primeiro va
 | Entrada (contexto) | `max_input_tokens`, `context_length`, `top_provider.context_length`, `capabilities.contextWindow`, `context_window`, `limits.input`, `max_model_len` |
 | Saída | `max_output_tokens`, `max_tokens`, `max_completion_tokens`, `top_provider.max_completion_tokens`, `capabilities.maxOutput`, `limits.output` |
 | Ferramentas | `capabilities.tools`, `capabilities.tool_calling`, `tools` em `supported_parameters` |
+| Visão | `capabilities.vision`; `image` em `architecture.input_modalities` |
+| Áudio, vídeo | `audio`, `video` em `architecture.input_modalities` |
+
+Com `architecture.input_modalities` presente, o que não está na lista conta como "não aceita"; sem ela, "não informado".
+O LiteLLM lê `supports_vision`, `supports_audio_input` e `supports_video_input` do `model_info`.
 
 Conexões que levam o Claude Code a hosts de terceiros (LiteLLM, 9router, OmniRoute, OpenRouter, compatíveis com
 Anthropic) têm a opção **Tool search de MCP no Claude Code**: fora da Anthropic o Claude Code carrega todas as

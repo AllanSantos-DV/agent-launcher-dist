@@ -165,6 +165,17 @@ def trust_claude_folder(path: Path, config: Path | None = None, attempts: int = 
     raise LauncherError(f"{config} mudou durante todas as {attempts} tentativas; confiança da pasta não gravada.")
 
 
+CLAUDE_DEFAULT_OUTPUT = 32_000  # padrão do Claude Code para ID que ele não reconhece
+
+
+def host_output_limit(record, verified: bool) -> int | None:
+    """Saída máxima que o host declara para um modelo que o Claude Code não reconhece, limitada ao padrão dele (o host
+    com saída menor recusaria o pedido); None quando o host não informou ou o modelo é da família Claude."""
+    if not verified or record.family or not record.max_output_tokens:
+        return None
+    return min(record.max_output_tokens, CLAUDE_DEFAULT_OUTPUT)
+
+
 class ClaudeCode(Harness):
     ID = "claude"
     LABEL = "Claude Code"
@@ -266,6 +277,9 @@ class ClaudeCode(Harness):
             overrides["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"] = "1"
         if context_window and not selected.family:
             overrides["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(context_window)
+        output_limit = host_output_limit(selected, catalog.verified)
+        if output_limit:
+            overrides["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(output_limit)
         if gateway.options.get("tool_search") is True:
             # Fora da Anthropic o Claude Code carrega todo MCP de uma vez; a conexão declara que o host aceita
             # tool_reference, então as ferramentas passam a carregar sob demanda.

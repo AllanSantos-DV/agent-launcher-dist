@@ -1,7 +1,7 @@
 """Endpoint local de UMA conexão: escuta só em 127.0.0.1 e repassa ao host da conexão.
 
 - Rotas: /v1/messages, /v1/responses, /v1/chat/completions (e /v1/messages/count_tokens), cada uma só se a conexão
-  serve o protocolo; /v1/models devolve o catálogo do launcher (só modelos com ferramentas); /health; /shutdown.
+  serve o protocolo; /v1/models devolve o catálogo do launcher (só modelos com ferramentas, com limites, capacidades e preço); /health; /shutdown.
 - Autenticação: a da conexão (chave da DPAPI como Bearer ou x-api-key; nada quando o host já injeta). Qualquer
   credencial que venha do destino (Authorization, x-api-key, api-key) é descartada.
 - Streaming (SSE) repassado sem buffer; sem seguir redirecionamento; proxy do sistema só para host público.
@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from agent_launcher.connectors._http import is_local_host
+from agent_launcher.domain.catalog import PRICES, ModelInfo
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import append_capped
 
@@ -152,6 +153,15 @@ def destination_of(user_agent: str) -> str:
     if "copilot" in agent or "electron" in agent:
         return "copilot_app"
     return "endpoint"
+
+
+def model_entry(record: ModelInfo, owner: str) -> dict:
+    """Item de /v1/models: limites, capacidades e preço por token (US$) como o catálogo os conhece; null = o host não informou."""
+    return {"id": record.id, "object": "model", "owned_by": owner, "max_input_tokens": record.max_input_tokens,
+            "max_output_tokens": record.max_output_tokens,
+            "capabilities": {"vision": record.vision, "audio_input": record.audio_input,
+                             "video_input": record.video_input, "tools": record.tools},
+            "pricing": {name: getattr(record, name) for name in PRICES}}
 
 
 class Upstream:
@@ -295,8 +305,7 @@ class Handler(BaseHTTPRequestHandler):
                 catalog = gateway.catalog()
         except LauncherError as error:
             return self.error(502, str(error))
-        data = [{"id": record.id, "object": "model", "owned_by": record.provider or gateway.name,
-                 "max_input_tokens": record.max_input_tokens, "max_output_tokens": record.max_output_tokens}
+        data = [model_entry(record, record.provider or gateway.name)
                 for record in catalog.records if record.chat and record.tools is not False]
         self.reply_json(200, {"object": "list", "data": data})
 

@@ -33,6 +33,8 @@ def positive_integer(value: object) -> int | None:
     return None
 
 
+MEDIA_INPUTS = ("vision", "audio_input", "video_input")
+
 PRICES = ("input_cost_per_token", "output_cost_per_token", "cache_read_input_token_cost",
           "cache_creation_input_token_cost")
 
@@ -42,6 +44,15 @@ def price(value: object) -> float | None:
     if type(value) in (int, float) and 0 <= value < 1:
         return float(value)
     return None
+
+
+def price_label(record: ModelInfo) -> str | None:
+    """Preço por 1M de tokens (US$) como "entrada/saída"; só o que o host informou, nunca zero no lugar de desconhecido."""
+    if record.input_cost_per_token is None and record.output_cost_per_token is None:
+        return None
+    per_million = [("?" if value is None else f"{value * 1_000_000:g}") for value in
+                   (record.input_cost_per_token, record.output_cost_per_token)]
+    return "/".join(per_million)
 
 
 def token_label(value: int | None) -> str:
@@ -67,6 +78,10 @@ class ModelInfo:
     output_cost_per_token: float | None = None
     cache_read_input_token_cost: float | None = None
     cache_creation_input_token_cost: float | None = None
+    # Entradas além de texto: True o host disse que aceita, False disse que não, None não informou.
+    vision: bool | None = None
+    audio_input: bool | None = None
+    video_input: bool | None = None
 
     @classmethod
     def from_cache(cls, value: dict) -> ModelInfo:
@@ -83,6 +98,7 @@ class ModelInfo:
             tools=value.get("tools") if type(value.get("tools")) is bool else None,
             responses=value.get("responses") if type(value.get("responses")) is bool else None,
             **{key: price(value.get(key)) for key in PRICES},
+            **{key: value.get(key) if type(value.get(key)) is bool else None for key in MEDIA_INPUTS},
         )
 
     @property
@@ -176,6 +192,8 @@ def merge_records(available: list, metadata: list) -> list[ModelInfo]:
             identifier, mode, minimum(rows, "max_input_tokens"), minimum(rows, "max_output_tokens"),
             capability(rows, "supports_function_calling"), responses,
             *(cost(rows, key) for key in PRICES),
+            vision=capability(rows, "supports_vision"), audio_input=capability(rows, "supports_audio_input"),
+            video_input=capability(rows, "supports_video_input"),
         ))
     return records
 
@@ -238,6 +256,11 @@ class Catalog:
         label = f"entrada {token_label(record.max_input_tokens)}"
         if not self.verified:
             label += " • não confirmada"
+        if record.max_output_tokens:
+            label += f" • saída {token_label(record.max_output_tokens)}"
+        if price_label(record):
+            label += f" • US$ {price_label(record)} por 1M"
+        label += "".join(f" • {title} {'sim' if state else 'não'}" for title, state in media_states(record) if state is not None)
         if record.family:
             label = f"{record.family.title()} • {label}"
         return f"{record.id} [{label}]"
@@ -252,6 +275,11 @@ class Catalog:
             if candidates:
                 mapping[family] = max(candidates, key=lambda record: (record.provider == selected.provider, record.version))
         return mapping
+
+
+def media_states(record: ModelInfo) -> tuple[tuple[str, bool | None], ...]:
+    """Visão, áudio e vídeo do modelo, na ordem em que a lista os mostra."""
+    return (("visão", record.vision), ("áudio", record.audio_input), ("vídeo", record.video_input))
 
 
 def codex_context(record: ModelInfo, verified: bool) -> tuple[int | None, int | None]:
