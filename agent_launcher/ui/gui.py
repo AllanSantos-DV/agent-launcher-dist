@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -26,6 +27,7 @@ from agent_launcher.harnesses import installers as clis
 from agent_launcher.harnesses import registry, vscode
 from agent_launcher.platform import keys, terminal
 from agent_launcher.session.conversations import conversations_for, has_conversation_for
+from agent_launcher.session.preview import plan_report, plan_text, planned
 from agent_launcher.session.window import session_title, start_session
 from agent_launcher.ui import placement
 from agent_launcher.ui.background import deliver
@@ -153,40 +155,114 @@ class ProjectDialog(QDialog):
             self.path.setText(str(Path(folder)))
 
 
-class DiagnosticsDialog(QDialog):
-    """O diagnóstico como texto selecionável, com o botão que o copia inteiro (como o Copiar erro da faixa de avisos)."""
+class TextDialog(QDialog):
+    """Texto selecionável só para leitura, com o botão que o copia inteiro (como o Copiar erro da faixa de avisos)."""
 
-    def __init__(self, text: str, parent=None, on_copy=None):
+    def __init__(self, title: str, text: str, copy_label: str, copied_message: str, parent=None, on_copy=None):
         super().__init__(parent)
-        self.setWindowTitle("Diagnóstico")
+        self.setWindowTitle(title)
         self.resize(640, 520)
+        self.copied_message = copied_message
         layout = QVBoxLayout(self)
         self.box = QPlainTextEdit(text)
         self.box.setReadOnly(True)
-        self.box.setAccessibleName("Diagnóstico")
+        self.box.setAccessibleName(title)
         # cores explícitas: sem elas o texto segue a paleta do Windows (fundo escuro com a tinta escura do app)
         self.box.setStyleSheet("QPlainTextEdit { background: #ffffff; color: #233e32; border: 1px solid #d5ded1; "
                                "border-radius: 8px; padding: 6px; selection-background-color: #d5e6cf; }")
         layout.addWidget(self.box, 1)
-        actions = QHBoxLayout()
-        self.copy_button = QPushButton("Copiar diagnóstico")
+        self.actions = QHBoxLayout()
+        self.copy_button = QPushButton(copy_label)
         self.copy_button.clicked.connect(lambda: self.copy(on_copy))
-        actions.addWidget(self.copy_button)
+        self.actions.addWidget(self.copy_button)
         self.copied = QLabel("")
         self.copied.setObjectName("muted")
-        actions.addWidget(self.copied)
-        actions.addStretch()
+        self.actions.addWidget(self.copied)
+        self.actions.addStretch()
         close = QPushButton("Fechar")
         close.setObjectName("primary")
         close.clicked.connect(self.accept)
-        actions.addWidget(close)
-        layout.addLayout(actions)
+        self.actions.addWidget(close)
+        layout.addLayout(self.actions)
 
     def copy(self, on_copy=None) -> None:
         QApplication.clipboard().setText(self.box.toPlainText())
-        self.copied.setText("Diagnóstico copiado.")
+        self.copied.setText(self.copied_message)
         if on_copy:
             on_copy()
+
+
+class DiagnosticsDialog(TextDialog):
+    """O diagnóstico como texto selecionável, com o botão que o copia inteiro."""
+
+    def __init__(self, text: str, parent=None, on_copy=None):
+        super().__init__("Diagnóstico", text, "Copiar diagnóstico", "Diagnóstico copiado.", parent, on_copy)
+
+
+class PlanDialog(TextDialog):
+    """O que a próxima abertura vai iniciar (comando, conexão, modelo, ambiente e avisos), só para leitura."""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__("O que vai abrir", text, "Copiar resumo", "Resumo copiado.", parent)
+
+
+class ScreenTask(QRunnable):
+    """Lê a tela do console de uma sessão aberta fora da thread da interface (o auxiliar pode levar alguns segundos)."""
+
+    def __init__(self, pid: int):
+        super().__init__()
+        self.pid = pid
+        self.signals = RefreshSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            deliver(self.signals, "completed", keys.read_screen(self.pid), "")
+        except Exception as error:  # volta para a tela como erro, nunca derruba a thread
+            deliver(self.signals, "completed", error, "")
+
+
+class SessionScreenDialog(TextDialog):
+    """O que uma sessão aberta exibe agora, só para leitura: nada é digitado nela e a janela dela não vem para a frente."""
+
+    def __init__(self, sessions: list[dict], parent=None):
+        super().__init__("Tela da sessão", "", "Copiar tela", "Tela copiada.", parent)
+        self.choice = ReadableCombo()
+        self.choice.setAccessibleName("Sessão aberta")
+        for session in sessions:
+            self.choice.addItem(f"{label_of(session.get('cli', ''))} — {session.get('title') or session.get('project', '')}",
+                                int(session["pid"]))
+        self.layout().insertWidget(0, self.choice)
+        self.error = label("", "notice")
+        self.error.setWordWrap(True)
+        self.error.hide()
+        self.layout().insertWidget(1, self.error)
+        self.refresh_button = QPushButton("Atualizar")
+        self.refresh_button.clicked.connect(self.refresh)
+        self.actions.insertWidget(1, self.refresh_button)
+        self.choice.currentIndexChanged.connect(self.refresh)
+        self.task = None
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Lê a tela da sessão escolhida; a leitura de uma escolha anterior que chega depois é descartada."""
+        pid = self.choice.currentData()
+        if pid is None:
+            return
+        self.error.hide()
+        self.copied.setText("Lendo a tela…")
+        task = self.task = ScreenTask(pid)
+        task.signals.completed.connect(lambda result, text="": task is self.task and self.show_screen(result))
+        QThreadPool.globalInstance().start(task)
+
+    def show_screen(self, result) -> None:
+        self.copied.setText("")
+        if isinstance(result, Exception):
+            self.error.setText(f"Não foi possível ler a tela da sessão: {result}")
+            self.error.show()
+            return
+        self.box.setPlainText(result)
+        self.box.verticalScrollBar().setValue(self.box.verticalScrollBar().maximum())
 
 
 def conversation_usage_cells(result, record, verified: bool) -> tuple[str, str]:
@@ -201,8 +277,17 @@ def conversation_usage_cells(result, record, verified: bool) -> tuple[str, str]:
     return context, cost
 
 
+CONVERSATIONS_HEADER = ("Data", "CLI", "Título", "Mensagens", "Contexto", "Custo (est.)")
+
+
+def conversations_text(rows: list[list[str]]) -> str:
+    """A lista de conversas separada por tabulação: colada numa planilha, cada valor cai na sua coluna."""
+    return "\n".join("\t".join(row) for row in [list(CONVERSATIONS_HEADER), *rows])
+
+
 class ConversationsDialog(QDialog):
-    """Conversas do CLI nesta pasta (as deste perfil, se a pasta é compartilhada): duplo clique ou Retomar."""
+    """Conversas do CLI nesta pasta (as deste perfil, se a pasta é compartilhada): filtro por texto, cópia da lista
+    como está filtrada, duplo clique ou Retomar."""
 
     def __init__(self, conversations: list, parent=None, cli_label: str = "", usages: dict | None = None,
                  record=None, verified: bool = False):
@@ -214,9 +299,15 @@ class ConversationsDialog(QDialog):
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(12)
         layout.addWidget(label("Escolha a conversa a retomar (mais recente primeiro).", "muted"))
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("Filtrar por título, data ou CLI")
+        self.filter.setClearButtonEnabled(True)
+        self.filter.setAccessibleName("Filtrar conversas")
+        self.filter.textChanged.connect(self.apply_filter)
+        layout.addWidget(self.filter)
         usages = usages or {}
-        self.table = QTableWidget(len(conversations), 6)
-        self.table.setHorizontalHeaderLabels(["Data", "CLI", "Título", "Mensagens", "Contexto", "Custo (est.)"])
+        self.table = QTableWidget(len(conversations), len(CONVERSATIONS_HEADER))
+        self.table.setHorizontalHeaderLabels(list(CONVERSATIONS_HEADER))
         self.table.setAccessibleName("Conversas")
         self.table.verticalHeader().hide()
         self.table.setAlternatingRowColors(True)
@@ -255,6 +346,14 @@ class ConversationsDialog(QDialog):
         self.table.cellDoubleClicked.connect(lambda *_args: self.accept())
         layout.addWidget(self.table, 1)
         actions = QHBoxLayout()
+        self.copy_button = QPushButton("Copiar lista")
+        self.copy_button.setToolTip("Copia a lista como está filtrada, separada por tabulação, para colar numa planilha")
+        self.copy_button.setEnabled(bool(conversations))
+        self.copy_button.clicked.connect(self.copy)
+        actions.addWidget(self.copy_button)
+        self.copied = QLabel("")
+        self.copied.setObjectName("muted")
+        actions.addWidget(self.copied)
         actions.addStretch()
         cancel = QPushButton("Cancelar")
         cancel.clicked.connect(self.reject)
@@ -266,6 +365,32 @@ class ConversationsDialog(QDialog):
         self.resume.clicked.connect(self.accept)
         actions.addWidget(self.resume)
         layout.addLayout(actions)
+
+    def visible_rows(self) -> list[int]:
+        return [row for row in range(self.table.rowCount()) if not self.table.isRowHidden(row)]
+
+    def apply_filter(self, text: str) -> None:
+        """Esconde as conversas sem o texto na data, no CLI ou no título; a seleção vai para uma que continua à vista."""
+        query = text.strip().casefold()
+        for row in range(self.table.rowCount()):
+            haystack = " ".join(self.table.item(row, column).text() for column in range(3)).casefold()
+            self.table.setRowHidden(row, query not in haystack)
+        shown = self.visible_rows()
+        selected = self.table.selectionModel().selectedRows()
+        if not shown:
+            self.table.clearSelection()
+        elif not selected or self.table.isRowHidden(selected[0].row()):
+            self.table.selectRow(shown[0])
+        self.resume.setEnabled(bool(shown))
+        self.copy_button.setEnabled(bool(shown))
+        self.copied.setText("")
+
+    def copy(self) -> None:
+        rows = [[self.table.item(row, column).text() for column in range(self.table.columnCount())]
+                for row in self.visible_rows()]
+        QApplication.clipboard().setText(conversations_text(rows))
+        self.copied.setText(f"{plural(len(rows), 'conversa copiada', 'conversas copiadas')}: cole numa planilha, "
+                            "cada valor vai para a sua coluna.")
 
     def selected(self) -> str | None:
         rows = self.table.selectionModel().selectedRows()
@@ -423,16 +548,16 @@ class CleanupTask(QRunnable):
 class UsageTask(QRunnable):
     """Uso do mês do perfil (domain/usage.py) fora da thread da interface: pode ler muitos arquivos de conversa."""
 
-    def __init__(self, home: Path, month: str | None = None):
+    def __init__(self, home: Path, month: str | None = None, everyone: bool = False):
         super().__init__()
-        self.home, self.month = home, month
+        self.home, self.month, self.everyone = home, month, everyone
         self.signals = RefreshSignals()
 
     @Slot()
     def run(self):
         try:
-            from agent_launcher.domain.usage import usage_report
-            deliver(self.signals, "completed", usage_report(self.home, self.month), "")
+            report = usage.usage_report_all if self.everyone else usage.usage_report
+            deliver(self.signals, "completed", report(self.home, self.month), "")
         except Exception as error:  # volta para a tela como erro, nunca derruba a thread
             deliver(self.signals, "completed", error, "")
 
@@ -473,7 +598,8 @@ USAGE_HEADER = ("Destino", "Modelo", "Entrada", "Saída", "Custo")
 
 def usage_text(report: dict) -> str:
     """O relatório de uso separado por tabulação: colado numa planilha, cada valor cai na sua coluna."""
-    lines = [f"Mês {report['month']}", "\t".join(USAGE_HEADER)]
+    scope = " (todos os perfis)" if report.get("profile") == "todos" else ""
+    lines = [f"Mês {report['month']}{scope}", "\t".join(USAGE_HEADER)]
     lines += ["\t".join(row) for row in usage_rows(report)]
     return "\n".join(lines)
 
@@ -510,6 +636,11 @@ class UsageDialog(QDialog):
             self.month_choice.addItem(month, month)
         self.month_label.setBuddy(self.month_choice)
         choice.addWidget(self.month_choice)
+        self.everyone_check = QCheckBox("Somar todos os perfis")
+        self.everyone_check.setToolTip("Soma o uso de todos os perfis numa tabela só; a tabela de um perfil mostra só o dele")
+        self.everyone_check.setVisible(len(profiles.list_profiles(profiles.base_of(home))) > 1)
+        self.everyone_check.toggled.connect(self.calculate)
+        choice.addWidget(self.everyone_check)
         self.status = QLabel("Calculando…")
         choice.addWidget(self.status, 1)
         layout.addLayout(choice)
@@ -529,9 +660,9 @@ class UsageDialog(QDialog):
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table, 1)
-        note = QLabel(self.NOTE)
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        self.note = QLabel(self.NOTE)
+        self.note.setWordWrap(True)
+        layout.addWidget(self.note)
         actions = QHBoxLayout()
         self.copy_button = QPushButton("Copiar relatório")
         self.copy_button.setEnabled(False)
@@ -556,7 +687,7 @@ class UsageDialog(QDialog):
         self.report = None
         self.copy_button.setEnabled(False)
         self.table.setRowCount(0)
-        task = self.task = UsageTask(self.home, self.month_choice.currentData())
+        task = self.task = UsageTask(self.home, self.month_choice.currentData(), self.everyone_check.isChecked())
         task.signals.completed.connect(lambda report, text="": task is self.task and self.show_report(report, text))
         QThreadPool.globalInstance().start(task)
 
@@ -568,6 +699,7 @@ class UsageDialog(QDialog):
             return
         self.error.hide()
         rows = usage_rows(report)
+        self.note.setText(self.NOTE.replace("deste perfil", "de cada perfil") if report.get("profile") == "todos" else self.NOTE)
         self.report = report if rows else None
         self.copy_button.setEnabled(self.report is not None)
         self.status.setText("" if rows else f"Nenhum uso encontrado em {report['month']}.")
@@ -642,7 +774,9 @@ class LauncherWindow(QMainWindow):
         QApplication.instance().applicationStateChanged.connect(self.recheck_tools)
         self.shortcuts = []
         for sequence, callback in (("Ctrl+K", self.project_search.setFocus), ("Ctrl+F", self.model_search.setFocus),
-                                   ("Ctrl+N", self.add_project), ("F5", lambda: self.refresh_catalog(True))):
+                                   ("Ctrl+N", self.add_project), ("F5", lambda: self.refresh_catalog(True)),
+                                   ("Ctrl+R", self.resume_by_shortcut), ("Ctrl+H", lambda: self.choose_conversation()),
+                                   ("Ctrl+U", lambda: self.show_usage())):
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.activated.connect(callback)
             self.shortcuts.append(shortcut)
@@ -1023,6 +1157,14 @@ class LauncherWindow(QMainWindow):
         self.install_cli_button.hide()
         buttons.addWidget(self.install_cli_button)
         self.installing_cli = False
+        self.plan_button = QToolButton()
+        self.plan_button.setIcon(icon("vision"))
+        self.plan_button.setMinimumHeight(44)
+        self.plan_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.plan_button.setAccessibleName("Ver o que vai abrir")
+        self.plan_button.setToolTip("Ver o que a nova sessão vai iniciar: comando, conexão, modelo, ambiente e avisos")
+        self.plan_button.clicked.connect(self.show_session_plan)
+        buttons.addWidget(self.plan_button)
         self.resume_button = button("Retomar última", "resume")
         self.resume_button.setMinimumHeight(44)
         self.resume_button.clicked.connect(lambda: self.launch_session(True))
@@ -1587,6 +1729,7 @@ class LauncherWindow(QMainWindow):
         enabled = bool(self.project and self.gateway and self.selected_model and self.online and not self.refreshing
                        and not missing)
         self.launch_button.setEnabled(enabled)
+        self.plan_button.setEnabled(enabled)
         self.launch_button.setText("&Nova sessão" if harness.KIND == "terminal" else f"Abrir no {harness.LABEL}")
         resumable = enabled and "resume" in harness.CAPABILITIES and self.has_previous_conversation()
         self.resume_button.setVisible("resume" in harness.CAPABILITIES)
@@ -1621,6 +1764,32 @@ class LauncherWindow(QMainWindow):
         except (LauncherError, OSError, ValueError):
             return False
 
+    def session_report(self) -> dict:
+        """O que a nova sessão vai iniciar, do plano que a própria abertura usa; fora do terminal, a prévia do destino."""
+        if not (self.project and self.gateway and self.selected_model and self.catalog):
+            raise LauncherError("Escolha projeto, conexão e modelo para ver o que vai abrir.")
+        harness = registry.get(self.cli)
+        if harness.KIND != "terminal":
+            return harness.preview(self.store, self.project, self.gateway, self.selected_model.id, self.catalog)
+        plan = planned(self.store.home, self.gateway, self.project["path"], self.cli, self.selected_model.id, False,
+                       self.catalog)
+        return plan_report(plan, self.gateway, False, self.catalog)
+
+    def show_session_plan(self) -> None:
+        """Mostra, só para leitura, o que a nova sessão vai iniciar; nada abre e nada é gravado."""
+        try:
+            report = self.session_report()
+        except (LauncherError, OSError, ValueError) as error:
+            self.show_error(str(error))
+            return
+        PlanDialog(plan_text(report) if "command" in report else json.dumps(report, ensure_ascii=False, indent=2),
+                   self).exec()
+
+    def resume_by_shortcut(self) -> None:
+        """Ctrl+R faz o que o botão Retomar última faz, só quando o botão está à vista e habilitado."""
+        if self.resume_button.isEnabled() and not self.resume_button.isHidden():
+            self.launch_session(True)
+
     def build_conversation_menu(self, actions):
         """Seta ao lado de 'Retomar última' com 'Escolher conversa…' (lista as conversas do CLI nesta pasta)."""
         self.conversation_button = QToolButton()
@@ -1631,7 +1800,7 @@ class LauncherWindow(QMainWindow):
         self.conversation_button.setToolTip("Escolher qual conversa retomar")
         self.conversation_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QMenu(self.conversation_button)
-        menu.addAction("Escolher conversa…", self.choose_conversation)
+        menu.addAction("Escolher conversa…\tCtrl+H", self.choose_conversation)
         self.conversation_button.setMenu(menu)
         actions.addWidget(self.conversation_button)
 
@@ -1983,8 +2152,18 @@ class LauncherWindow(QMainWindow):
         menu.addAction("Abrir pasta" if context else "Abrir pasta do projeto", self.open_project)
         if context and (code := vscode.find_code()):
             menu.addAction("Abrir no VS Code", lambda: self.open_in_vscode(code))
+        if context and self.project and (open_sessions := self.open_sessions_of(self.project["id"])):
+            menu.addAction("Ver a tela da sessão aberta…", lambda: self.show_session_screen(open_sessions))
         menu.addAction("Editar…" if context else "Editar projeto…", self.edit_project)
         menu.add_danger_action("Remover do launcher…", self.remove_project)
+
+    @staticmethod
+    def open_sessions_of(project_id: str) -> list[dict]:
+        return [session for session in keys.sessions() if session.get("project_id") == project_id]
+
+    def show_session_screen(self, open_sessions: list[dict]) -> None:
+        """Mostra, só para leitura, o que a sessão aberta exibe agora; a janela dela fica onde está."""
+        SessionScreenDialog(open_sessions, self).exec()
 
     def edit_project(self):
         if not self.project:

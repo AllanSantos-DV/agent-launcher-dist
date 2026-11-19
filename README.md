@@ -161,7 +161,8 @@ cada perfil ficam num arquivo próprio. Quem não cria perfil continua no **Padr
 - **Importar perfil…** (ou duplo clique num arquivo `.alprofile`) cria o perfil pronto, com conexões e conectores;
   **Exportar perfil…** gera esse arquivo. O arquivo nunca leva chave: se a conexão pede uma, o launcher pergunta.
 - **Remover perfil** (ou conexão) oferece tirar também o provider do Copilot app e do VS Code e parar o endpoint local.
-- **Uso do mês…**: tokens e custo estimado por destino e modelo, lidos das conversas e do endpoint deste perfil.
+- **Uso do mês…**: tokens e custo estimado por destino e modelo, lidos das conversas e do endpoint deste perfil. Com mais de
+  um perfil, **Somar todos os perfis** junta o uso de todos numa tabela só.
   É estimativa local; o custo usa o preço que o host informa no catálogo. **Copiar relatório** copia a tabela com os
   valores separados por tabulação: colada numa planilha, cada valor cai na sua coluna.
 - A aba do Terminal usa a cor do perfil (**Cor do perfil…**, também no Padrão). Sem cor escolhida, o Padrão fica com
@@ -241,15 +242,19 @@ as conversas abertas pelo launcher: as da conta do usuário no próprio Codex (o
 também não as mistura com as do launcher. A última conversa do Codex é retomada pelo id, sempre a da pasta do projeto;
 se ela estiver aberta em outra janela ou programa, a sessão não abre e o aviso diz onde ela está (uma sessão que já
 fechou e deixou o Codex preso é liberada sozinha). A seta ao lado abre **Escolher conversa…**: a lista das
-conversas do projeto (data, título, mensagens) para retomar qualquer uma, não só a última. Em modo texto:
+conversas do projeto (data, título, mensagens, contexto e custo estimado) para retomar qualquer uma, não só a última; o campo
+acima da lista filtra por título, data ou CLI e **Copiar lista** copia as linhas à vista, separadas por tabulação. Em modo texto:
 `launcher conversations --project X` e `launch --resume --conversation ID`. Sem conversa anterior (inclusive numa sessão aberta pelo orquestrador), a retomada vira
 sessão nova, com um aviso na janela, em vez de parar em "No conversation found to continue". Com o Windows Terminal instalado, cada sessão vira
 uma aba da janela **agent-launcher** (laranja para Claude Code, verde para Codex), com o título
 **Projeto — Claude Code/Codex**; sem ele, cada sessão abre num console próprio. A sessão confere a conexão antes de iniciar. Fechar o launcher não encerra as
 sessões. A lista de projetos fica do mais recente para o mais antigo e se reordena a cada abertura; projeto com sessão
 aberta agora (por esta ou por outra janela do launcher) aparece com "· aberta" ou "· 2 abertas", e a dica diz quais CLIs.
-O botão direito em um projeto abre a pasta, abre no VS Code (só com o VS Code instalado, no seu perfil normal), edita
-(nome e pasta) ou remove o cadastro. `Ctrl+K` busca projetos, `Ctrl+F` modelos, `Ctrl+N` adiciona projeto e `F5` atualiza o catálogo.
+O botão direito em um projeto abre a pasta, abre no VS Code (só com o VS Code instalado, no seu perfil normal), mostra
+**a tela da sessão aberta** (só leitura: nada é digitado nela e a janela dela não vem para a frente), edita (nome e pasta)
+ou remove o cadastro. O botão do olho ao lado de **Retomar última** mostra, antes de abrir, o que a nova sessão vai iniciar
+(comando, conexão, modelo, ambiente e avisos, sem a chave). `Ctrl+K` busca projetos, `Ctrl+F` modelos, `Ctrl+N` adiciona
+projeto, `F5` atualiza o catálogo, `Ctrl+R` retoma a última conversa, `Ctrl+H` escolhe a conversa e `Ctrl+U` abre o uso do mês.
 
 Cada sessão recebe a configuração só no próprio processo; `~/.claude/settings.json` e `~/.codex/config.toml` não são
 alterados.

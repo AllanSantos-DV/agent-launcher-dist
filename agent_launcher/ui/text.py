@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agent_launcher import ROOT
 from agent_launcher.domain import profiles, usage
-from agent_launcher.domain.conversation_usage import conversation_usage, resume_window_warning
+from agent_launcher.domain.conversation_usage import conversation_usage
 from agent_launcher.domain.catalog import CLAUDE_FAMILIES, base_model, token_label
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.gateway import Gateway
@@ -21,7 +21,7 @@ from agent_launcher.harnesses.installers import CliInstallError
 from agent_launcher.harnesses import registry
 from agent_launcher.platform import elevated, focus, keys, terminal
 from agent_launcher.session.conversations import conversations_for, record_session
-from agent_launcher.session.plan import build_plan
+from agent_launcher.session.preview import plan_report, planned
 from agent_launcher.update import updater
 from version import APP_NAME, VERSION
 
@@ -316,25 +316,9 @@ def launch(store: Store, project: dict, gateway: Gateway, cli: str, model: str, 
         print(harness.open(store, project, gateway, model, catalog, confirm=confirm_in_console))
         store.remember(project, gateway.connection, cli, base_model(model))
         return 0
-    plan = build_plan(gateway, cli, project["path"], model, resume, catalog, controlled=controlled,
-                      conversation=conversation)
-    if resume:
-        warning = resume_window_warning(store.home, conversations_for(store.home, harness, plan.directory), conversation,
-                                        catalog.find(plan.model), catalog.verified)
-        if warning:
-            plan.warnings.append(warning)
+    plan = planned(store.home, gateway, project["path"], cli, model, resume, catalog, controlled, conversation)
     if dry_run:
-        controlled_commands = harness.dry_run_extra(plan) or None
-        hidden = {gateway.token} - {""}
-        command = ["<chave>" if part in hidden else part for part in plan.command]
-        print(json.dumps({"cli": cli, "project": str(plan.directory), "model": plan.model,
-                          "connection": gateway.name, "connector": gateway.module.NAME, "targets": gateway.targets,
-                          "resume": resume, "command": command,
-                          "controlled": plan.controlled, "controlled_codex": controlled_commands,
-                          "environment_overrides": plan.public_overrides, "catalog_status": catalog.status,
-                          "input_limit": plan.input_limit, "context_window": plan.context_window,
-                          "auto_compact_token_limit": plan.auto_compact_limit,
-                          "claude_families": plan.families, "warnings": plan.warnings}, ensure_ascii=False, indent=2))
+        print(json.dumps(plan_report(plan, gateway, resume, catalog), ensure_ascii=False, indent=2))
         return 0
     heading(f"{'RETOMAR' if resume else 'INICIAR'} / {cli.upper()}")
     print(f"  Projeto: {project['name']}\n  Pasta:   {plan.directory}\n  Modelo:  {plan.model}")

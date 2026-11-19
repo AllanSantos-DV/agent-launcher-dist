@@ -605,10 +605,38 @@ def usage_report(home: Path, month: str | None = None) -> dict:
         models.append({"destination": destination, "model": model, **dict(zip(FIELDS, values)),
                        "conversations": len(row["conversations"]), "requests": row["requests"],
                        "cost": price, "priced": price is not None})
+    return _summary(profile_id, month, models)
+
+
+def _summary(profile: str, month: str, models: list[dict]) -> dict:
+    """Totais por destino e geral a partir das linhas por destino e modelo."""
     destinations: dict = {}
     total = _empty()
     for row in models:
         _accumulate(destinations.setdefault(row["destination"], _empty()), row)
         _accumulate(total, row)
-    return {"profile": profile_id, "month": month, "note": NOTE, "currency": "USD", "destinations": destinations,
+    return {"profile": profile, "month": month, "note": NOTE, "currency": "USD", "destinations": destinations,
             "models": models, "total": total}
+
+
+def usage_report_all(home: Path, month: str | None = None) -> dict:
+    """Uso do mês de todos os perfis numa tabela só: a mesma linha de destino e modelo soma entre os perfis, e a que
+    algum perfil não consegue precificar fica sem custo."""
+    base = profiles.base_of(Path(home))
+    merged: dict[tuple, dict] = {}
+    month_label = month
+    for profile in profiles.list_profiles(base):
+        report = usage_report(profiles.home_of(profile["id"], base), month)
+        month_label = report["month"]
+        for row in report["models"]:
+            target = merged.setdefault((row["destination"], row["model"]), {
+                "destination": row["destination"], "model": row["model"], **{field: 0 for field in FIELDS},
+                "conversations": 0, "requests": 0, "cost": 0.0, "priced": True})
+            for field in (*FIELDS, "conversations", "requests"):
+                target[field] += row[field]
+            target["priced"] = target["priced"] and row["priced"]
+            target["cost"] = target["cost"] + row["cost"] if target["priced"] else None
+    models = sorted(merged.values(), key=lambda row: (DESTINATIONS.index(row["destination"])
+                                                      if row["destination"] in DESTINATIONS else 99,
+                                                      row["model"].casefold()))
+    return _summary("todos", month_label or month_bounds(month)[0], models)
