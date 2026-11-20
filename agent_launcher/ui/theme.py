@@ -2,12 +2,13 @@ import functools
 import json
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QByteArray, QEvent, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractButton, QApplication, QBoxLayout, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLayout, QMenu,
-    QListWidget, QPushButton, QSizePolicy, QStyledItemDelegate, QTableWidget, QVBoxLayout, QWidget,
+    QListWidget, QPushButton, QSizePolicy, QStyle, QStyledItemDelegate, QStyleOptionComboBox, QTableWidget, QVBoxLayout,
+    QWidget,
 )
 
 from agent_launcher.ui import palette
@@ -185,6 +186,8 @@ class CliButton(QAbstractButton):
     BAR = 8
     TEXT_LEFT = 58
     BAND_LEFT = 19
+    MISSING = "Não instalado · clique para instalar"
+    MISSING_SHORT = "Não instalado"
     action_requested = Signal()
 
     def __init__(self, title: str, subtitle: str, symbol: str, parent=None):
@@ -328,12 +331,16 @@ class CliButton(QAbstractButton):
         return font
 
     def _text(self, painter: QPainter, font: QFont, color: str, baseline: int, text: str, right: int,
-              left: int = TEXT_LEFT) -> None:
+              left: int = TEXT_LEFT, short: str = "") -> bool:
+        """Draws one line; `short` replaces a line that does not fit before it is elided. True if the line was cut."""
         painter.setFont(font)
         painter.setPen(QColor(tone(color, text=True)))
         room = max(0, right - left)
-        shown = painter.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, room)
+        metrics = painter.fontMetrics()
+        fitting = short if short and metrics.horizontalAdvance(text) > room else text
+        shown = metrics.elidedText(fitting, Qt.TextElideMode.ElideRight, room)
         painter.drawText(left, baseline, shown)
+        return shown != text
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -361,11 +368,16 @@ class CliButton(QAbstractButton):
                 icon(self.symbol, self.tone, 25).paint(painter, 19, top, 25, 25)
                 painter.restore()
         right = self.width() - (40 if active else 14)
-        self._text(painter, self.card_font(15, QFont.Weight.DemiBold), INK, 31, self.title, right)
-        self._text(painter, self.card_font(MIN_TEXT_PX), MUTED, 54, self.subtitle, self.width() - 14)
-        line = self.version if self.installed else "" if self.installing else "Não instalado · clique para instalar"
+        cut = self._text(painter, self.card_font(15, QFont.Weight.DemiBold), INK, 31, self.title, right)
+        cut |= self._text(painter, self.card_font(MIN_TEXT_PX), MUTED, 54, self.subtitle, self.width() - 14)
+        line = self.version if self.installed else "" if self.installing else self.MISSING
         if line:
-            self._text(painter, self.card_font(MIN_TEXT_PX), MUTED, 74, line, self.width() - 14)
+            cut |= self._text(painter, self.card_font(MIN_TEXT_PX), MUTED, 74, line, self.width() - 14,
+                              short="" if self.installed else self.MISSING_SHORT)
+        # O cartão estreito (grade de duas colunas) encurta o texto; a dica guarda o que ficou de fora.
+        tip = "\n".join(part for part in (self.title, self.subtitle, line) if part) if cut else ""
+        if self.toolTip() != tip:
+            self.setToolTip(tip)
         if self.has_band():
             self._paint_band(painter)
         if active:
@@ -464,6 +476,17 @@ class ReadableCombo(QComboBox):
         widest = max((metrics.horizontalAdvance(self.itemText(row)) for row in range(self.count())), default=0)
         view.setMinimumWidth(widest + 2 * CurrentMark.PADDING + self.itemDelegate().mark_width() + 8)
         super().showPopup()
+
+    def fit_to_items(self) -> None:
+        """Minimum width that shows the longest item whole: the stylesheet's min-width would otherwise let a crowded
+        row squeeze the combo until the chosen text is cut."""
+        self.ensurePolished()
+        metrics = QFontMetrics(self.font())
+        widest = max((metrics.horizontalAdvance(self.itemText(row)) for row in range(self.count())), default=0)
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        needed = self.style().sizeFromContents(QStyle.ContentsType.CT_ComboBox, option, QSize(widest, metrics.height()), self)
+        self.setMinimumWidth(needed.width())
 
 
 class DangerMenu(QMenu):
@@ -624,8 +647,16 @@ class FlowRow(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        direction = QBoxLayout.Direction.LeftToRight if self.fits(event.size().width()) \
-            else QBoxLayout.Direction.TopToBottom
+        self._choose(event.size().width())
+
+    def event(self, event):
+        # Uma parte que muda de texto ou aparece (o botão de instalar) muda a largura pedida sem redimensionar a linha.
+        if event.type() == QEvent.Type.LayoutRequest:
+            self._choose(self.width())
+        return super().event(event)
+
+    def _choose(self, width: int) -> None:
+        direction = QBoxLayout.Direction.LeftToRight if self.fits(width) else QBoxLayout.Direction.TopToBottom
         if self.box.direction() != direction:
             self.box.setDirection(direction)
 
