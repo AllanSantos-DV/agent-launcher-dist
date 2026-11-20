@@ -11,7 +11,7 @@ from pathlib import Path
 
 from agent_launcher.domain.catalog import CLAUDE_FAMILIES, Catalog, ModelInfo, base_model, token_label
 from agent_launcher.domain.errors import LauncherError
-from agent_launcher.domain.files import replace_retrying
+from agent_launcher.domain.files import read_text_retrying, replace_retrying
 from agent_launcher.harnesses import installers
 from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines, is_exe,
                                            key_mcp_urls, native_wrapper, node_script, parse_time, unrecognized)
@@ -113,7 +113,7 @@ def claude_config_file() -> Path:
 
 def _trusted(config: Path, keys: list[str]) -> bool:
     try:
-        projects = json.loads(config.read_text(encoding="utf-8")).get("projects")
+        projects = json.loads(read_text_retrying(config)).get("projects")
     except (OSError, ValueError):
         return False
     return isinstance(projects, dict) and all(isinstance(projects.get(name), dict)
@@ -129,7 +129,7 @@ def trust_claude_folder(path: Path, config: Path | None = None, attempts: int = 
     for attempt in range(attempts):
         try:
             before = config.stat()
-            data = json.loads(config.read_text(encoding="utf-8"))
+            data = json.loads(read_text_retrying(config))
         except FileNotFoundError as error:
             raise LauncherError(f"Estado do Claude Code não encontrado em {config}; abra o Claude Code uma vez.") from error
         except ValueError as error:

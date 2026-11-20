@@ -129,14 +129,16 @@ def read_json_state(path, accept=lambda data: isinstance(data, dict), backups: P
 def remove_tree(path, attempts: int = 5) -> None:
     """shutil.rmtree que repete quando o Windows recusa por arquivo em uso (um pythonw da venv ainda carregado, o
     antivírus varrendo); esgotadas as tentativas, levanta o último erro."""
-    for attempt in range(1, attempts + 1):
+    started = time.monotonic()
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             shutil.rmtree(path)
             return
         except PermissionError:
-            if attempt == attempts:
+            if _give_up(attempt, attempts, started, REPLACE_TIMEOUT):
                 raise
-            time.sleep(0.5 * attempt)
 
 
 class LockBusy(LauncherError):

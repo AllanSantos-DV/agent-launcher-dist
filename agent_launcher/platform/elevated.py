@@ -172,7 +172,11 @@ def apply(home: Path, mark: set[str], unmark: set[str], folder: Path | None = No
             if result.returncode:
                 raise LauncherError(f"schtasks /create falhou: {(result.stderr or result.stdout).strip()}")
         else:
-            subprocess.run(["schtasks.exe", "/delete", "/tn", TASK, "/f"], capture_output=True, creationflags=NO_WINDOW)
+            deleted = subprocess.run(["schtasks.exe", "/delete", "/tn", TASK, "/f"], capture_output=True, text=True,
+                                     creationflags=NO_WINDOW)
+            if deleted.returncode and subprocess.run(["schtasks.exe", "/query", "/tn", TASK], capture_output=True,
+                                                     creationflags=NO_WINDOW).returncode == 0:
+                raise LauncherError(f"schtasks /delete falhou: {(deleted.stderr or deleted.stdout).strip()}")
     return {"projects": [item["name"] for item in projects.values()], "task": bool(projects) and register}
 
 

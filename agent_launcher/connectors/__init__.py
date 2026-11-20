@@ -138,7 +138,3 @@ def available(user_dir: Path | None = None) -> tuple[dict, list[str]]:
             errors.append(f"{path.name}: {type(error).__name__}: {error}")
     return found, errors
 
-
-def defaults(module) -> dict:
-    return {item["name"]: item.get("default", False if item.get("type") == "bool" else "")
-            for item in module.FIELDS if not item.get("secret")}

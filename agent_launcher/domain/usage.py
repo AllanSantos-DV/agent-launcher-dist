@@ -29,7 +29,7 @@ from pathlib import Path
 
 from agent_launcher.domain import profiles
 from agent_launcher.domain.catalog import PRICES, ModelInfo, base_model
-from agent_launcher.domain.files import atomic_json
+from agent_launcher.domain.files import atomic_json, note_state_recovery
 from agent_launcher.session import registry
 
 DESTINATIONS = ("claude", "codex", "copilot", "vscode", "copilot_app", "endpoint")
@@ -237,7 +237,8 @@ def read_codex(path: Path, resume: dict | None = None) -> dict:
     return {"months": months, "context": context, "resume": state}
 
 
-def copilot_meta(folder: Path) -> dict:
+def copilot_meta(folder: Path, home: Path | None = None) -> dict:
+    """Id, pasta e criação da sessão do Copilot (workspace.yaml); arquivo ilegível vai para o state-recovery.log de `home`."""
     meta = {"id": folder.name, "cwd": None, "created": None}
     try:
         with open(folder / "workspace.yaml", encoding="utf-8", errors="replace") as stream:
@@ -250,8 +251,11 @@ def copilot_meta(folder: Path) -> dict:
                     meta["created"] = parse_time(value)
                 elif key == "id" and value:
                     meta["id"] = value
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as error:
+        if home is not None:
+            note_state_recovery(home, f"{folder.name}/workspace.yaml ilegível ({error}); a sessão do Copilot fica fora do Uso do mês")
     return meta
 
 
@@ -455,7 +459,7 @@ def _copilot(home, folders, shared, month, start, cache, totals):
             continue
         if stat.st_mtime < start:
             continue
-        meta = copilot_meta(folder)
+        meta = copilot_meta(folder, home)
         if meta.get("cwd") and _key(meta["cwd"]) in wanted:
             by_folder.setdefault(wanted[_key(meta["cwd"])], []).append((path, stat, meta))
     _attribute(home, "copilot", by_folder, shared, month, cache, totals, read_copilot)

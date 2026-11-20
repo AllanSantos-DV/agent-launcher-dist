@@ -452,8 +452,8 @@ class EndpointServer(ThreadingHTTPServer):
             with self._usage_lock:
                 with self.usage_file.open("a", encoding="utf-8") as stream:
                     stream.write(line)
-        except Exception:
-            pass
+        except Exception as error:
+            self.note(f"uso não gravado: {type(error).__name__}: {error}")
 
     def service_actions(self):
         if self.idle and time.monotonic() - self.last > self.idle:
