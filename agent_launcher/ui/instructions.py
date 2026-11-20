@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QLabel, QPushButton, QTextBrowser, QVBoxLayout
 
 from agent_launcher.domain.errors import LauncherError
+from agent_launcher.ui.theme import bind_style
 
 SOURCE = Path(__file__).with_name("instrucoes.md")
 FENCE = re.compile(r"^```(?P<language>[^\n]*)\n(?P<body>.*?)^```", re.MULTILINE | re.DOTALL)
@@ -44,8 +45,8 @@ class InstructionsDialog(QDialog):
         self.view = QTextBrowser()
         self.view.setAccessibleName("Instruções e comandos")
         # cores explícitas: sem elas o texto segue a paleta do Windows (fundo escuro com a tinta escura do app)
-        self.view.setStyleSheet("QTextBrowser { background: #ffffff; color: #233e32; border: 1px solid #d5ded1; "
-                                "border-radius: 8px; padding: 6px; selection-background-color: #d5e6cf; }")
+        bind_style(self.view, "QTextBrowser { background: #ffffff; color: #233e32; border: 1px solid #d5ded1; "
+                              "border-radius: 8px; padding: 6px; selection-background-color: #d5e6cf; }")
         self.view.setOpenLinks(False)  # só âncoras internas; endereço externo não abre navegador daqui
         self.view.anchorClicked.connect(self.follow)
         layout.addWidget(self.view, 1)

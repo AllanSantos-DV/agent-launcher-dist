@@ -190,7 +190,7 @@ class ClaudeCode(Harness):
     EXECUTABLE = "claude"
 
     def find_executable(self) -> str | None:
-        return installers.find(self.ID)
+        return installers.find(self.ID, usable=True)
 
     def install_steps(self) -> list:
         return installers.steps(self.ID)
@@ -212,14 +212,9 @@ class ClaudeCode(Harness):
                 "Famílias: " + "   ·   ".join(f"{family.title()} {token_label(model.max_input_tokens)}"
                                               for family, model in mapped.items()))
 
-    def command(self) -> list[str]:
-        executable = self.find_executable()
-        if not executable:
-            raise LauncherError(f"{self.LABEL} não está instalado. Use 'Instalar' na interface ou "
-                                f"'launcher.py cli --install {self.ID}'.")
-        path = Path(executable)
+    def command_for(self, path: Path, repair: bool = True) -> list[str]:
         try:
-            native = installers.claude_binary(path)
+            native = installers.claude_binary(path, repair)
         except installers.CliInstallError as error:
             raise LauncherError(str(error)) from error
         if native is not None:

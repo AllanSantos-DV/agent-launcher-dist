@@ -17,6 +17,8 @@ from PySide6.QtWidgets import QApplication, QDialog, QMenu, QWidget
 PREFERRED_MINIMUM = QSize(800, 600)
 TITLE_GRIP = 48
 SETTLE_MS = 350
+POPUP_EVENTS = (QEvent.Type.Show, QEvent.Type.Hide, QEvent.Type.Resize, QEvent.Type.ScreenChangeInternal,
+                QEvent.Type.DevicePixelRatioChange)
 WM_DPICHANGED = 0x02E0
 VISIBLE_EDGE = 1 if sys.platform == "win32" else 0
 KEEPERS: dict[int, "WindowKeeper"] = {}
@@ -161,7 +163,7 @@ class PopupKeeper(QObject):
                 QTimer.singleShot(0, lambda w=watched: _clamp_dialog(w))
             elif kind in (QEvent.Type.ScreenChangeInternal, QEvent.Type.DevicePixelRatioChange):
                 QTimer.singleShot(SETTLE_MS, lambda w=watched: _clamp_dialog(w))
-        if not self.is_popup(watched):
+        if kind not in POPUP_EVENTS or not self.is_popup(watched):
             return False
         key = shiboken6.getCppPointer(watched)[0]
         if kind == QEvent.Type.Show:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import itertools
 import time
+import urllib.parse
+from collections import Counter
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
@@ -11,13 +13,13 @@ from PySide6.QtWidgets import (
     QApplication, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
-from agent_launcher.connectors import LoginPending, QuotaExhausted
+from agent_launcher.connectors import ConnectorError, LoginPending, QuotaExhausted
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
 from agent_launcher.endpoint import registry as endpoint_registry
 from agent_launcher.ui.background import deliver
-from agent_launcher.ui.theme import ReadableCombo
+from agent_launcher.ui.theme import ReadableCombo, plural
 
 
 def _label(text: str, role: str = "") -> QLabel:
@@ -76,6 +78,46 @@ def quota_warning(connection: dict | None) -> str:
     """Mensagem de cota esgotada gravada na conexão ("" se ela não está nesse estado)."""
     status = (connection or {}).get("status") or {}
     return str(status.get("message") or "") if status.get("state") == "quota_exhausted" else ""
+
+
+BATCH_STATES = ("ok", "chave recusada", "host fora do ar", "cota esgotada", "aguarda login", "falhou")
+CONNECTIONS_HEADER = ("Nome", "Conector", "Endereço", "Padrão", "Estado")
+
+
+def verdict(task, error: str) -> tuple[str, str]:
+    """Estado de uma conexão testada (um de BATCH_STATES) e o texto do erro do conector, que vai para a dica da linha."""
+    if not error:
+        return "ok", ""
+    cause = cause_of(task, ConnectorError)
+    detail = str(cause) if cause is not None else error
+    if login_of(task) is not None:
+        return "aguarda login", detail
+    if cause_of(task, QuotaExhausted) is not None:
+        return "cota esgotada", detail
+    if getattr(cause, "status", None) in (401, 403):
+        return "chave recusada", detail
+    if getattr(cause, "transient", False):
+        return "host fora do ar", detail
+    return "falhou", detail
+
+
+def public_address(url: str) -> str:
+    """O endereço sem usuário, senha, consulta nem fragmento ("" se não for um endereço): nada que sirva de segredo sai
+    da tela."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return ""
+    if not parts.scheme or not host:
+        return ""
+    netloc = (f"[{host}]" if ":" in host else host) + (f":{port}" if port else "")
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def connections_text(rows: list[list[str]]) -> str:
+    """A lista de conexões separada por tabulação: colada numa planilha, cada valor cai na sua coluna."""
+    return "\n".join("\t".join(row) for row in [list(CONNECTIONS_HEADER), *rows])
 
 
 def _remaining(seconds: float) -> str:
@@ -538,8 +580,9 @@ class ConnectionsDialog(QDialog):
         self.buttons = {}
         for key, text, callback in (("add", "Adicionar…", self.add), ("edit", "Editar…", self.edit),
                                     ("duplicate", "Duplicar…", self.duplicate),
-                                    ("test", "Testar", self.test), ("default", "Tornar padrão", self.make_default),
-                                    ("remove", "Remover…", self.remove)):
+                                    ("test", "Testar", self.test), ("test_all", "Testar todas", self.test_all),
+                                    ("default", "Tornar padrão", self.make_default),
+                                    ("copy", "Copiar lista", self.copy_list), ("remove", "Remover…", self.remove)):
             widget = QPushButton(text)
             widget.clicked.connect(callback)
             buttons.addWidget(widget)
@@ -554,6 +597,10 @@ class ConnectionsDialog(QDialog):
         self.login_panel.poll.connect(lambda: self.test(polling=True))
         layout.addWidget(self.login_panel)
         self.testing = False
+        self.testing_all = False
+        self.batch: list[str] = []  # conexões que ainda faltam testar na rodada de "Testar todas"
+        self.batch_total = 0
+        self.results: dict[str, tuple[str, str]] = {}  # conexão -> (estado, erro) do último "Testar todas"
         self.errors: dict[str, str] = {}  # origem ("limpeza", "teste") -> erro; some só quando a origem se resolve
         self.error_notice = _label("", "notice")  # não some com a lista que recarrega nem com a linha de status
         self.error_notice.setWordWrap(True)
@@ -576,31 +623,50 @@ class ConnectionsDialog(QDialog):
         store = Store(self.home)
         modules, _errors = store.connectors()
         self.list.clear()
+        self.results = {key: value for key, value in self.results.items()
+                        if any(connection["id"] == key for connection in store.connections)}
         for connection in store.connections:
             module = modules.get(connection["connector"])
             default = " • padrão" if connection["id"] == store.data["default_connection"] else ""
-            details = [module.LABEL if module else connection["connector"], connection["options"].get("base_url", ""),
-                       "cota esgotada" if quota_warning(connection) else ""]
+            details = [module.LABEL if module else connection["connector"], public_address(str(connection["options"].get("base_url", ""))),
+                       self.state_text(connection)]
             item = QListWidgetItem(f"{connection['name']}{default}\n" + " • ".join(part for part in details if part))
             item.setData(Qt.ItemDataRole.UserRole, connection["id"])
+            item.setToolTip(self.results.get(connection["id"], ("", ""))[1])
             self.list.addItem(item)
             if connection["id"] == preferred:
                 self.list.setCurrentItem(item)
         if self.list.currentItem() is None and self.list.count():
             self.list.setCurrentRow(0)
         self.set_status("lista", "" if self.list.count() else "Nenhuma conexão ainda. Clique em Adicionar.")
+        self.set_status("copia", "")
         self.set_status("cota", "\n".join(f"{connection['name']}: cota esgotada, a conexão volta a funcionar quando a cota "
                                           "voltar ou com outra conta." for connection in store.connections
                                           if quota_warning(connection)))
         self.update_buttons()
+
+    def state_text(self, connection: dict) -> str:
+        """Estado a mostrar: o do último "Testar todas" ou, sem ele, a cota esgotada gravada na conexão."""
+        state, detail = self.results.get(connection["id"], ("", ""))
+        if state == "falhou":
+            return f"falhou: {' '.join(detail.split())[:120]}"
+        return state or ("cota esgotada" if quota_warning(connection) else "")
+
+    def selected_id(self) -> str | None:
+        """O id da conexão selecionada na lista, ou None."""
+        item = self.list.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
 
     def current(self) -> dict | None:
         item = self.list.currentItem()
         return Store(self.home).find_connection(item.data(Qt.ItemDataRole.UserRole)) if item else None
 
     def update_buttons(self, *_args):
-        for key in ("edit", "duplicate", "test", "default", "remove"):
+        for key in ("edit", "duplicate", "default", "remove"):
             self.buttons[key].setEnabled(self.list.currentItem() is not None)
+        self.buttons["test"].setEnabled(self.list.currentItem() is not None and not self.testing_all)
+        self.buttons["test_all"].setEnabled(self.list.count() > 0 and not self.testing_all)
+        self.buttons["copy"].setEnabled(self.list.count() > 0)
         item = self.list.currentItem()
         self.endpoint.show_for(item.data(Qt.ItemDataRole.UserRole) if item else None)
 
@@ -614,6 +680,7 @@ class ConnectionsDialog(QDialog):
         if connection:
             form = ConnectionForm(self.home, connection, self)
             if form.exec() and form.saved:
+                self.results.pop(form.saved["id"], None)
                 self.populate(form.saved["id"])
 
     def duplicate(self):
@@ -628,15 +695,88 @@ class ConnectionsDialog(QDialog):
         connection = self.current()
         if not connection or self.testing:
             return
-        home = self.home
         self.testing = True
         if not polling:
             self.login_panel.clear()
             self.set_status("teste", f"Testando {connection['name']}…")
-        self.task = _Task(lambda: Gateway(Store(home), Store(home).find_connection(connection["id"])).verify())
+            if self.results.pop(connection["id"], None) is not None:
+                self.populate(connection["id"])
+        self.task = self.verification(connection)
         task = self.task
         task.signals.done.connect(lambda _result, error: self.show_test_result(connection["name"], error, task))
         QThreadPool.globalInstance().start(task)
+
+    def verification(self, connection: dict) -> _Task:
+        """Tarefa de fundo que confere a conexão pelo Gateway: a mesma do teste individual e a de cada passo do Testar
+        todas (Gateway.verify lista os modelos, não pede resposta de modelo)."""
+        home, reference = self.home, connection["id"]
+        return _Task(lambda: Gateway(Store(home), Store(home).find_connection(reference)).verify())
+
+    def test_all(self):
+        """Testa as conexões uma depois da outra, cada uma na tarefa de fundo do teste individual. Uma falha não
+        interrompe as outras e o login por código pendente vira "aguarda login" sem abrir o painel."""
+        if self.testing or self.cleaning or not self.list.count():
+            return
+        self.login_panel.clear()
+        self.errors.pop("teste", None)
+        self.render_errors()
+        self.batch = [connection["id"] for connection in Store(self.home).connections]
+        self.batch_total = len(self.batch)
+        self.results.clear()
+        self.testing = self.testing_all = True
+        self.populate(self.selected_id())
+        self.test_next()
+
+    def test_next(self):
+        """Dispara o teste da próxima conexão da rodada (pulando as removidas) ou encerra a rodada."""
+        store = Store(self.home)
+        connection = None
+        while self.batch and connection is None:
+            try:
+                connection = store.find_connection(self.batch.pop(0))
+            except LauncherError:
+                pass  # removida durante a rodada: não há o que testar
+        if connection is None:
+            self.finish_batch()
+            return
+        self.set_status("teste", f"Testando {self.batch_total - len(self.batch)} de {self.batch_total}: "
+                                 f"{connection['name']}…")
+        self.task = self.verification(connection)
+        task = self.task
+        task.signals.done.connect(lambda _result, error: self.batch_result(connection, error, task))
+        QThreadPool.globalInstance().start(task)
+
+    def batch_result(self, connection: dict, error: str, task):
+        """Guarda o resultado de uma conexão da rodada, mostra na lista e segue para a próxima."""
+        self.results[connection["id"]] = verdict(task, error)
+        self.populate(self.selected_id())
+        self.test_next()
+
+    def finish_batch(self):
+        """Fim da rodada: libera os botões e resume quantas conexões ficaram em cada estado."""
+        self.testing = self.testing_all = False
+        counts = Counter(state for state, _detail in self.results.values())
+        summary = ", ".join(f"{counts[state]} {state}" for state in BATCH_STATES if counts[state])
+        hint = " Para entrar, selecione a conexão e clique em Testar." if counts["aguarda login"] else ""
+        self.set_status("teste", f"{plural(len(self.results), 'conexão testada', 'conexões testadas')}: {summary}.{hint}"
+                        if self.results else "")
+        self.update_buttons()
+
+    def copy_list(self):
+        """Copia nome, conector, endereço, padrão e estado de cada conexão, separados por tabulação. Chave e segredo
+        nunca entram: as chaves ficam no cofre e o endereço sai sem usuário, senha ou consulta."""
+        store = Store(self.home)
+        modules, _errors = store.connectors()
+        rows = []
+        for connection in store.connections:
+            module = modules.get(connection["connector"])
+            rows.append([connection["name"], module.LABEL if module else connection["connector"],
+                         public_address(str(connection["options"].get("base_url", ""))) or "—",
+                         "sim" if connection["id"] == store.data["default_connection"] else "não",
+                         self.state_text(connection) or "—"])
+        QApplication.clipboard().setText(connections_text(rows))
+        self.set_status("copia", f"{plural(len(rows), 'conexão copiada', 'conexões copiadas')}: cole numa planilha, "
+                                 "cada valor vai para a sua coluna.")
 
     def show_test_result(self, name: str, error: str, task=None):
         self.testing = False
@@ -670,6 +810,7 @@ class ConnectionsDialog(QDialog):
         """Não fecha no meio da limpeza nos destinos (Fechar, Esc ou o X): o fim dela atualiza este diálogo."""
         if self.cleaning:
             return
+        self.batch = []
         self.login_panel.clear()
         super().done(result)
 

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
@@ -11,7 +14,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QDialog, QFileDialog, QFormLayout, QFrame,
     QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QTableWidget,
-    QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
+    QSystemTrayIcon, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 from agent_launcher import ROOT
@@ -19,7 +22,7 @@ from agent_launcher.domain import profiles, usage
 from agent_launcher.domain.conversation_usage import conversation_usage, resume_window_warning, window_warning
 from agent_launcher.domain.catalog import base_model, media_states, price_label, token_label
 from agent_launcher.domain.errors import LauncherBusy, LauncherError
-from agent_launcher.domain.files import project_path
+from agent_launcher.domain.files import append_capped, project_path
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
 from agent_launcher.harnesses import cli_update
@@ -30,21 +33,56 @@ from agent_launcher.session.conversations import conversations_for, has_conversa
 from agent_launcher.session.preview import plan_report, plan_text, planned
 from agent_launcher.session.window import session_title, start_session
 from agent_launcher.ui import placement
+from agent_launcher.ui import theme as theme_module
 from agent_launcher.ui.background import deliver
 from agent_launcher.ui.connections import ConnectionsDialog, quota_warning
 from agent_launcher.ui.instructions import InstructionsDialog
 from agent_launcher.ui.text import label_of
 from agent_launcher.ui.theme import (
-    DANGER, GREEN, INFO, MENU_SELECTED, MUTED, STYLE, WARN, CardGrid, CliButton, DangerMenu, ElidedLabel, FlowRow, InfoStrip,
-    NoticeStrip, ReadableCombo, icon,
+    ACCENT_NAMES, DANGER, GREEN, INFO, MENU_SELECTED, MUTED, THEME_NAMES, WARN, CardGrid, CliButton, DangerMenu, ElidedLabel,
+    FlowRow, InfoStrip, NoticeStrip, ReadableCombo, bind_icon, bind_style, icon, plural, tone, tone_item,
 )
 from agent_launcher.update import updater
 from version import APP_NAME, APP_USER_MODEL_ID, VERSION
 
 
+STARTUP_LOG = "abertura.log"
+STARTUP_LOG_BYTES = 64 * 1024
+_located: dict[str, tuple[tuple, str | None]] = {}
+
+
+def process_started() -> float:
+    """Momento (epoch) em que o Windows criou este processo: a abertura conta do clique no atalho, não do import."""
+    import ctypes
+    from ctypes import wintypes
+    times = [wintypes.FILETIME() for _ in range(4)]
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    if not kernel32.GetProcessTimes(kernel32.GetCurrentProcess(), *(ctypes.byref(item) for item in times)):
+        raise OSError(f"GetProcessTimes falhou ({ctypes.GetLastError()})")
+    return ((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime) / 1e7 - 11644473600
+
+
+PROCESS_STARTED = process_started()
+GUI_IMPORTED = time.time()
+
+
 def installed_path(cli: str) -> str | None:
-    """Executável do destino (CLIs de terminal pelo módulo de instalação, que os testes substituem)."""
-    return clis.locate(cli)
+    """Executável do destino (CLIs de terminal pelo módulo de instalação, que os testes substituem), resolvido uma vez
+    por PATH: cada busca confere todas as pastas do PATH. O caminho guardado que sumiu do disco é procurado de novo."""
+    key = (os.environ.get("PATH", ""), clis.locate)
+    cached = _located.get(cli)
+    if cached and cached[0] == key and (cached[1] is None or os.path.isfile(cached[1])):
+        return cached[1]
+    found = clis.locate(cli)
+    _located[cli] = (key, found)
+    return found
+
+
+def forget_installed() -> None:
+    """Esquece os caminhos guardados: depois de instalar ou atualizar, e ao voltar ao launcher (pode ter mudado por fora)."""
+    _located.clear()
 
 
 def model_name(identifier: str) -> str:
@@ -76,8 +114,15 @@ def media_cell(title: str, state: bool | None) -> tuple[str, str]:
     return "", f"{title}: {'aceita' if state else 'não aceita'} (informado pelo conector)"
 
 
-def plural(count: int, singular: str, several: str) -> str:
-    return f"{count} {singular if count == 1 else several}"
+def media_icon(symbol: str, state: bool) -> QIcon:
+    """Ícone de uma entrada de mídia da lista de modelos: cheio quando o conector diz que aceita, riscado quando diz que não."""
+    return icon(symbol, GREEN, fill=MENU_SELECTED) if state else icon(symbol, MUTED, struck=True)
+
+
+def project_icon(item: QListWidgetItem, selected: bool) -> QIcon:
+    """Ícone do projeto na lista (pasta, ou alfinete no fixado): verde no escolhido, claro sobre o trilho nos outros.
+    O fixado é marcado pelo ícone e não por texto, para a marca de sessão aberta continuar cabendo na lista."""
+    return icon("pin" if item.data(PROJECT_PINNED) else "folder", GREEN if selected else "#c8d9c7")
 
 
 def breakable_path(path: str) -> str:
@@ -106,7 +151,7 @@ def button(text: str, symbol: str = "", role: str = "", parent=None) -> QPushBut
     widget = QPushButton(text, parent)
     widget.setCursor(Qt.CursorShape.PointingHandCursor)
     if symbol:
-        widget.setIcon(icon(symbol, "#ffffff" if role == "primary" else GREEN))
+        bind_icon(widget, symbol, "#ffffff" if role == "primary" else GREEN)
     if role:
         widget.setObjectName(role)
     return widget
@@ -155,6 +200,50 @@ class ProjectDialog(QDialog):
             self.path.setText(str(Path(folder)))
 
 
+class ThemeDialog(QDialog):
+    """Tema e cor de destaque da interface; quem abre grava a escolha ao aceitar."""
+
+    def __init__(self, theme: str, accent: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Tema da interface")
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(12)
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.theme = self.picker("Tema", THEME_NAMES, theme)
+        form.addRow("Tema", self.theme)
+        self.accent = self.picker("Cor de destaque", ACCENT_NAMES, accent)
+        form.addRow("Cor de destaque", self.accent)
+        layout.addLayout(form)
+        layout.addWidget(label("A cor do perfil, das abas do Terminal e das ferramentas não muda com o tema.", "muted"))
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel = QPushButton("Cancelar")
+        cancel.clicked.connect(self.reject)
+        actions.addWidget(cancel)
+        save = QPushButton("Salvar")
+        save.setObjectName("primary")
+        save.setDefault(True)
+        save.clicked.connect(self.accept)
+        actions.addWidget(save)
+        layout.addLayout(actions)
+
+    @staticmethod
+    def picker(name: str, options: dict, chosen: str) -> ReadableCombo:
+        combo = ReadableCombo()
+        combo.setAccessibleName(name)
+        for value, title in options.items():
+            combo.addItem(title, value)
+        combo.setCurrentIndex(max(0, combo.findData(chosen)))
+        return combo
+
+    def chosen(self) -> tuple[str, str]:
+        """(tema, cor de destaque) escolhidos, nos valores que o Store grava."""
+        return self.theme.currentData(), self.accent.currentData()
+
+
 class TextDialog(QDialog):
     """Texto selecionável só para leitura, com o botão que o copia inteiro (como o Copiar erro da faixa de avisos)."""
 
@@ -168,8 +257,8 @@ class TextDialog(QDialog):
         self.box.setReadOnly(True)
         self.box.setAccessibleName(title)
         # cores explícitas: sem elas o texto segue a paleta do Windows (fundo escuro com a tinta escura do app)
-        self.box.setStyleSheet("QPlainTextEdit { background: #ffffff; color: #233e32; border: 1px solid #d5ded1; "
-                               "border-radius: 8px; padding: 6px; selection-background-color: #d5e6cf; }")
+        bind_style(self.box, "QPlainTextEdit { background: #ffffff; color: #233e32; border: 1px solid #d5ded1; "
+                             "border-radius: 8px; padding: 6px; selection-background-color: #d5e6cf; }")
         layout.addWidget(self.box, 1)
         self.actions = QHBoxLayout()
         self.copy_button = QPushButton(copy_label)
@@ -334,7 +423,7 @@ class ConversationsDialog(QDialog):
                     warning = window_warning(getattr(usages.get(conversation.id), "context", None), record, verified)
                     item.setToolTip(warning or "Tokens do último pedido da conversa: o que a retomada carrega.")
                     if warning:
-                        item.setForeground(QColor(WARN))
+                        tone_item(item, WARN)
                 elif column == 5:
                     item.setToolTip("Estimativa pelo preço que o host informa para cada modelo usado; não é fatura. "
                                     "Traço: o host não informou o preço de algum modelo, ou o CLI não guarda o uso.")
@@ -604,6 +693,26 @@ def usage_text(report: dict) -> str:
     return "\n".join(lines)
 
 
+MODEL_ORDERS = (("Ordenar: Nome", "name"), ("Ordenar: Contexto", "context"), ("Ordenar: Preço", "price"))
+MODEL_ORDER_TIPS = {"name": "Família e versão mais nova primeiro",
+                    "context": "Maior contexto de entrada primeiro; o que o conector não informou vai para o fim",
+                    "price": "Menor preço de entrada primeiro; o que o conector não informou vai para o fim"}
+
+
+def order_models(records: list, order: str) -> list:
+    """Os modelos na ordem pedida: "name" (família e versão mais nova primeiro, a ordem de sempre), "context" (maior
+    entrada primeiro) ou "price" (menor preço de entrada primeiro). Quem não tem o dado vai para o fim, na ordem do nome."""
+    families = {"opus": 0, "sonnet": 1, "haiku": 2}
+    ordered = sorted(records, key=lambda record: record.version, reverse=True)
+    ordered.sort(key=lambda record: families.get(record.family, 3))
+    values = {"context": lambda record: record.max_input_tokens, "price": lambda record: record.input_cost_per_token}
+    if order not in values:
+        return ordered
+    known = [record for record in ordered if values[order](record) is not None]
+    known.sort(key=values[order], reverse=order == "context")
+    return known + [record for record in ordered if values[order](record) is None]
+
+
 MODELS_HEADER = ("Modelo", "Provider", "Entrada", "Saída", "Preço (US$ por 1M, entrada/saída)", *(title for _, title, _ in MEDIA_COLUMNS))
 
 
@@ -715,7 +824,7 @@ class UsageDialog(QDialog):
                     font.setBold(True)
                     item.setFont(font)
                 if column == 4 and (value == "sem preço" or value.endswith("(parcial)")):
-                    item.setForeground(QColor(MUTED))
+                    tone_item(item, MUTED)
                 self.table.setItem(number, column, item)
 
     def copy(self) -> None:
@@ -724,6 +833,8 @@ class UsageDialog(QDialog):
 
 
 PROJECT_TEXT = Qt.ItemDataRole.UserRole + 1  # texto e dica do projeto sem a marca de sessão aberta
+PROJECT_PINNED = Qt.ItemDataRole.UserRole + 2
+TRAY_NOTICE_MS = 10_000  # o Windows mostra o balão por tempo próprio; o ícone fica este tempo para o balão não sumir com ele
 GENERAL_ERROR = "geral"  # origem do erro avulso de uma ação; os erros persistentes têm origem própria
 
 
@@ -734,6 +845,9 @@ class LauncherWindow(QMainWindow):
         # Raiz dos perfis: a pasta-mãe quando o Store é de um perfil extra; a própria pasta senão (testes).
         self.profile_base = profiles.base_of(self.store.home)
         self.auto_refresh = auto_refresh
+        self.startup_phases = {"import": GUI_IMPORTED - PROCESS_STARTED}
+        self.startup_pending = {"clis"} if auto_refresh else set()
+        self.startup_done = False
         self.gateway = None
         self.catalog = None
         self.project = None
@@ -768,6 +882,12 @@ class LauncherWindow(QMainWindow):
         self.populate_profiles()
         self.populate_projects(self.store.data["last_project"])
         self.populate_connections()
+        self.tray = None
+        self.tray_notified = False
+        self.tray_timer = QTimer(self)
+        self.tray_timer.setSingleShot(True)
+        self.tray_timer.setInterval(TRAY_NOTICE_MS)
+        self.tray_timer.timeout.connect(self.release_tray)
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.check_sessions)
         self.refresh_timer.start(1500)
@@ -776,12 +896,14 @@ class LauncherWindow(QMainWindow):
         for sequence, callback in (("Ctrl+K", self.project_search.setFocus), ("Ctrl+F", self.model_search.setFocus),
                                    ("Ctrl+N", self.add_project), ("F5", lambda: self.refresh_catalog(True)),
                                    ("Ctrl+R", self.resume_by_shortcut), ("Ctrl+H", lambda: self.choose_conversation()),
-                                   ("Ctrl+U", lambda: self.show_usage())):
+                                   ("Ctrl+U", lambda: self.show_usage()), ("Ctrl+Return", self.launch_by_shortcut),
+                                   ("Ctrl+Enter", self.launch_by_shortcut)):
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.activated.connect(callback)
             self.shortcuts.append(shortcut)
+        self.startup_mark("janela")
         if self.auto_refresh:
-            QTimer.singleShot(1500, self.start_auto_update)
+            QTimer.singleShot(0, self.start_auto_update)
             # Janela aberta por dias também se atualiza (09/10: uma janela antiga seguia com o bug já corrigido).
             self.update_timer = QTimer(self)
             self.update_timer.timeout.connect(self.start_auto_update)
@@ -835,7 +957,7 @@ class LauncherWindow(QMainWindow):
         profile_row.addWidget(self.profile_picker, 1)
         self.profile_options = QToolButton()
         self.profile_options.setObjectName("ghost")
-        self.profile_options.setIcon(icon("more", "#c8d9c7"))
+        bind_icon(self.profile_options, "more", "#c8d9c7")
         self.profile_options.setToolTip("Novo perfil, renomear, remover, importar ou exportar")
         self.profile_options.setAccessibleName("Opções do perfil")
         self.profile_options.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -862,10 +984,8 @@ class LauncherWindow(QMainWindow):
         self.project_search = QLineEdit()
         self.project_search.setPlaceholderText("Buscar projetos")
         self.project_search.setAccessibleName("Buscar projetos")
-        search_palette = self.project_search.palette()
-        search_palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#c4d8c6"))
-        self.project_search.setPalette(search_palette)
-        self.project_search.addAction(icon("search", "#c8d9c7"), QLineEdit.ActionPosition.LeadingPosition)
+        self.paint_search_placeholder()
+        bind_icon(self.project_search.addAction(QIcon(), QLineEdit.ActionPosition.LeadingPosition), "search", "#c8d9c7")
         self.project_search.textChanged.connect(self.filter_projects)
         rail.addWidget(self.project_search)
         self.project_list = QListWidget()
@@ -877,11 +997,11 @@ class LauncherWindow(QMainWindow):
         self.project_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.project_list.customContextMenuRequested.connect(self.project_menu)
         rail.addWidget(self.project_list, 1)
-        list_hint = label("Mais recentes primeiro. Botão direito ou Shift+F10 para editar ou remover.", "railMuted")
+        list_hint = label("Fixados e mais recentes primeiro. Botão direito ou Shift+F10 para fixar, editar ou remover.", "railMuted")
         list_hint.setWordWrap(True)
         rail.addWidget(list_hint)
         add = button("Adicionar projeto", "plus")
-        add.setIcon(icon("plus", "#edf5e6"))
+        bind_icon(add, "plus", "#edf5e6")
         add.clicked.connect(self.add_project)
         rail.addWidget(add)
         import_button = button("Importar projetos", role="ghost")
@@ -910,7 +1030,7 @@ class LauncherWindow(QMainWindow):
         banner.setContentsMargins(16, 12, 14, 12)
         banner.setSpacing(12)
         restart_mark = QLabel()
-        restart_mark.setPixmap(icon("refresh", GREEN, 22).pixmap(22, 22))
+        bind_icon(restart_mark, "refresh", GREEN, 22)
         banner.addWidget(restart_mark)
         restart_flow = FlowRow(12)
         restart_box = QWidget()
@@ -973,7 +1093,7 @@ class LauncherWindow(QMainWindow):
         status_row.addWidget(self.connection)
         self.options = QToolButton()
         self.options.setObjectName("ghost")
-        self.options.setIcon(icon("more"))
+        bind_icon(self.options, "more")
         self.options.setToolTip("Opções do projeto e diagnóstico")
         self.options.setAccessibleName("Opções do projeto e diagnóstico")
         self.options.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -1000,6 +1120,7 @@ class LauncherWindow(QMainWindow):
         self.cli_update_preference.setChecked(self.store.preference("cli_auto_update"))
         self.cli_update_preference.toggled.connect(self.set_cli_auto_update)
         menu.addAction(self.cli_update_preference)
+        menu.addAction("Tema da interface…", self.choose_theme)
         menu.addAction("Instruções e comandos…", self.show_instructions)
         self.options.setMenu(menu)
         status_row.addWidget(self.options)
@@ -1038,7 +1159,7 @@ class LauncherWindow(QMainWindow):
         self.model_search = QLineEdit()
         self.model_search.setPlaceholderText("Buscar modelo, família ou ID")
         self.model_search.setAccessibleName("Buscar modelos")
-        self.model_search.addAction(icon("search", MUTED), QLineEdit.ActionPosition.LeadingPosition)
+        bind_icon(self.model_search.addAction(QIcon(), QLineEdit.ActionPosition.LeadingPosition), "search", MUTED)
         self.model_search.textChanged.connect(self.populate_models)
         search_row.addWidget(self.model_search, 1)
         self.provider_filter = ReadableCombo()
@@ -1051,6 +1172,13 @@ class LauncherWindow(QMainWindow):
             self.media_filter.addItem(text, field)
         self.media_filter.currentIndexChanged.connect(self.populate_models)
         search_row.addWidget(self.media_filter)
+        self.model_order = ReadableCombo()
+        self.model_order.setAccessibleName("Ordenar modelos")
+        for text, order in MODEL_ORDERS:
+            self.model_order.addItem(text, order)
+            self.model_order.setItemData(self.model_order.count() - 1, MODEL_ORDER_TIPS[order], Qt.ItemDataRole.ToolTipRole)
+        self.model_order.currentIndexChanged.connect(self.populate_models)
+        search_row.addWidget(self.model_order)
         self.copy_models_button = button("Copiar lista", "copy", "ghost")
         self.copy_models_button.setToolTip("Copia a lista como está filtrada, separada por tabulação, para colar numa planilha")
         self.copy_models_button.clicked.connect(self.copy_models)
@@ -1158,7 +1286,7 @@ class LauncherWindow(QMainWindow):
         buttons.addWidget(self.install_cli_button)
         self.installing_cli = False
         self.plan_button = QToolButton()
-        self.plan_button.setIcon(icon("vision"))
+        bind_icon(self.plan_button, "vision")
         self.plan_button.setMinimumHeight(44)
         self.plan_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.plan_button.setAccessibleName("Ver o que vai abrir")
@@ -1182,17 +1310,23 @@ class LauncherWindow(QMainWindow):
         self.project_list.blockSignals(True)
         self.project_list.clear()
         selected = None
+        pinned = self.store.pinned_ids()
         for project in self.store.projects:
-            item = QListWidgetItem(icon("folder", "#c8d9c7"), project["name"])
+            item = QListWidgetItem(project["name"])
             item.setData(Qt.ItemDataRole.UserRole, project["id"])
-            item.setData(PROJECT_TEXT, (project["name"], project["path"]))
+            item.setData(PROJECT_PINNED, project["id"] in pinned)
+            item.setIcon(project_icon(item, False))
+            text, tip = project["name"], project["path"]
             if not Path(project["path"]).is_dir():
-                item.setData(PROJECT_TEXT, (project["name"] + "  (pasta não encontrada)",
-                                            f"Pasta não encontrada: {project['path']}\n"
-                                            "Botão direito → Editar para apontar a nova pasta."))
+                text += "  (pasta não encontrada)"
+                tip = (f"Pasta não encontrada: {project['path']}\n"
+                       "Botão direito → Editar para apontar a nova pasta.")
                 font = item.font()
                 font.setItalic(True)
                 item.setFont(font)
+            if project["id"] in pinned:
+                tip += "\nFixado no topo da lista."
+            item.setData(PROJECT_TEXT, (text, tip))
             self.project_list.addItem(item)
             if project["id"] == preferred:
                 selected = item
@@ -1230,10 +1364,10 @@ class LauncherWindow(QMainWindow):
 
     def select_project(self, item, previous=None):
         if previous:
-            previous.setIcon(icon("folder", "#c8d9c7"))
+            previous.setIcon(project_icon(previous, False))
         self.project = self.store.find(item.data(Qt.ItemDataRole.UserRole)) if item else None
         if item:
-            item.setIcon(icon("folder", GREEN))
+            item.setIcon(project_icon(item, True))
         self.project_title.setText(self.project["name"] if self.project else "Seu próximo projeto começa aqui")
         self.project_path.setText(breakable_path(self.project["path"]) if self.project else
                                   "Adicione uma pasta para começar. Nenhum arquivo será alterado.")
@@ -1281,6 +1415,7 @@ class LauncherWindow(QMainWindow):
     @Slot(object, str)
     def finish_cli_check(self, result, _unused=""):
         self.cli_checking = False
+        self.startup_mark("clis")
         if isinstance(result, Exception):
             clis.record(f"verificação das CLIs falhou: {result}")
             self.show_warning(f"Não foi possível verificar as versões das CLIs: {result}", origin="cli:verificacao")
@@ -1339,6 +1474,7 @@ class LauncherWindow(QMainWindow):
     @Slot(object, str)
     def finish_cli_update(self, result, cli):
         self.cli_updating = None
+        forget_installed()
         name = clis.NAMES[cli]
         found = self.cli_versions.get(cli) or {}
         if isinstance(result, cli_update.UpdateDeferred):
@@ -1513,6 +1649,48 @@ class LauncherWindow(QMainWindow):
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(str(error))
 
+    def interface_store(self) -> Store:
+        """Onde o tema fica: a pasta de dados raiz, a mesma para todos os perfis (o tema é do launcher, não do perfil)."""
+        return self.store if self.store.home == self.profile_base else Store(self.profile_base)
+
+    def choose_theme(self):
+        store = self.interface_store()
+        self.theme_dialog = ThemeDialog(store.choice("theme"), store.choice("accent"), self)
+        self.theme_dialog.accepted.connect(self.save_theme)
+        self.theme_dialog.open()
+
+    def save_theme(self):
+        theme, accent = self.theme_dialog.chosen()
+        try:
+            fresh = Store(self.profile_base)
+            fresh.set_choice("theme", theme)
+            fresh.set_choice("accent", accent)
+        except (LauncherError, OSError, ValueError) as error:
+            self.show_error(f"Não foi possível salvar o tema: {error}")
+            return
+        if self.store.home == fresh.home:
+            self.store = fresh
+        theme_module.apply(QApplication.instance(), theme, accent)
+
+    def paint_search_placeholder(self):
+        palette = self.project_search.palette()
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(tone("#c4d8c6", True)))
+        self.project_search.setPalette(palette)
+
+    def retone(self):
+        """Refaz o que o tema pinta fora da folha de estilo e dos ícones ligados: o texto de dica da busca e os ícones
+        das listas de projetos e de modelos."""
+        self.paint_search_placeholder()
+        current = self.project_list.currentItem()
+        for index in range(self.project_list.count()):
+            item = self.project_list.item(index)
+            item.setIcon(project_icon(item, item is current))
+        for row, record in enumerate(self.records):
+            for column, (field, _title, symbol) in enumerate(MEDIA_COLUMNS, start=FIRST_MEDIA_COLUMN):
+                item, state = self.model_table.item(row, column), getattr(record, field)
+                if item is not None and state is not None:
+                    item.setIcon(media_icon(symbol, state))
+
     def populate_connections(self, preferred=None):
         self.connection_picker.blockSignals(True)
         self.connection_picker.clear()
@@ -1553,6 +1731,8 @@ class LauncherWindow(QMainWindow):
         available = [cli for cli in served if self.cli_buttons[cli].installed] or served or ["claude"]
         self.select_cli(preferred if preferred in available else available[0])
         if self.gateway and self.auto_refresh:
+            if not self.startup_done:
+                self.startup_pending.add("catalogo")
             QTimer.singleShot(0, self.refresh_catalog)
 
     def manage_connections(self):
@@ -1573,10 +1753,45 @@ class LauncherWindow(QMainWindow):
                 widget.set_installed(installed_path(cli) is not None)
             widget.setEnabled(not widget.installed or bool(self.gateway and cli in self.gateway.clis))
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if "pintada" not in self.startup_phases:
+            QTimer.singleShot(0, lambda: self.startup_mark("pintada"))
+
+    def startup_mark(self, phase: str) -> None:
+        """Marca uma fase da abertura (segundos desde a criação do processo); com a janela pintada e nada pendente
+        (catálogo, versões das CLIs), grava a linha da abertura no log que o Diagnóstico mostra."""
+        if self.startup_done or phase in self.startup_phases:
+            return
+        self.startup_phases[phase] = time.time() - PROCESS_STARTED
+        self.startup_pending.discard(phase)
+        if "pintada" not in self.startup_phases or self.startup_pending:
+            return
+        self.startup_done = True
+        phases = self.startup_phases
+        parts = [f"{name} {phases[key]:.2f} s" for key, name in (
+            ("import", "import"), ("janela", "janela"), ("pintada", "pintada"), ("catalogo", "catálogo"),
+            ("clis", "CLIs")) if key in phases]
+        line = f"{VERSION} · " + " · ".join(parts) + f" · pronta {max(phases.values()):.2f} s"
+        try:
+            append_capped(self.profile_base / STARTUP_LOG, f"{datetime.now():%Y-%m-%d %H:%M:%S} {line}\n",
+                          STARTUP_LOG_BYTES)
+        except OSError as error:
+            self.show_warning(f"Não foi possível gravar o tempo da abertura em {STARTUP_LOG}: {error}", origin="abertura")
+
+    def last_startup(self) -> str:
+        """A linha da última abertura gravada, sem a data e a hora; vazio se nenhuma foi gravada."""
+        try:
+            lines = (self.profile_base / STARTUP_LOG).read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return ""
+        return lines[-1].split(" ", 2)[-1] if lines else ""
+
     @Slot(Qt.ApplicationState)
     def recheck_tools(self, state):
         """Ao voltar para o launcher, ferramenta instalada ou removida por fora aparece no cartão."""
         if state == Qt.ApplicationState.ApplicationActive:
+            forget_installed()
             self.refresh_card_states()
             self.update_actions()
 
@@ -1630,9 +1845,7 @@ class LauncherWindow(QMainWindow):
         self.records = [record for record in all_records if (provider is None or record.provider == provider)
                         and (media is None or getattr(record, media) is True)
                         and (query in record.id.casefold() or query in model_name(record.id).casefold())]
-        families = {"opus": 0, "sonnet": 1, "haiku": 2}
-        self.records.sort(key=lambda record: record.version, reverse=True)
-        self.records.sort(key=lambda record: families.get(record.family, 3))
+        self.records = order_models(self.records, self.model_order.currentData())
         self.model_table.blockSignals(True)
         self.model_table.clearContents()
         self.model_table.setRowCount(len(self.records))
@@ -1667,7 +1880,7 @@ class LauncherWindow(QMainWindow):
         item.setData(Qt.ItemDataRole.AccessibleTextRole, tip)
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         if state is not None:
-            item.setIcon(icon(symbol, GREEN, fill=MENU_SELECTED) if state else icon(symbol, MUTED, struck=True))
+            item.setIcon(media_icon(symbol, state))
         return item
 
     def render_empty_models(self):
@@ -1720,7 +1933,9 @@ class LauncherWindow(QMainWindow):
 
     def update_actions(self):
         harness = registry.get(self.cli)
-        missing = installed_path(self.cli) is None
+        card = self.cli_buttons.get(self.cli)
+        # O cartão já guarda o que refresh_card_states achou: procurar de novo varre o PATH inteiro a cada clique.
+        missing = not card.installed if card is not None else installed_path(self.cli) is None
         installable = bool(harness.install_steps())
         self.install_cli_button.setVisible(bool((missing and installable) or self.installing_cli))
         self.install_cli_button.setEnabled(not self.installing_cli)
@@ -1738,7 +1953,7 @@ class LauncherWindow(QMainWindow):
         self.conversation_button.setEnabled(resumable)
         self.bypass_checkbox.setVisible("bypass" in harness.CAPABILITIES)
         self.bypass_checkbox.setEnabled(enabled)
-        bypass = self.bypass_checkbox.isChecked() and "bypass" in harness.CAPABILITIES
+        bypass = self.bypass_checkbox.isChecked() and "bypass" in harness.CAPABILITIES and not missing
         description = harness.BYPASS_RISK + " Vale só para a próxima abertura; o padrão fica em Opções → Bypass marcado por padrão."
         self.bypass_checkbox.setToolTip(description)
         self.bypass_checkbox.setAccessibleDescription(description)
@@ -1749,13 +1964,22 @@ class LauncherWindow(QMainWindow):
         self.bypass_risk.setAccessibleDescription(description)
         self.bypass_risk.setVisible(bypass)
         self.session_hint.setVisible(not bypass)
-        self.session_hint.setText(f"{harness.LABEL} não instalado: clique no cartão dele para instalar." if missing and installable else
-                                  harness.MISSING_HINT if missing else harness.SESSION_HINT)
+        absent = self.missing_reason(harness, installable) if missing else ""
+        self.session_hint.setText(absent or harness.SESSION_HINT)
         self.session_hint.setToolTip(session_title(self.project, self.cli, self.store.home) if self.project else "Selecione um projeto")
-        reason = "Retoma a última sessão nativa deste CLI na pasta do projeto." if enabled else "Escolha projeto, conexão e modelo; a conexão precisa responder."
+        reason = ("Retoma a última sessão nativa deste CLI na pasta do projeto." if enabled else
+                  absent or "Escolha projeto, conexão e modelo; a conexão precisa responder.")
         self.resume_button.setToolTip(reason if resumable or not enabled else
                                       f"Ainda não há conversa do {harness.LABEL} nesta pasta para retomar: use Nova sessão.")
         self.launch_button.setToolTip(session_title(self.project, self.cli, self.store.home) if enabled else reason)
+
+    def missing_reason(self, harness, installable: bool) -> str:
+        """Por que a sessão não abre com o CLI ausente, dito no botão desligado e no aviso ao lado dele."""
+        if self.installing_cli == harness.ID:
+            return f"{harness.LABEL} não instalado: instalando agora, a sessão abre quando terminar."
+        if installable:
+            return f"{harness.LABEL} não instalado: clique em Instalar {harness.LABEL} (ou no cartão dele) antes da sessão."
+        return harness.MISSING_HINT
 
     def has_previous_conversation(self) -> bool:
         """Pasta compartilhada com outro perfil: só conta conversa aberta por este perfil."""
@@ -1789,6 +2013,12 @@ class LauncherWindow(QMainWindow):
         """Ctrl+R faz o que o botão Retomar última faz, só quando o botão está à vista e habilitado."""
         if self.resume_button.isEnabled() and not self.resume_button.isHidden():
             self.launch_session(True)
+
+    def launch_by_shortcut(self) -> None:
+        """Ctrl+Enter faz o que o botão Nova sessão faz, só quando o botão está à vista e habilitado (com o CLI ausente
+        ele fica desligado)."""
+        if self.launch_button.isEnabled() and not self.launch_button.isHidden():
+            self.launch_session(False)
 
     def build_conversation_menu(self, actions):
         """Seta ao lado de 'Retomar última' com 'Escolher conversa…' (lista as conversas do CLI nesta pasta)."""
@@ -1855,6 +2085,7 @@ class LauncherWindow(QMainWindow):
     @Slot(object, str)
     def finish_refresh(self, result, connection):
         self.refreshing = False
+        self.startup_mark("catalogo")
         self.refresh_button.setEnabled(True)
         self.refresh_button.setText("Atualizar")
         if not self.gateway or connection != self.gateway.connection["id"]:
@@ -1887,6 +2118,10 @@ class LauncherWindow(QMainWindow):
         else:
             self.clear_error("janela")
         harness = registry.get(self.cli)
+        if installed_path(self.cli) is None:
+            self.show_error(self.missing_reason(harness, bool(harness.install_steps())), origin="cli:instalacao")
+            self.update_actions()
+            return
         if harness.KIND != "terminal":
             self.open_outside_terminal(harness)
             return
@@ -1946,6 +2181,7 @@ class LauncherWindow(QMainWindow):
     def finish_install_cli(self, found, log):
         cli = self.installing_cli or self.cli
         self.installing_cli = False
+        forget_installed()
         self.cli_buttons[cli].finish_install(bool(found))
         if found:
             self.clear_error("cli:instalacao")
@@ -1956,7 +2192,7 @@ class LauncherWindow(QMainWindow):
             if cli in clis.NAMES:
                 self.start_cli_check()
         else:
-            self.set_footer("instalacao", "A instalação não terminou; o motivo está no aviso acima.")
+            self.set_footer("instalacao", "A instalação não terminou; o motivo está no erro logo abaixo.")
             self.show_error(log or f"Não foi possível instalar o {registry.get(cli).LABEL}.", origin="cli:instalacao")
         self.update_actions()
 
@@ -1965,8 +2201,39 @@ class LauncherWindow(QMainWindow):
         finished = [(process, title) for process, title in self.sessions if process.poll() is not None]
         self.sessions = [(process, title) for process, title in self.sessions if process.poll() is None]
         if finished:
-            self.set_footer("sessao", f"Sessão encerrada: {finished[-1][1]} · "
-                                      f"{plural(len(self.sessions), 'janela ainda aberta', 'janelas ainda abertas')}")
+            message = (f"Sessão encerrada: {finished[-1][1]} · "
+                       f"{plural(len(self.sessions), 'janela ainda aberta', 'janelas ainda abertas')}")
+            self.set_footer("sessao", message)
+            self.notify_session_ended(message)
+        self.sync_tray()
+
+    def notify_session_ended(self, message: str) -> None:
+        """Balão do Windows com a mensagem do rodapé, só com o launcher minimizado ou sem foco: à vista, o rodapé basta."""
+        if self.isActiveWindow() and not self.isMinimized():
+            return
+        self.tray_notified = True
+        self.sync_tray()
+        if self.tray is None:
+            self.tray_notified = False
+            return
+        self.tray.showMessage(APP_NAME, message, self.windowIcon(), TRAY_NOTICE_MS)
+        self.tray_timer.start()
+
+    def sync_tray(self) -> None:
+        """O ícone da bandeja só existe com sessão aberta ou aviso ainda a mostrar. Sem bandeja no Windows não cria nada."""
+        wanted = bool(self.sessions) or self.tray_notified
+        if wanted and self.tray is None and QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = QSystemTrayIcon(self.windowIcon(), self)
+            self.tray.show()
+        elif not wanted and self.tray is not None:
+            self.tray.hide()
+            self.tray.deleteLater()
+            self.tray = None
+
+    def release_tray(self) -> None:
+        """Fim do prazo do aviso: o ícone sai se não há mais sessão aberta."""
+        self.tray_notified = False
+        self.sync_tray()
 
     def problem_report(self, message: str) -> str:
         """Aviso + contexto para diagnosticar fora daqui (sem chaves: só versões, caminhos e estado do Terminal)."""
@@ -2155,6 +2422,8 @@ class LauncherWindow(QMainWindow):
         if context and self.project and (open_sessions := self.open_sessions_of(self.project["id"])):
             menu.addAction("Ver a tela da sessão aberta…", lambda: self.show_session_screen(open_sessions))
         menu.addAction("Editar…" if context else "Editar projeto…", self.edit_project)
+        if context and self.project:
+            menu.addAction("Desafixar" if self.store.is_pinned(self.project) else "Fixar no topo", self.toggle_pinned)
         menu.add_danger_action("Remover do launcher…", self.remove_project)
 
     @staticmethod
@@ -2164,6 +2433,17 @@ class LauncherWindow(QMainWindow):
     def show_session_screen(self, open_sessions: list[dict]) -> None:
         """Mostra, só para leitura, o que a sessão aberta exibe agora; a janela dela fica onde está."""
         SessionScreenDialog(open_sessions, self).exec()
+
+    def toggle_pinned(self) -> None:
+        """Fixa o projeto atual no topo da lista, ou o desafixa se já está fixado."""
+        if not self.project:
+            return
+        try:
+            self.store.set_pinned(self.project, not self.store.is_pinned(self.project))
+        except (LauncherError, OSError, ValueError) as error:
+            self.show_error(f"Não foi possível salvar o projeto fixado: {error}")
+            return
+        self.populate_projects(self.project["id"])
 
     def edit_project(self):
         if not self.project:
@@ -2250,7 +2530,7 @@ class LauncherWindow(QMainWindow):
         for item in profiles.list_profiles(self.profile_base):
             self.profile_picker.addItem(item["name"], item["id"])
             if item["color"]:
-                self.profile_picker.setItemIcon(self.profile_picker.count() - 1, icon("folder", item["color"]))
+                self.profile_picker.setItemIcon(self.profile_picker.count() - 1, icon("folder", item["color"], fixed=True))
         self.profile_picker.addItem("Novo perfil…", NEW_PROFILE)
         self.profile_picker.setCurrentIndex(max(0, self.profile_picker.findData(current["id"])))
         self.profile_picker.blockSignals(False)
@@ -2520,6 +2800,9 @@ class LauncherWindow(QMainWindow):
         if not found_any:
             lines.append("Nenhuma ferramenta instalada ainda: normal numa instalação nova.")
         lines.extend(f"Adaptador do usuário não carregado: {error}" for error in registry.errors())
+        last_open = self.last_startup()
+        if last_open:
+            lines.extend(["", f"Última abertura: {last_open}"])
         quota = self.quota_mark()
         lines.extend(["", self.catalog.status if self.catalog else "Sem catálogo.", "",
                       "As chaves das conexões ficam cifradas (DPAPI) e nunca aparecem aqui."])
@@ -2568,10 +2851,8 @@ def create_application(arguments=None):
     application.setOrganizationName(APP_NAME)
     application.setStyle("Fusion")
     application.setFont(QFont("Segoe UI", 10))
-    palette = application.palette()
-    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#60725f"))
-    application.setPalette(palette)
-    application.setStyleSheet(STYLE)
+    saved = Store(profiles.root())
+    theme_module.apply(application, saved.choice("theme"), saved.choice("accent"))
     application.popup_keepers = placement.install(application)
     return application
 

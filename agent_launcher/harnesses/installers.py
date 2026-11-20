@@ -91,7 +91,7 @@ def label(tool: str) -> str:
 
 def locate(tool: str) -> str | None:
     """Executável da ferramenta: os CLIs por `find` (que os testes substituem); os outros pelo próprio adaptador."""
-    return find(tool) if tool in NAMES else _harness(tool).find_executable()
+    return find(tool, usable=True) if tool in NAMES else _harness(tool).find_executable()
 
 
 def installable() -> tuple[str, ...]:
@@ -134,12 +134,25 @@ def _refused(path: Path | str) -> bool:
         return False
 
 
-def find(cli: str) -> str | None:
+def runnable(cli: str, path: Path | str) -> bool:
+    """O launcher consegue montar o comando que roda `path` (sem consertar nada): um atalho do npm sem o pacote ou sem
+    o Node ao lado não conta como CLI instalado."""
+    from agent_launcher.domain.errors import LauncherError
+    from agent_launcher.harnesses import registry
+    try:
+        registry.get(cli).command_for(Path(path), repair=False)
+    except (LauncherError, CliInstallError, OSError):
+        return False
+    return True
+
+
+def find(cli: str, usable: bool = False) -> str | None:
     """Executável do CLI: o primeiro do PATH (sem o atalho `copilot-shim` do VS Code), senão o da instalação nativa por
-    usuário, pulando os que `reject_unsigned` recusou nesta execução (o próximo candidato assume)."""
+    usuário, pulando os que `reject_unsigned` recusou nesta execução (o próximo candidato assume). Com `usable`, pula
+    também os que não rodam: é o que conta para abrir sessão; a atualização e o reparo querem achar o atalho quebrado."""
     path = path_without_vscode_shim()
     while found := shutil.which(cli, path=path):
-        if not _refused(found):
+        if not _refused(found) and (not usable or runnable(cli, found)):
             return found
         folder = os.path.normcase(os.path.normpath(os.path.dirname(found)))
         rest = os.pathsep.join(entry for entry in path.split(os.pathsep)
@@ -147,7 +160,8 @@ def find(cli: str) -> str | None:
         if rest == path:
             break
         path = rest
-    return next((str(path) for path in native_paths(cli) if path.is_file() and not _refused(path)), None)
+    return next((str(path) for path in native_paths(cli)
+                 if path.is_file() and not _refused(path) and (not usable or runnable(cli, path))), None)
 
 
 def _run(command: list[str], timeout: int, environment: dict | None = None) -> subprocess.CompletedProcess:
@@ -206,10 +220,10 @@ def _package_roots(path: Path, package: str) -> list[Path]:
     return [root for root in dict.fromkeys(roots) if root.is_dir()]
 
 
-def claude_binary(path: Path) -> Path | None:
+def claude_binary(path: Path, repair: bool = True) -> Path | None:
     """Binário nativo do Claude Code instalado pelo npm, ou None sem nenhum pacote do npm em volta de `path`.
-    Pula o que não tem cabeçalho MZ, prefere o pacote da plataforma quando bin/claude.exe é o provisório e o repara
-    (copia o binário da plataforma por cima). Sem binário válido, levanta com o comando de reparo."""
+    Pula o que não tem cabeçalho MZ, prefere o pacote da plataforma quando bin/claude.exe é o provisório e, com
+    `repair`, o repara (copia o binário da plataforma por cima). Sem binário válido, levanta com o comando de reparo."""
     roots = _package_roots(path, "@anthropic-ai/claude-code")
     if not roots:
         return None
@@ -221,7 +235,7 @@ def claude_binary(path: Path) -> Path | None:
         raise CliInstallError((f"{', '.join(invalid)} não é um executável do Windows (cabeçalho MZ ausente). "
                                if invalid else "Binário nativo do Claude Code não encontrado no pacote do npm. ") +
                               f"Repare com: {npm_repair('claude', path)}")
-    for stub in (candidate for candidate in candidates if candidate.is_file() and candidate != found
+    for stub in (candidate for candidate in candidates if repair and candidate.is_file() and candidate != found
                  and candidate.parent.name == "bin" and not is_native(candidate)):
         try:
             descriptor, partial = tempfile.mkstemp(prefix=stub.name + ".", suffix=".reparo", dir=stub.parent)

@@ -122,7 +122,8 @@ def get_json(url: str, headers: dict | None = None, timeout: float = 15, quota=N
 
 def auth_probe(url: str, headers: dict, timeout: float = 15) -> None:
     """Confere a chave com um POST de corpo vazio: o host autentica antes de validar o corpo, então 401/403 é chave
-    recusada e qualquer outro status (400 "Missing model"...) é chave aceita, sem gerar nenhuma resposta de modelo."""
+    recusada, 502/503/504 ou sem resposta é host fora do ar (passageiro) e qualquer outro status (400 "Missing model"...)
+    é chave aceita, sem gerar nenhuma resposta de modelo."""
     import urllib.error
     import urllib.request
     request = urllib.request.Request(url, data=b"{}", headers={"Content-Type": "application/json", **headers},
@@ -132,10 +133,16 @@ def auth_probe(url: str, headers: dict, timeout: float = 15) -> None:
             response.read(1024)
     except urllib.error.HTTPError as error:
         error.close()
-        if error.code in (401, 403):
-            raise ConnectorError(f"O host recusou a chave (HTTP {error.code}) em {url}.") from None
+        if error.code in (401, 403) or error.code in TRANSIENT_STATUS:
+            failure = ConnectorError(f"O host recusou a chave (HTTP {error.code}) em {url}." if error.code in (401, 403)
+                                     else f"{url} respondeu HTTP {error.code}.")
+            failure.status = error.code
+            failure.transient = error.code in TRANSIENT_STATUS
+            raise failure from None
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
-        raise ConnectorError(f"Sem resposta de {url}: {getattr(error, 'reason', error)}") from None
+        failure = ConnectorError(f"Sem resposta de {url}: {getattr(error, 'reason', error)}")
+        failure.transient = True
+        raise failure from None
 
 
 def bearer(token: str) -> dict:

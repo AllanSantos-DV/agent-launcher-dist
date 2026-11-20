@@ -10,7 +10,8 @@ saída máxima, ferramentas, entrada de imagem, áudio e vídeo) e configura cad
 de catálogo fixo no código. A lista mostra, para cada modelo, se ele aceita imagem (Visão), áudio e vídeo: ícone quando
 o host diz que aceita, ícone riscado quando diz que não e traço quando o conector não informou.
 O filtro "Entrada" lista só os modelos com visão, áudio ou vídeo; o modelo escolhido que o host diz não aceitar imagem
-ganha um aviso; **Copiar lista** copia a lista filtrada, separada por tabulação. O que o host informa sobre imagem também
+ganha um aviso; **Ordenar** põe a lista por nome (a ordem de sempre), por contexto (maior primeiro) ou por preço de entrada
+(menor primeiro), com o que o host não informou sempre no fim; **Copiar lista** copia a lista filtrada, separada por tabulação. O que o host informa sobre imagem também
 vai para o chat do VS Code (anexar imagem) e para o Codex (modelo declarado só de texto não recebe imagem); `launcher models`
 mostra visão, áudio e vídeo só do que o host informou.
 A lista também traz a saída máxima e, na dica e na cópia, o preço por 1M de tokens (traço quando o host não informa). A lista de
@@ -54,7 +55,8 @@ orquestrador), o launcher confere no máximo a cada 4 horas num processo oculto 
 vale para os próximos comandos e sessões. Sem rede, nada muda: o resultado da última verificação aparece
 em Diagnóstico e em `~/.agent-launcher/update.log`. Para desligar, use **Atualizar automaticamente** no menu de
 opções, `launcher preferences --auto-update off` ou `AGENT_LAUNCHER_NO_AUTO_UPDATE=1`. Para atualizar na hora:
-`launcher update` (`--check` só consulta). Quem está na 1.0.4 ou anterior atualiza uma última vez à mão, rodando de
+`launcher update` (`--check` só consulta). O Diagnóstico mostra também quanto levou cada fase da última abertura (import, janela, primeira
+pintura, catálogo e versões das CLIs), gravada em `~/.agent-launcher/abertura.log`. Quem está na 1.0.4 ou anterior atualiza uma última vez à mão, rodando de
 novo o comando de instalação acima.
 
 Desinstalar: `npx @allansantos-dev/agent-launcher@latest install --uninstall`. Remove o app e os atalhos; seus dados
@@ -178,6 +180,10 @@ consulta a lista de modelos antes de gravar: conexão que não responde não é 
 projeto lembra a última conexão, o CLI e o modelo usados.
 **Duplicar** abre o formulário preenchido com os campos da conexão selecionada e o nome "(cópia)", para cadastrar
 outra conta do mesmo provedor sem redigitar endereço e opções; a chave não é copiada e é pedida de novo.
+**Testar todas** testa as conexões uma depois da outra, em segundo plano, pela mesma conferência do **Testar**, e a lista mostra
+o resultado de cada uma (ok, chave recusada, host fora do ar, cota esgotada, aguarda login ou o erro); uma falha não interrompe
+as outras. **Copiar lista** copia nome, conector, endereço, padrão e estado de cada conexão, separados por tabulação; a chave
+nunca vai junto.
 Conexão usada pelo VS Code ou pelo Copilot app mostra o endpoint local dela: porta, rodando ou parado, requisições,
 **Iniciar/Parar** e **Iniciar com o Windows**.
 
@@ -248,13 +254,17 @@ acima da lista filtra por título, data ou CLI e **Copiar lista** copia as linha
 sessão nova, com um aviso na janela, em vez de parar em "No conversation found to continue". Com o Windows Terminal instalado, cada sessão vira
 uma aba da janela **agent-launcher** (laranja para Claude Code, verde para Codex), com o título
 **Projeto — Claude Code/Codex**; sem ele, cada sessão abre num console próprio. A sessão confere a conexão antes de iniciar. Fechar o launcher não encerra as
-sessões. A lista de projetos fica do mais recente para o mais antigo e se reordena a cada abertura; projeto com sessão
+sessões. Quando uma sessão termina com o launcher minimizado ou sem foco, o Windows mostra um aviso na bandeja com a mesma
+mensagem do rodapé; o ícone da bandeja só existe enquanto há sessão aberta ou aviso a mostrar. A lista de projetos fica do mais
+recente para o mais antigo e se reordena a cada abertura, com os projetos fixados no topo; projeto com sessão
 aberta agora (por esta ou por outra janela do launcher) aparece com "· aberta" ou "· 2 abertas", e a dica diz quais CLIs.
 O botão direito em um projeto abre a pasta, abre no VS Code (só com o VS Code instalado, no seu perfil normal), mostra
-**a tela da sessão aberta** (só leitura: nada é digitado nela e a janela dela não vem para a frente), edita (nome e pasta)
-ou remove o cadastro. O botão do olho ao lado de **Retomar última** mostra, antes de abrir, o que a nova sessão vai iniciar
+**a tela da sessão aberta** (só leitura: nada é digitado nela e a janela dela não vem para a frente), edita (nome e pasta),
+**fixa no topo** (ou desafixa; o fixado aparece com um alfinete no lugar da pasta) ou remove o cadastro. O botão do olho ao lado de **Retomar última** mostra, antes de abrir, o que a nova sessão vai iniciar
 (comando, conexão, modelo, ambiente e avisos, sem a chave). `Ctrl+K` busca projetos, `Ctrl+F` modelos, `Ctrl+N` adiciona
-projeto, `F5` atualiza o catálogo, `Ctrl+R` retoma a última conversa, `Ctrl+H` escolhe a conversa e `Ctrl+U` abre o uso do mês.
+projeto, `F5` atualiza o catálogo, `Ctrl+R` retoma a última conversa, `Ctrl+H` escolhe a conversa, `Ctrl+U` abre o uso do mês e `Ctrl+Enter` abre a Nova sessão.
+No menu **…**, **Tema da interface…** escolhe Claro, Escuro ou Seguir o Windows e a cor de destaque (Verde, Azul, Roxo
+ou Grafite); a troca vale na hora, inclusive nas janelas abertas, e fica gravada para todos os perfis.
 
 Cada sessão recebe a configuração só no próprio processo; `~/.claude/settings.json` e `~/.codex/config.toml` não são
 alterados.

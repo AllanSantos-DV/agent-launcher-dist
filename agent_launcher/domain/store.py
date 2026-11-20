@@ -22,6 +22,8 @@ PROJECT_KEYS = {"id", "name", "path", "last_cli", "last_connection", "models", "
 CONNECTION_KEYS = {"id", "name", "connector", "options"}
 PREFERENCES = {"bypass_default": False, "auto_update": True, "cli_auto_update": True,
                "sessions_secondary_monitor": False}
+# Escolhas de texto da interface guardadas junto das preferências; o primeiro valor de cada uma é o padrão.
+CHOICES = {"theme": ("light", "dark", "system"), "accent": ("green", "blue", "purple", "graphite")}
 BACKUP_DAYS = 30
 DEFAULT_HOME = Path.home() / ".agent-launcher"
 # Destinos novos (Copilot CLI, VS Code, Copilot app) guardam a última escolha em selections.json: o config.json
@@ -97,7 +99,8 @@ class Store:
             newer = rejected.get("preferences") if isinstance(rejected, dict) else None
             if isinstance(newer, dict):
                 self.data["preferences"].update({key: value for key, value in newer.items()
-                                                 if isinstance(key, str) and type(value) is bool})
+                                                 if isinstance(key, str) and (type(value) is bool or (
+                                                     key in CHOICES and isinstance(value, str)))})
             atomic_json(self.path, self.data)
             for old in sorted(self.backups.glob("invalid-config-*.json"), reverse=True)[BACKUP_DAYS:]:
                 try:
@@ -145,7 +148,8 @@ class Store:
         # Campo e preferência de versão mais nova não derrubam esta: ficam no arquivo e voltam na próxima gravação.
         preferences = self.data["preferences"]
         if not isinstance(preferences, dict) or not all(isinstance(key, str) for key in preferences) or not all(
-                type(value) is bool for key, value in preferences.items() if key in PREFERENCES):
+                type(value) is bool for key, value in preferences.items() if key in PREFERENCES) or not all(
+                isinstance(value, str) for key, value in preferences.items() if key in CHOICES):
             raise ValueError("preferências")
         connections = set()
         connection_names = set()
@@ -215,7 +219,34 @@ class Store:
 
     @property
     def projects(self) -> list[dict]:
-        return sorted(self.data["projects"], key=lambda project: (-project["last_used"], project["name"].casefold()))
+        """Os projetos fixados primeiro e, dentro de cada grupo, o de uso mais recente primeiro."""
+        pinned = self.pinned_ids()
+        return sorted(self.data["projects"], key=lambda project: (project["id"] not in pinned, -project["last_used"],
+                                                                  project["name"].casefold()))
+
+    def pinned_ids(self) -> set[str]:
+        """Projetos fixados no topo. Ficam em selections.json: uma instalação mais antiga valida o config.json com
+        chaves exatas e recusaria um campo novo no projeto."""
+        return {identifier for identifier, chosen in self._selections()["projects"].items()
+                if isinstance(chosen, dict) and chosen.get("pinned") is True}
+
+    def is_pinned(self, project: dict) -> bool:
+        """True se o projeto está fixado no topo da lista."""
+        return project["id"] in self.pinned_ids()
+
+    def set_pinned(self, project: dict, pinned: bool) -> None:
+        """Fixa ou desafixa o projeto; o config.json não é tocado."""
+        selections = self._selections()
+        chosen = selections["projects"].get(project["id"])
+        if not isinstance(chosen, dict):
+            chosen = selections["projects"][project["id"]] = {}
+        if pinned:
+            chosen["pinned"] = True
+        else:
+            chosen.pop("pinned", None)
+            if not chosen:
+                del selections["projects"][project["id"]]
+        atomic_json(self.home / SELECTIONS, selections)
 
     def add(self, path: str, name: str | None = None, save: bool = True) -> dict:
         resolved = project_path(path)
@@ -474,4 +505,18 @@ class Store:
         if key not in PREFERENCES:
             raise LauncherError(f"Preferência desconhecida: {key}")
         self.data["preferences"][key] = bool(value)
+        self.save()
+
+    def choice(self, key: str) -> str:
+        """Escolha de texto da interface (tema, cor de destaque). Valor que esta versão não conhece, vindo de uma
+        mais nova que gravou a mesma pasta, vale como o padrão."""
+        value = self.data["preferences"].get(key)
+        return value if value in CHOICES[key] else CHOICES[key][0]
+
+    def set_choice(self, key: str, value: str) -> None:
+        if key not in CHOICES:
+            raise LauncherError(f"Escolha desconhecida: {key}")
+        if value not in CHOICES[key]:
+            raise LauncherError(f"Valor inválido para {key}: {value}")
+        self.data["preferences"][key] = value
         self.save()

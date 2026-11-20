@@ -195,6 +195,16 @@ class Harness:
     # Sessão
 
     def command(self) -> list[str]:
+        """Comando que abre o CLI encontrado; levanta LauncherError quando ele falta ou não pode rodar."""
+        executable = self.find_executable()
+        if not executable:
+            raise LauncherError(f"{self.LABEL} não está instalado. Use 'Instalar' na interface ou "
+                                f"'launcher.py cli --install {self.ID}'.")
+        return self.command_for(Path(executable))
+
+    def command_for(self, path: Path, repair: bool = True) -> list[str]:
+        """Comando que roda o executável `path`; levanta LauncherError quando ele não pode rodar. `repair=False` só
+        confere, sem consertar nada no disco."""
         raise NotImplementedError
 
     def connection_url(self, gateway) -> str:

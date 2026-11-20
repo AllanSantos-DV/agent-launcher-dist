@@ -104,7 +104,7 @@ class CopilotCli(Harness):
                        "COPILOT_ALLOW_ALL"})
 
     def find_executable(self) -> str | None:
-        return installers.find(self.ID)
+        return installers.find(self.ID, usable=True)
 
     def install_steps(self) -> list:
         return installers.steps(self.ID)
@@ -123,12 +123,7 @@ class CopilotCli(Harness):
         return (f"Entrada declarada: {token_label(record.max_input_tokens).replace('.', ',')} tokens",
                 f"Protocolo: {names.get(protocol, '?')} • ID conhecido pelo Copilot: {known_model_id(record.id)}")
 
-    def command(self) -> list[str]:
-        executable = self.find_executable()
-        if not executable:
-            raise LauncherError(f"{self.LABEL} não está instalado. Use 'Instalar' na interface ou "
-                                f"'launcher.py cli --install {self.ID}'.")
-        path = Path(executable)
+    def command_for(self, path: Path, repair: bool = True) -> list[str]:
         if is_exe(path):
             return [str(path)]
         command = node_script(path, "@github/copilot/npm-loader.js") or native_wrapper(path)

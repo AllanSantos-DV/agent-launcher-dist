@@ -1,12 +1,17 @@
+import functools
+import json
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
-    QAbstractButton, QBoxLayout, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLayout, QMenu, QPushButton,
-    QSizePolicy, QStyledItemDelegate, QVBoxLayout, QWidget,
+    QAbstractButton, QApplication, QBoxLayout, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLayout, QMenu,
+    QListWidget, QPushButton, QSizePolicy, QStyledItemDelegate, QTableWidget, QVBoxLayout, QWidget,
 )
+
+from agent_launcher.ui import palette
+from agent_launcher.ui.palette import tone, toned
 
 
 INK = "#233e32"
@@ -23,6 +28,8 @@ SURFACE = "#f5f6f1"
 MENU_BACKGROUND = "#ffffff"
 MENU_SELECTED = "#e3eddf"
 MIN_TEXT_PX = 13
+THEME_NAMES = {"light": "Claro", "dark": "Escuro", "system": "Seguir o Windows"}
+ACCENT_NAMES = {"green": "Verde", "blue": "Azul", "purple": "Roxo", "graphite": "Grafite"}
 PATHS = {
     "folder": '<path d="M3 7V5h6l2 2h10v12H3Z"/>',
     "search": '<circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/>',
@@ -36,6 +43,7 @@ PATHS = {
     "resume": '<path d="M4 5v6h6M4 11a8 8 0 1 1 2 7M12 7v5l3 2"/>',
     "arrow": '<path d="M4 12h16m-6-6 6 6-6 6"/>',
     "copy": '<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M15 8V3H3v13h5"/>',
+    "pin": '<path d="M9 3h6M10 3v6l-3 4h10l-3-4V3M12 13v8"/>',
     "more": '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
     "import": '<path d="M12 3v12m-5-5 5 5 5-5M4 15v6h16v-6"/>',
     "check": '<path d="m5 12 4 4L19 6"/>',
@@ -49,8 +57,23 @@ PATHS = {
 STRIKE = '<path d="M3 3 21 21"/>'
 
 
-def icon(name: str, color: str = INK, size: int = 20, fill: str = "none", struck: bool = False) -> QIcon:
-    """Ícone de traço da biblioteca PATHS; `fill` preenche as formas e `struck` cruza o ícone com uma barra."""
+def plural(count: int, singular: str, several: str) -> str:
+    """O número com a palavra no singular (1) ou no plural (0 ou mais de 1): "1 conversa", "2 conversas"."""
+    return f"{count} {singular if count == 1 else several}"
+
+
+def icon(name: str, color: str = INK, size: int = 20, fill: str = "none", struck: bool = False,
+         fixed: bool = False) -> QIcon:
+    """Ícone de traço da biblioteca PATHS; `fill` preenche as formas e `struck` cruza o ícone com uma barra. As cores
+    são da paleta clara e saem na do esquema em vigor; `fixed` as usa como vêm (a cor do perfil não é do tema)."""
+    if not fixed:
+        color, fill = tone(color, text=True), fill if fill == "none" else tone(fill)
+    return QIcon(_drawn(name, color, size, fill, struck))
+
+
+@functools.lru_cache(maxsize=512)
+def _drawn(name: str, color: str, size: int, fill: str, struck: bool) -> QPixmap:
+    """Desenho do ícone nas cores finais; a lista de modelos pede o mesmo ícone em cada linha."""
     shapes = PATHS[name] + (STRIKE if struck else "")
     svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="{fill}" stroke="{color}" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">{shapes}</svg>'
     pixmap = QPixmap(size * 2, size * 2)
@@ -59,7 +82,62 @@ def icon(name: str, color: str = INK, size: int = 20, fill: str = "none", struck
     QSvgRenderer(QByteArray(svg.encode())).render(painter)
     painter.end()
     pixmap.setDevicePixelRatio(2)
-    return QIcon(pixmap)
+    return pixmap
+
+
+def bind_icon(target, name: str, color: str = INK, size: int = 20, fill: str = "none", struck: bool = False) -> None:
+    """Põe o ícone em `target` (botão, ação ou rótulo) e guarda a especificação para refazê-lo ao trocar de esquema."""
+    spec = [name, color, size, fill, struck]
+    target.setProperty("iconSpec", json.dumps(spec))
+    _show_icon(target, spec)
+
+
+def _show_icon(target, spec: list) -> None:
+    name, color, size, fill, struck = spec
+    chosen = icon(name, color, size, fill, struck)
+    if isinstance(target, QLabel):
+        target.setPixmap(chosen.pixmap(size, size))
+    else:
+        target.setIcon(chosen)
+
+
+TONED_TEXT = Qt.ItemDataRole.UserRole + 50
+
+
+def tone_item(item, color: str) -> None:
+    """Cor de texto de uma célula de tabela ou lista (cor da paleta clara); é refeita ao trocar de esquema, mesmo com a
+    janela aberta."""
+    item.setData(TONED_TEXT, color)
+    item.setForeground(QColor(tone(color, text=True)))
+
+
+def bind_style(widget: QWidget, css: str) -> None:
+    """Folha de estilo do widget escrita com a paleta clara; é refeita ao trocar de esquema."""
+    widget.setProperty("toneStyle", css)
+    widget.setStyleSheet(toned(css))
+
+
+def refresh_widgets() -> None:
+    """Refaz os ícones, as folhas de estilo e as cores de célula que guardaram a especificação (`bind_icon`,
+    `bind_style`, `tone_item`)."""
+    for widget in QApplication.allWidgets():
+        css = widget.property("toneStyle")
+        if css:
+            widget.setStyleSheet(toned(css))
+        if isinstance(widget, QTableWidget):
+            items = [widget.item(row, column) for row in range(widget.rowCount()) for column in range(widget.columnCount())]
+        elif isinstance(widget, QListWidget):
+            items = [widget.item(row) for row in range(widget.count())]
+        else:
+            items = []
+        for item in items:
+            color = item.data(TONED_TEXT) if item is not None else None
+            if color:
+                item.setForeground(QColor(tone(color, text=True)))
+        for target in (widget, *widget.actions()):
+            spec = target.property("iconSpec")
+            if spec:
+                _show_icon(target, json.loads(spec))
 
 
 class ElidedLabel(QLabel):
@@ -153,7 +231,11 @@ class CliButton(QAbstractButton):
         """Oferta que fica na faixa enquanto valer (versão nova, atualização que falhou); texto vazio a tira."""
         self.offer, self.offer_tone, self.offer_symbol = text, tone, symbol
         self.action.setText(action)
-        self.action.setIcon(icon(symbol, GREEN) if action else QIcon())
+        if action:
+            bind_icon(self.action, symbol, GREEN)
+        else:
+            self.action.setProperty("iconSpec", None)
+            self.action.setIcon(QIcon())
         self.action.setAccessibleName(f"{action} {self.title}" if action else "")
         self._relayout()
 
@@ -248,7 +330,7 @@ class CliButton(QAbstractButton):
     def _text(self, painter: QPainter, font: QFont, color: str, baseline: int, text: str, right: int,
               left: int = TEXT_LEFT) -> None:
         painter.setFont(font)
-        painter.setPen(QColor(color))
+        painter.setPen(QColor(tone(color, text=True)))
         room = max(0, right - left)
         shown = painter.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, room)
         painter.drawText(left, baseline, shown)
@@ -260,9 +342,9 @@ class CliButton(QAbstractButton):
         background = "#e3eddf" if active else "#ffffff"
         if self.underMouse() and not active:
             background = "#eef2e9"
-        painter.setBrush(QColor(background))
+        painter.setBrush(QColor(tone(background)))
         width = 3 if self.hasFocus() else 2 if active else 1
-        painter.setPen(QPen(QColor(GREEN if active or self.hasFocus() else "#d8e1d7"), width))
+        painter.setPen(QPen(QColor(tone(GREEN if active or self.hasFocus() else "#d8e1d7")), width))
         inset = width / 2 + 0.5
         painter.drawRoundedRect(QRectF(self.rect()).adjusted(inset, inset, -inset, -inset), 12, 12)
         top = 30
@@ -291,23 +373,23 @@ class CliButton(QAbstractButton):
 
     def _paint_band(self, painter: QPainter) -> None:
         line = self.HEIGHT - 2
-        painter.setPen(QPen(QColor("#d8e1d7"), 1))
+        painter.setPen(QPen(QColor(tone("#d8e1d7")), 1))
         painter.drawLine(14, line, self.width() - 14, line)
         if self.installing:
-            text, tone, symbol, baseline = self.stage, self.tone, "", self.HEIGHT + 20
+            text, shade, symbol, baseline = self.stage, self.tone, "", self.HEIGHT + 20
         else:
-            text, tone, symbol, baseline = self.offer, self.offer_tone, self.offer_symbol, self.HEIGHT + 21
+            text, shade, symbol, baseline = self.offer, self.offer_tone, self.offer_symbol, self.HEIGHT + 21
         left = self.BAND_LEFT
         if symbol:
-            icon(symbol, tone, 16).paint(painter, left, baseline - 13, 16, 16)
+            icon(symbol, shade, 16).paint(painter, left, baseline - 13, 16, 16)
             left += 23
-        self._text(painter, self.card_font(MIN_TEXT_PX, QFont.Weight.DemiBold), tone, baseline, text, self.width() - 14, left)
+        self._text(painter, self.card_font(MIN_TEXT_PX, QFont.Weight.DemiBold), shade, baseline, text, self.width() - 14, left)
         if not self.installing:
             return
         track = self.bar_rect()
         radius = self.BAR / 2
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#dfe7dc"))
+        painter.setBrush(QColor(tone("#dfe7dc")))
         painter.drawRoundedRect(track, radius, radius)
         if self.fraction is None:
             width = track.width() * 0.28
@@ -316,7 +398,7 @@ class CliButton(QAbstractButton):
             fill = QRectF(left, track.top(), width, track.height())
         else:
             fill = QRectF(track.left(), track.top(), track.width() * self.fraction, track.height())
-        painter.setBrush(QColor(self.tone))
+        painter.setBrush(QColor(tone(self.tone)))
         painter.drawRoundedRect(fill, radius, radius)
         painter.setClipping(False)
 
@@ -361,7 +443,7 @@ class CurrentMark(QStyledItemDelegate):
             return
         painter.save()
         painter.setFont(self.mark_font())
-        painter.setPen(QColor(GREEN))
+        painter.setPen(QColor(tone(GREEN, text=True)))
         painter.drawText(option.rect.adjusted(0, 0, -self.PADDING, 0), Qt.AlignRight | Qt.AlignVCenter, self.MARK)
         painter.restore()
 
@@ -407,9 +489,9 @@ class DangerMenu(QMenu):
                 continue
             selected = action is self.activeAction() and action.isEnabled()
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(MENU_SELECTED if selected else MENU_BACKGROUND))
+            painter.setBrush(QColor(tone(MENU_SELECTED if selected else MENU_BACKGROUND)))
             painter.drawRoundedRect(area, 6, 6)
-            painter.setPen(QColor(DANGER))
+            painter.setPen(QColor(tone(DANGER, text=True)))
             painter.setFont(self.font())
             text_area = area.adjusted(12, 0, -24, 0)
             painter.drawText(text_area, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, action.text())
@@ -439,7 +521,7 @@ class NoticeStrip(QFrame):
         self.row.setContentsMargins(14, 10, 10, 10)
         self.row.setSpacing(10)
         mark = QLabel()
-        mark.setPixmap(icon(symbol, color, 18).pixmap(18, 18))
+        bind_icon(mark, symbol, color, 18)
         self.row.addWidget(mark, 0, Qt.AlignmentFlag.AlignTop)
         self.text = QLabel()
         self.text.setWordWrap(True)
@@ -463,7 +545,7 @@ class InfoStrip(QFrame):
         row.setContentsMargins(14, 8, 8, 8)
         row.setSpacing(10)
         mark = QLabel()
-        mark.setPixmap(icon("info", INFO, 18).pixmap(18, 18))
+        bind_icon(mark, "info", INFO, 18)
         row.addWidget(mark, 0, Qt.AlignmentFlag.AlignTop)
         column = QVBoxLayout()
         column.setSpacing(2)
@@ -646,10 +728,10 @@ QPushButton, QToolButton { background: #ffffff; border: 1px solid #d5ded1; borde
 QPushButton:hover, QToolButton:hover { background: #e9efdf; border-color: #abc19f; }
 QPushButton:pressed, QToolButton:pressed { background: #dce8d5; }
 QPushButton:focus, QToolButton:focus { border: 2px solid #286046; }
-QPushButton:disabled, QToolButton:disabled { background: #ebeee7; color: #687566; border-color: #dbe0d4; }
+QPushButton:disabled, QToolButton:disabled { background: #ebeee7; color: #5f6c5d; border-color: #dbe0d4; }
 QPushButton#primary { background: #286046; color: #ffffff; border-color: #286046; padding: 12px 22px; }
 QPushButton#primary:hover { background: #1c4c35; }
-QPushButton#primary:disabled { background: #d4dfd0; color: #51674f; border-color: #d4dfd0; }
+QPushButton#primary:disabled { background: #d4dfd0; color: #4d624b; border-color: #d4dfd0; }
 QPushButton#primary:focus { border: 2px solid #99bd7e; }
 QPushButton#ghost, QToolButton#ghost { background: transparent; border-color: transparent; font-weight: 400; }
 QPushButton#ghost:hover, QToolButton#ghost:hover { background: #e6ecdf; }
@@ -674,7 +756,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: trans
 QMenu { background: #ffffff; color: #233e32; font-size: 14px; border: 1px solid #d5ded1; border-radius: 8px; padding: 6px; }
 QMenu::item { padding: 8px 24px 8px 12px; min-height: 20px; border-radius: 6px; }
 QMenu::item:selected { background: #e3eddf; color: #193d2b; }
-QMenu::item:disabled { color: #687566; }
+QMenu::item:disabled { color: #5f6c5d; }
 QMenu::separator { height: 1px; background: #d5ded1; margin: 5px 8px; }
 QMenu::indicator { width: 18px; height: 18px; padding-left: 6px; }
 QScrollArea#page, QWidget#page, QScrollArea#page > QWidget#qt_scrollarea_viewport { background: #f5f6f1; border: 0; }
@@ -691,5 +773,73 @@ QCheckBox::indicator {{ width: 20px; height: 20px; background: #ffffff; border: 
 QCheckBox::indicator:hover {{ border-color: #286046; }}
 QCheckBox::indicator:checked {{ background: #286046; border-color: #286046; image: url("{CHECK_ICON}"); }}
 QCheckBox::indicator:disabled {{ background: #ebeee7; border-color: #b8c5b6; }}
-QCheckBox:disabled {{ color: #687566; }}
+QCheckBox:disabled {{ color: #5f6c5d; }}
 """
+
+
+def style_sheet() -> str:
+    """STYLE no esquema em vigor."""
+    return toned(STYLE)
+
+
+def windows_is_dark() -> bool:
+    """Modo de aplicativos do Windows: o Qt informa; sem resposta dele, o registro (AppsUseLightTheme)."""
+    reported = QGuiApplication.styleHints().colorScheme()
+    if reported != Qt.ColorScheme.Unknown:
+        return reported == Qt.ColorScheme.Dark
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+    except (ImportError, FileNotFoundError):
+        return False
+
+
+def scheme_palette(base: QPalette, dark: bool) -> QPalette:
+    """Paleta do aplicativo: a do sistema, como sempre, no claro; a escura da paleta do tema no escuro. Os widgets
+    que a folha de estilo não cobre (o texto de uma caixa de mensagem, por exemplo) seguem esta."""
+    result = QPalette(base)
+    if dark:
+        roles = {
+            QPalette.ColorRole.Window: tone("#f5f6f1"), QPalette.ColorRole.Base: tone("#ffffff"),
+            QPalette.ColorRole.AlternateBase: tone("#fafbf7"), QPalette.ColorRole.Button: tone("#ffffff"),
+            QPalette.ColorRole.Highlight: tone("#dfecda"), QPalette.ColorRole.ToolTipBase: tone(INK),
+            QPalette.ColorRole.WindowText: tone(INK, True), QPalette.ColorRole.Text: tone(INK, True),
+            QPalette.ColorRole.ButtonText: tone(INK, True), QPalette.ColorRole.HighlightedText: tone("#193d2b", True),
+            QPalette.ColorRole.ToolTipText: tone("#ffffff", True), QPalette.ColorRole.Link: tone(GREEN, True),
+        }
+        for role, color in roles.items():
+            result.setColor(role, QColor(color))
+        for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
+            result.setColor(QPalette.ColorGroup.Disabled, role, QColor(tone("#5f6c5d", True)))
+    result.setColor(QPalette.ColorRole.PlaceholderText, QColor(tone("#60725f", True)))
+    return result
+
+
+_state = {"base": None, "choice": ("light", "green"), "watching": False}
+
+
+def apply(application: QApplication, theme: str, accent: str, reader=None) -> bool:
+    """Põe o tema ("light", "dark" ou "system") e a cor de destaque na aplicação, na janela que já estiver aberta
+    inclusive. `reader` devolve True quando o Windows está no modo escuro (padrão: `windows_is_dark`). Devolve se o
+    esquema ficou escuro."""
+    if theme not in ("light", "dark", "system"):
+        raise ValueError(f"Tema desconhecido: {theme}")
+    dark = {"light": False, "dark": True}.get(theme)
+    if dark is None:
+        dark = bool((reader or windows_is_dark)())
+    palette.set_scheme(dark, accent)
+    _state["choice"] = (theme, accent)
+    if _state["base"] is None:
+        _state["base"] = application.palette()
+    application.setPalette(scheme_palette(_state["base"], dark))
+    application.setStyleSheet(style_sheet())
+    refresh_widgets()
+    for window in application.topLevelWidgets():
+        if hasattr(window, "retone"):
+            window.retone()
+    if theme == "system" and not _state["watching"]:
+        application.styleHints().colorSchemeChanged.connect(lambda *_: apply(application, *_state["choice"]))
+        _state["watching"] = True
+    return dark
