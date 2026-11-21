@@ -466,6 +466,8 @@ launcher doctor                # ferramentas + todas as conexões, sem gerar tok
 launcher projects add "C:\meus projetos\app" --name "Meu app"
 launcher projects edit "Meu app" --name "App" --path "D:\app"   # só o cadastro muda
 launcher projects import "C:\caminho\config.json"   # só nomes e caminhos
+launcher projects list         # JSON: id, nome, pasta, fixado, último uso, pasta disponível
+launcher projects restore --date 2026-11-20   # devolve os removidos a partir da cópia diária daquele dia
 launcher models --connection OpenRouter --cli claude --search sonnet --refresh
 launcher launch --project "Meu app" --connection OpenRouter --cli codex --model "openai/gpt-6" --dry-run
 launcher launch --project "Meu app" --resume

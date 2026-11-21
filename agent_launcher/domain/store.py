@@ -302,6 +302,40 @@ class Store:
         if selections["projects"].pop(project["id"], None) is not None:
             atomic_json(self.home / SELECTIONS, selections)
 
+    def restore_removed(self, date: str | None = None) -> list[dict]:
+        """Devolve ao cadastro os projetos que constam numa cópia diária e já não estão na lista: a cópia da data
+        (AAAA-MM-DD) ou, sem data, a mais recente que ainda tenha algum. Conexões, chaves e preferências não mudam; a
+        última conexão do projeto só volta se ela ainda existe. Levanta se não há cópia ou nada a restaurar."""
+        pattern = f"config-{date}.json" if date else "config-*.json"
+        copies = sorted(self.backups.glob(pattern), reverse=True)
+        if not copies:
+            raise LauncherError(f"Nenhuma cópia diária de {date} em {self.backups}." if date
+                                else f"Nenhuma cópia diária em {self.backups}.")
+        known = {identifier["id"] for identifier in self.data["connections"]}
+        for copy in copies:
+            try:
+                saved = json.loads(read_text_retrying(copy))["projects"]
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            paths = {path_key(project["path"]) for project in self.data["projects"]}
+            names = {project["name"].casefold() for project in self.data["projects"]}
+            ids = {project["id"] for project in self.data["projects"]}
+            restored = []
+            for project in saved:
+                if path_key(project["path"]) in paths or project["id"] in ids:
+                    continue
+                project = dict(project)
+                if project["name"].casefold() in names:
+                    project["name"] = f"{project['name']} (restaurado)"
+                if project.get("last_connection") not in known:
+                    project["last_connection"] = None
+                self.data["projects"].append(project)
+                restored.append(project)
+            if restored:
+                self.save()
+                return restored
+        raise LauncherError("As cópias diárias não têm nenhum projeto fora do cadastro atual.")
+
     # Última escolha por projeto: claude/codex no config.json, os outros destinos em selections.json
 
     def _selections(self) -> dict:

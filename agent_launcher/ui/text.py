@@ -65,6 +65,15 @@ def show_projects(store: Store) -> None:
         print("  Nenhum projeto cadastrado. Você pode adicionar uma pasta existente.")
 
 
+def projects_json(store: Store) -> str:
+    """Projetos na ordem da interface (fixados primeiro, depois o uso mais recente), em JSON estável para script."""
+    pinned = store.pinned_ids()
+    return json.dumps([{"id": project["id"], "name": project["name"], "path": project["path"],
+                        "pinned": project["id"] in pinned, "last_used": project["last_used"],
+                        "folder_available": Path(project["path"]).is_dir()} for project in store.projects],
+                      ensure_ascii=False, indent=2)
+
+
 def show_connections(store: Store) -> None:
     heading("CONEXÕES")
     modules, errors = store.connectors()
@@ -689,6 +698,9 @@ def parser() -> argparse.ArgumentParser:
     edit.add_argument("--path")
     remove = actions.add_parser("remove", help="Remover cadastro, sem excluir a pasta")
     remove.add_argument("reference", help="Nome, ID ou caminho")
+    actions.add_parser("list", help="Listar os projetos (JSON)")
+    restore = actions.add_parser("restore", help="Devolver projetos removidos a partir de uma cópia diária")
+    restore.add_argument("--date", metavar="AAAA-MM-DD", help="Cópia daquele dia; omitido usa a mais recente com projetos a devolver")
     legacy = actions.add_parser("import", help="Importar nomes e caminhos de outro config.json")
     legacy.add_argument("source", type=Path)
     cli_command = commands.add_parser("cli", help="Ferramentas (Claude Code, Codex, Copilot CLI, VS Code, Copilot app): "
@@ -892,6 +904,11 @@ def main(arguments: list[str] | None = None) -> int:
                 print("Cadastro removido. A pasta do projeto foi preservada.")
             elif options.project_action == "import":
                 import_projects(store, options.source)
+            elif options.project_action == "list":
+                print(projects_json(store))
+            elif options.project_action == "restore":
+                for project in store.restore_removed(options.date):
+                    print(f"Projeto restaurado: {project['name']}\n{project['path']}")
             else:
                 show_projects(store)
         elif options.action == "cli":

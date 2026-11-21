@@ -838,6 +838,23 @@ TRAY_NOTICE_MS = 10_000  # o Windows mostra o balão por tempo próprio; o ícon
 GENERAL_ERROR = "geral"  # origem do erro avulso de uma ação; os erros persistentes têm origem própria
 
 
+class ModelTable(QTableWidget):
+    """Lista de modelos: a coluna do nome ocupa o que sobra das colunas fixas e nunca fica menor que o nome mais
+    comprido (ou NAME_MIN, sem linhas); na janela estreita a tabela rola na horizontal em vez de espremer o nome."""
+
+    NAME_MIN = 200
+    NAME_PADDING = 24
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.fit_name_column()
+
+    def fit_name_column(self) -> None:
+        fixed = sum(self.columnWidth(column) for column in range(1, self.columnCount()))
+        whole_name = self.sizeHintForColumn(0) + self.NAME_PADDING
+        self.setColumnWidth(0, max(self.viewport().width() - fixed, whole_name, self.NAME_MIN))
+
+
 class LauncherWindow(QMainWindow):
     def __init__(self, store: Store | None = None, auto_refresh: bool = True):
         super().__init__()
@@ -1207,12 +1224,12 @@ class LauncherWindow(QMainWindow):
         filters.add(tools, width=lambda: choices_box.minimumSizeHint().width() + tools.box.spacing()
                     + actions_box.minimumSizeHint().width())
         body.addWidget(filters)
-        self.model_table = QTableWidget(0, FIRST_MEDIA_COLUMN + len(MEDIA_COLUMNS))
+        self.model_table = ModelTable(0, FIRST_MEDIA_COLUMN + len(MEDIA_COLUMNS))
         self.model_table.setAccessibleName("Modelos disponíveis: nome, provider, entrada, saída, visão, áudio e vídeo")
         self.model_table.setHorizontalHeaderLabels(["Modelo", "Provider", "Entrada", "Saída", *(title for _, title, _ in MEDIA_COLUMNS)])
         self.model_table.verticalHeader().hide()
         self.model_table.verticalHeader().setDefaultSectionSize(40)
-        self.model_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.model_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.model_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         self.model_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self.model_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -1888,6 +1905,7 @@ class LauncherWindow(QMainWindow):
                 self.model_table.setItem(row, column, self.media_item(title, symbol, getattr(record, field)))
             if record.id == preferred:
                 selected_row = row
+        self.model_table.fit_name_column()
         self.model_table.blockSignals(False)
         if self.records:
             self.model_table.selectRow(selected_row)
@@ -2447,6 +2465,8 @@ class LauncherWindow(QMainWindow):
         if context and self.project and (open_sessions := self.open_sessions_of(self.project["id"])):
             menu.addAction("Ver a tela da sessão aberta…", lambda: self.show_session_screen(open_sessions))
         menu.addAction("Editar…" if context else "Editar projeto…", self.edit_project)
+        if context and self.project:
+            menu.addAction("Copiar caminho", lambda: QApplication.clipboard().setText(self.project["path"]))
         if context and self.project:
             menu.addAction("Desafixar" if self.store.is_pinned(self.project) else "Fixar no topo", self.toggle_pinned)
         menu.add_danger_action("Remover do launcher…", self.remove_project)
