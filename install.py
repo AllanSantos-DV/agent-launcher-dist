@@ -18,6 +18,7 @@ from pathlib import Path
 
 import clis
 import terminal
+from agent_launcher.domain import cache
 from agent_launcher.domain.files import atomic_text, remove_tree, replace_retrying
 from version import APP_NAME, APP_USER_MODEL_ID, VERSION, data_home
 
@@ -28,7 +29,9 @@ MANIFEST = ".install-manifest.json"
 # bootstrap Node (bin/, package.json). terminal/ e .venv/ são da instalação e nunca são apagados por obsolescência.
 BLOCKED = {"__pycache__", ".git", ".github", ".claude", ".vscode", ".memory", ".token-guard", ".venv", "terminal",
            "terminal.old", "tests", "docs", "site", "release", "npm", "dist", "bin", "node_modules",
-           "AGENTS.md", "CLAUDE.md", "install.py", "package.json", ".gitignore", ".gitattributes", MANIFEST}
+           "AGENTS.md", "CLAUDE.md", "install.py", "package.json", ".gitignore", ".gitattributes", "nativo", MANIFEST}
+NATIVE_DIR = "nativo-bin"
+LEFTOVER = ".old-"  # sufixo da imagem em execução renomeada para dar lugar à nova; só existe em NATIVE_DIR
 MIN_PYTHON = (3, 10)
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # instalador iniciado por processo sem console não abre janela
 SHORTCUT = f"{APP_NAME}.lnk"
@@ -89,10 +92,19 @@ _REMOVE_SHORTCUTS = (
 def ships(rel: str) -> bool:
     """O arquivo (caminho relativo à fonte) faz parte do produto instalado? Usado também por release/build_package.py."""
     parts = Path(rel).parts
-    return bool(parts) and not any(part in BLOCKED for part in parts) and not rel.endswith((".log", ".pyc"))
+    return (bool(parts) and not any(part in BLOCKED for part in parts) and not rel.endswith((".log", ".pyc"))
+            and LEFTOVER not in parts[-1])
 
 
 def source_files():
+    """Arquivos a instalar. Num checkout git: os que o git não ignora, mais os executáveis de nativo-bin/ (gerados por
+    nativo/compilar.py); rascunhos e dados de desenvolvimento ignorados ficam fora. Fora do git (pacote npm): a pasta."""
+    if (SOURCE / ".git").exists():
+        listed = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=SOURCE,
+                                check=True, capture_output=True, creationflags=NO_WINDOW).stdout
+        candidates = [rel for rel in listed.decode("utf-8").split("\0") if rel and (SOURCE / rel).is_file()]
+        candidates += [path.relative_to(SOURCE).as_posix() for path in (SOURCE / "nativo-bin").glob("*.exe")]
+        return sorted(rel for rel in candidates if ships(rel))
     files = []
     for current, dirs, names in os.walk(SOURCE):
         dirs[:] = sorted(d for d in dirs if d not in BLOCKED)
@@ -130,6 +142,49 @@ def removable(target, rel):
     return (target / rel).resolve().is_relative_to(Path(target).resolve())  # temp com nome curto (8.3) ou junção não pode barrar
 
 
+def aside_name(path):
+    """Nome único, na mesma pasta, para onde a imagem em execução de `path` é renomeada."""
+    return path.with_name(f"{path.name}{LEFTOVER}{os.getpid()}-{time.time_ns()}")
+
+
+def put(source, dest):
+    """copy2 que cede a um executável nativo em execução no destino: o Windows recusa gravar sobre a imagem de um
+    processo vivo, mas aceita renomeá-la. A antiga sai do caminho com nome único (sweep_leftovers a apaga depois) e a nova
+    ocupa o lugar; se a cópia falhar, a antiga volta."""
+    try:
+        shutil.copy2(source, dest)
+    except PermissionError:
+        if dest.parent.name != NATIVE_DIR or not dest.is_file():
+            raise
+        aside = aside_name(dest)
+        os.replace(dest, aside)
+        try:
+            shutil.copy2(source, dest)
+        except BaseException:
+            os.replace(aside, dest)
+            raise
+
+
+def discard(path):
+    """Apaga o arquivo; um executável nativo em execução é só tirado do caminho (mesmo motivo de `put`)."""
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError:
+        if path.parent.name != NATIVE_DIR:
+            raise
+        os.replace(path, aside_name(path))
+
+
+def sweep_leftovers(target):
+    """Apaga as imagens renomeadas por `put` cujo processo já saiu. A que ainda roda recusa a exclusão e fica para a
+    próxima instalação ou desinstalação."""
+    for path in (target / NATIVE_DIR).glob(f"*{LEFTOVER}*"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 def copy_files(target, files, backup, changed, removed, previous):
     if (target / MANIFEST).is_file():
         shutil.copy2(target / MANIFEST, backup / MANIFEST)
@@ -142,7 +197,7 @@ def copy_files(target, files, backup, changed, removed, previous):
             shutil.copy2(dest, backup / rel)
         changed.append(rel)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, dest)
+        put(source, dest)
         os.utime(dest)  # o npm grava todo arquivo com a mesma data fixa: sem isto o .pyc antigo continuaria valendo
     for rel in sorted(previous - set(files)):
         if not removable(target, rel):
@@ -168,9 +223,9 @@ def clear_bytecode(target):
 def restore(target, backup, changed, removed):
     for rel in changed:
         if (backup / rel).is_file():
-            shutil.copy2(backup / rel, target / rel)
+            put(backup / rel, target / rel)
         else:
-            (target / rel).unlink(missing_ok=True)
+            discard(target / rel)
     for rel in removed:
         if (backup / rel).is_file():
             (target / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -302,10 +357,12 @@ def unregister_file_type(registry=None):
 
 
 def in_use(target):
-    """Executáveis da instalação que estão rodando agora (o Python da venv que abriu o launcher ou uma sessão, o
-    Terminal portátil): o Windows não deixa apagar um .exe em execução. Vale o processo de verdade, não a recusa de abrir."""
+    """Executáveis da instalação que estão rodando agora (o Python da venv que abriu o launcher ou uma sessão, o vigia e
+    a janela de sessão nativos, o Terminal portátil): o Windows não deixa apagar um .exe em execução. O endpoint nativo
+    fica de fora: `stop_endpoints` o para. Vale o processo de verdade, não a recusa de abrir."""
     from agent_launcher.platform import processes
-    executables = [*(target / ".venv" / "Scripts").glob("*.exe"), *terminal.portable_dir(target).rglob("*.exe")]
+    native = [target / "nativo-bin" / f"{name}.exe" for name in ("vigia", "sessao")]
+    executables = [*(target / ".venv" / "Scripts").glob("*.exe"), *terminal.portable_dir(target).rglob("*.exe"), *native]
     return [Path(image) for _pid, image in processes.running_from(executables)]
 
 
@@ -338,6 +395,15 @@ def stop_endpoints(target):
         print(f"Endpoints locais: {stopped} parado(s), {len(removed)} início(s) no logon removido(s).")
 
 
+def prune_cache():
+    """Apaga as versões antigas do cache estável no fim da instalação. A pasta de onde o instalador roda (o atualizador
+    fica no cache da versão antiga) e a do diretório de trabalho ficam; falha só avisa, nunca desfaz a instalação."""
+    try:
+        cache.prune_old_versions(keep=[SOURCE, Path.cwd()])
+    except Exception as error:
+        print(f"Aviso: o cache das versões antigas não foi apagado ({error}).", file=sys.stderr)
+
+
 def uninstall(target, registry=None):
     if not (target / MANIFEST).is_file():
         raise SystemExit(f"{target} não contém uma instalação do {APP_NAME} (sem {MANIFEST}); nada foi removido.")
@@ -346,6 +412,7 @@ def uninstall(target, registry=None):
         raise SystemExit(f"{APP_NAME} está aberto ({busy[0].name} em uso): feche a janela e as sessões abertas por ele e "
                          "rode a desinstalação de novo; nada foi removido.")
     stop_endpoints(target)
+    sweep_leftovers(target)
     powershell(_REMOVE_SHORTCUTS, {"AL_NAME": SHORTCUT})
     try:
         unregister_file_type()
@@ -404,11 +471,13 @@ def main():
     existed = (target / "launcher.pyw").is_file()
     print(("Atualizando" if existed else "Instalando") + f" {APP_NAME} {VERSION} em {target} ({len(files)} arquivos)")
     target.mkdir(parents=True, exist_ok=True)
+    sweep_leftovers(target)
     backup = target.parent / f".agent-launcher-backup-{time.strftime('%Y%m%d-%H%M%S')}"
     backup.mkdir()
     changed, removed = [], []
     try:
         copy_files(target, files, backup, changed, removed, previous)
+        sweep_leftovers(target)
         clear_bytecode(target)
         print(f"Arquivos alterados: {len(changed)}; removidos por obsolescência: {len(removed)}")
         if not args.skip_deps:
@@ -456,6 +525,7 @@ def main():
     for cli in wanted:
         # Instaladores oficiais por usuário; como o Terminal, a falha avisa e não desfaz a instalação do launcher.
         clis.ensure(cli)
+    prune_cache()
     print(f"{APP_NAME} pronto." + ("" if args.no_shortcuts else f" Abra pelo atalho '{APP_NAME}' no Menu Iniciar ou na Área de Trabalho.")
           + ("" if wanted else " As ferramentas (Claude Code, Codex, Copilot CLI, VS Code, Copilot app) se instalam pelo "
                                "cartão de cada uma, na tela do launcher."))

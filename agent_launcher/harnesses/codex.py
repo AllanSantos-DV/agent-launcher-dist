@@ -14,8 +14,8 @@ from agent_launcher.domain.catalog import Catalog, ModelInfo, base_model, codex_
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import atomic_json, path_key
 from agent_launcher.harnesses import installers
-from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines, is_exe,
-                                           key_mcp_urls, native_wrapper, node_script, parse_time, same_folder, unrecognized)
+from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines,
+                                           key_mcp_urls, npm_cli_command, parse_time, same_folder)
 from agent_launcher.platform.jobs import close_job, free_port, kill_with_parent, stop_tree
 from agent_launcher.session import controlled as controlled_state
 from agent_launcher.session.plan import LaunchPlan
@@ -166,6 +166,7 @@ class Codex(Harness):
     BYPASS_RISK = "Executa comandos sem confirmações e sem sandbox no Codex."
     BYPASS_HINT = "Sem sandbox ou confirmações"
     EXECUTABLE = "codex"
+    ENDPOINT_SESSIONS = True
     SCRUB = frozenset({CODEX_KEY_VARIABLE})
     # Pela TUI conectada por --remote, "resume --last" pega a conversa mais recente de qualquer pasta (verificado no
     # 0.169): a de outro projeto, presa pela sessão dele, abre só de leitura ("open in another app").
@@ -193,12 +194,7 @@ class Codex(Harness):
         return f"Entrada declarada: {budget} tokens", "Contexto informado pelo host. O Codex mantém sua margem interna."
 
     def command_for(self, path: Path, repair: bool = True) -> list[str]:
-        if is_exe(path):
-            return [str(path)]
-        command = node_script(path, "@openai/codex/bin/codex.js") or native_wrapper(path)
-        if command is None:
-            raise unrecognized(path)
-        return command
+        return npm_cli_command(path, "@openai/codex/bin/codex.js")
 
     def connection_url(self, gateway) -> str:
         return gateway.targets["codex"] or ""
@@ -206,12 +202,16 @@ class Codex(Harness):
     def plan(self, context) -> LaunchPlan:
         gateway, catalog, selected, model = context.gateway, context.catalog, context.selected, context.model
         warnings, command = context.warnings, context.command
-        overrides = {CODEX_KEY_VARIABLE: gateway.token}
+        token, base_url = gateway.token, gateway.targets["codex"]
+        if context.endpoint:
+            from agent_launcher.endpoint.registry import PLACEHOLDER_KEY
+            token, base_url = PLACEHOLDER_KEY, context.endpoint.url + "/v1"
+        overrides = {CODEX_KEY_VARIABLE: token}
         provider = f"model_providers.{CODEX_PROVIDER}"
         options = {
             "model_provider": CODEX_PROVIDER,
             f"{provider}.name": gateway.name,
-            f"{provider}.base_url": gateway.targets["codex"],
+            f"{provider}.base_url": base_url,
             f"{provider}.env_key": CODEX_KEY_VARIABLE,
             f"{provider}.wire_api": "responses",
             f"{provider}.requires_openai_auth": False,
@@ -246,9 +246,17 @@ class Codex(Harness):
             command += ["-c", f"projects={{{json.dumps(str(context.directory), ensure_ascii=True)}={{trust_level=\"trusted\"}}}}"]
         return LaunchPlan(self.ID, model, context.directory, command, context.environment, overrides, context.input_limit,
                           context_window, auto_compact_limit, {}, warnings, context.controlled, gateway.name,
-                          (CODEX_KEY_VARIABLE,), vision=selected.vision)
+                          () if context.endpoint else (CODEX_KEY_VARIABLE,), vision=selected.vision)
 
-    def final_command(self, plan, directory: Path) -> tuple[list[str], str]:
+    def session_files_key(self, plan) -> object | None:
+        """O catálogo depende do modelo, do contexto, da visão e do Codex instalado (o catálogo nativo muda com ele)."""
+        if not needs_catalog(plan):
+            return None
+        return {"model": plan.model, "context_window": plan.context_window, "vision": plan.vision,
+                "codex": [_file_identity(part) for part in self.command() if os.path.isfile(part)]}
+
+    def final_command(self, plan, directory: Path | None) -> tuple[list[str], str]:
+        """Comando com o catálogo nativo do modelo (`model_catalog_json`) quando o plano o pede; (comando, aviso)."""
         return prepare_codex_command(plan, directory, self.command)
 
     def ensure_resumable(self, plan) -> None:
@@ -256,12 +264,16 @@ class Codex(Harness):
             free_conversation(plan.session_id)
 
     def prepare(self, plan) -> None:
+        self.ensure_endpoint(plan)
         self.ensure_resumable(plan)
 
     def run(self, plan, project: dict) -> int:
         if plan.controlled:
             return run_controlled_codex(plan, project["name"])
         return super().run(plan, project)
+
+    def hosts_itself(self, plan) -> bool:
+        return plan.controlled
 
     def dry_run_extra(self, plan) -> dict:
         if not plan.controlled:
@@ -351,13 +363,27 @@ def approve_codex_hooks(directory: Path, environment: dict | None = None, comman
         stop_tree(process)
 
 
-def prepare_codex_command(plan: LaunchPlan, directory: Path, resolve=None) -> tuple[list[str], str]:
-    """Catálogo nativo temporário para o Codex aplicar ao ID com prefixo de provider o contexto do host e se o modelo
-    aceita imagem (input_modalities). Sem metadados nativos correspondentes (modelo de outro fornecedor via roteador),
-    segue sem o catálogo e avisa."""
+def needs_catalog(plan: LaunchPlan) -> bool:
+    """O plano pede catálogo nativo (contexto do host ou se o modelo aceita imagem)?"""
+    return plan.cli == "codex" and (plan.context_window is not None or plan.vision is not None)
+
+
+def _file_identity(path: str) -> tuple[str, int, int]:
+    status = os.stat(path)
+    return path, status.st_size, status.st_mtime_ns
+
+
+def prepare_codex_command(plan: LaunchPlan, directory: Path | None, resolve=None) -> tuple[list[str], str]:
+    """Catálogo nativo para o Codex aplicar ao ID com prefixo de provider o contexto do host e se o modelo aceita imagem
+    (input_modalities), gravado em `directory` (a pasta estável da entrada, ver `session_files_key`) e reusado quando já
+    está lá. Sem metadados nativos correspondentes (modelo de outro fornecedor via roteador), segue sem o catálogo e avisa."""
     command = list(plan.command)
-    if plan.cli != "codex" or (plan.context_window is None and plan.vision is None):
+    if not needs_catalog(plan):
         return command, ""
+    catalog_path = directory / "codex-model-catalog.json"
+    option = ["-c", "model_catalog_json=" + json.dumps(str(catalog_path), ensure_ascii=True)]
+    if catalog_path.is_file():
+        return command + option, ""
     needs_context = plan.context_window is not None
     environment = dict(plan.environment)
     environment["CODEX_HOME"] = str(directory / "native-config")
@@ -398,10 +424,8 @@ def prepare_codex_command(plan: LaunchPlan, directory: Path, resolve=None) -> tu
     if plan.vision is not None:
         modalities = [item for item in record.get("input_modalities") or ["text"] if item != "image"]
         record["input_modalities"] = modalities + (["image"] if plan.vision else [])
-    catalog_path = directory / "codex-model-catalog.json"
     atomic_json(catalog_path, {"models": [record]})
-    command += ["-c", "model_catalog_json=" + json.dumps(str(catalog_path), ensure_ascii=True)]
-    return command, ""
+    return command + option, ""
 
 
 def controlled_codex_commands(plan: LaunchPlan, url: str, token_sha256: str = "<sha256>") -> tuple[list[str], list[str]]:
@@ -454,7 +478,7 @@ def run_controlled_codex(plan: LaunchPlan, project: str) -> int:
                     raise LauncherError("O app-server do Codex não ficou pronto em 30 s.")
                 time.sleep(0.3)
         controlled_state.CODEX_CONTROLLED_DIR.mkdir(parents=True, exist_ok=True)
-        atomic_json(registry, {"project": project, "cwd": str(plan.directory), "url": url, "pid": os.getpid(),
+        atomic_json(registry, {"project": project, "cwd": str(plan.directory), "url": url, "pid": plan.window_pid or os.getpid(),
                               "serverPid": server.pid, "token": token, "startedAt": time.time()})
         tui = subprocess.Popen(tui_command, cwd=plan.directory, env={**plan.environment, "ORQ_CODEX_TOKEN": token}, shell=False)
         while True:

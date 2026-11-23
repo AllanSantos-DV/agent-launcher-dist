@@ -35,6 +35,21 @@ Um conector é um módulo Python com:
            supports_function_calling, supports_responses_api, supports_vision, supports_audio_input,
            supports_video_input); host sem nenhuma das duas rotas tem os mesmos campos lidos da raiz
            de cada item de /v1/models. contexto_confirmado é True quando algum modelo traz a entrada.
+  SEGREGATES_SOURCES  (opcional, bool; ausente = False) o conector se declara com segregação por fonte: cada modelo
+           pertence a UMA fonte, dita em ModelInfo.source, com o nome exato que o conector quer ver na tela. Só então o
+           launcher guarda e mostra a fonte (coluna, filtro, `models --source`, campo `source` do /v1/models). Fonte não é
+           provider: é o caminho de acesso pelo qual o modelo é alcançado. O launcher não cadastra, junta nem renomeia
+           fontes; o mesmo modelo por duas fontes são dois ids distintos, escolhidos pelo conector. models() que traz
+           um id com 2+ fontes é recusado com ConnectorError. Sem a declaração a fonte é descartada ao gravar o catálogo.
+  costs(options, month) -> dict   (opcional; só vale com SEGREGATES_SOURCES = True) o custo do mês por fonte, dado pelo
+           conector: o launcher não sabe de onde vem e não estima nada. `month` é "AAAA-MM". Devolve
+             {"currency": "USD", "sources": [{"source": str, "cost": número, "limit": número ou None,
+                                              "tokens_in": inteiro ou None, "tokens_out": inteiro ou None}]}
+           `currency` é o código da moeda de `cost` e de `limit`; `source` repete o nome dado em ModelInfo.source, uma
+           vez só por fonte; `cost` e `limit` não são negativos (`limit` None: a fonte não tem teto); os tokens são
+           inteiros não negativos ou None. Formato fora disso levanta ConnectorError no uso (fonte repetida, custo não
+           numérico ou negativo...). Falha de rede: ConnectorError, como em models(). Só `usage --by-source` e o diálogo
+           "Uso do mês" chamam costs(), e só com a rota presente; sem ela não há custo por fonte em lugar nenhum.
 
 Várias conexões e perfis:
   - O mesmo conector serve quantas conexões o usuário quiser; cada conexão guarda as suas opções e a sua chave.
@@ -51,8 +66,9 @@ Um arquivo que falha ao carregar aparece com o erro e não afeta os outros.
 from __future__ import annotations
 
 import importlib
-import importlib.util
 from pathlib import Path
+
+from agent_launcher.domain.user_modules import load_user_modules
 
 PROTOCOLS = ("messages", "responses", "chat_completions")
 LEGACY = {"claude": "messages", "codex": "responses"}
@@ -106,13 +122,72 @@ BUILTIN_NAMES = ("litellm", "ninerouter", "omniroute", "openrouter", "anthropic"
 BUILTIN = tuple(importlib.import_module(f"{__name__}.{name}") for name in BUILTIN_NAMES)
 
 
+def declares_sources(module) -> bool:
+    """O conector declara segregação por fonte (`SEGREGATES_SOURCES = True` no módulo)? Ausente vale False."""
+    return getattr(module, "SEGREGATES_SOURCES", False) is True
+
+
+def offers_costs(module) -> bool:
+    """O módulo tem a rota opcional `costs(options, month)`?"""
+    return callable(getattr(module, "costs", None))
+
+
+def _amount(value, name: str, where: str, *, integer: bool = False) -> int | float:
+    """Número finito e não negativo (inteiro, se `integer`); ConnectorError diz qual campo corrigir."""
+    kind = int if integer else (int, float)
+    if isinstance(value, bool) or not isinstance(value, kind) or value != value or value in (float("inf"), float("-inf")):
+        raise ConnectorError(f"costs(): {where}: {name} precisa ser um número {'inteiro ' if integer else ''}"
+                             f"não negativo, não {value!r}.")
+    if value < 0:
+        raise ConnectorError(f"costs(): {where}: {name} não pode ser negativo ({value!r}).")
+    return value
+
+
+def normalize_costs(raw) -> dict:
+    """Resposta de `costs()` conferida contra o contrato e levada ao formato completo (campos ausentes de `limit`,
+    `tokens_in` e `tokens_out` viram None; chaves desconhecidas somem). ConnectorError acionável se malformada."""
+    if not isinstance(raw, dict):
+        raise ConnectorError(f"costs() precisa devolver um dicionário com currency e sources, não {type(raw).__name__}.")
+    currency = raw.get("currency")
+    if not isinstance(currency, str) or not currency.strip():
+        raise ConnectorError("costs(): currency precisa ser o código da moeda (por exemplo \"USD\").")
+    sources = raw.get("sources")
+    if not isinstance(sources, list):
+        raise ConnectorError("costs(): sources precisa ser uma lista de fontes.")
+    found, seen = [], set()
+    for index, item in enumerate(sources):
+        where = f"sources[{index}]"
+        if not isinstance(item, dict):
+            raise ConnectorError(f"costs(): {where} precisa ser um dicionário com source e cost.")
+        name = item.get("source")
+        if not isinstance(name, str) or not name.strip():
+            raise ConnectorError(f"costs(): {where}: source precisa ser o nome da fonte.")
+        if name in seen:
+            raise ConnectorError(f"costs(): a fonte {name!r} aparece mais de uma vez; some o custo dela numa linha só.")
+        seen.add(name)
+        where = f"fonte {name!r}"
+        entry = {"source": name, "cost": _amount(item.get("cost"), "cost", where), "limit": None,
+                 "tokens_in": None, "tokens_out": None}
+        if item.get("limit") is not None:
+            entry["limit"] = _amount(item["limit"], "limit", where)
+        for field in ("tokens_in", "tokens_out"):
+            if item.get(field) is not None:
+                entry[field] = _amount(item[field], field, where, integer=True)
+        found.append(entry)
+    return {"currency": currency.strip(), "sources": found}
+
+
 def _check(module, origin: str):
     for attribute in ("NAME", "LABEL", "FIELDS"):
         if not getattr(module, attribute, None):
             raise ValueError(f"{origin}: falta {attribute}")
+    if not isinstance(getattr(module, "SEGREGATES_SOURCES", False), bool):
+        raise ValueError(f"{origin}: SEGREGATES_SOURCES precisa ser True ou False")
     for function in ("targets", "verify", "models"):
         if not callable(getattr(module, function, None)):
             raise ValueError(f"{origin}: falta a função {function}()")
+    if hasattr(module, "costs") and not offers_costs(module):
+        raise ValueError(f"{origin}: costs precisa ser a função costs(options, month)")
     for item in module.FIELDS:
         if not isinstance(item, dict) or not item.get("name") or not item.get("label"):
             raise ValueError(f"{origin}: cada item de FIELDS precisa de name e label")
@@ -122,19 +197,12 @@ def _check(module, origin: str):
 def available(user_dir: Path | None = None) -> tuple[dict, list[str]]:
     """({NAME: módulo}, [erros de carga]) com os embutidos e os do usuário."""
     found = {module.NAME: module for module in BUILTIN}
-    errors = []
-    if user_dir is None or not user_dir.is_dir():
-        return found, errors
-    for path in sorted(user_dir.glob("*.py")):
-        try:
-            spec = importlib.util.spec_from_file_location(f"agent_launcher_connector_{path.stem}", path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            _check(module, path.name)
-            if module.NAME in found:
-                raise ValueError(f"NAME {module.NAME!r} já existe")
-            found[module.NAME] = module
-        except Exception as error:
-            errors.append(f"{path.name}: {type(error).__name__}: {error}")
-    return found, errors
+
+    def accept(module, name):
+        _check(module, name)
+        if module.NAME in found:
+            raise ValueError(f"NAME {module.NAME!r} já existe")
+        found[module.NAME] = module
+
+    return found, load_user_modules(user_dir, "agent_launcher_connector", accept)
 

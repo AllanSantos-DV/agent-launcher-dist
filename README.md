@@ -11,7 +11,7 @@ de catálogo fixo no código. A lista mostra, para cada modelo, se ele aceita im
 o host diz que aceita, ícone riscado quando diz que não e traço quando o conector não informou.
 O filtro "Entrada" lista só os modelos com visão, áudio ou vídeo; o modelo escolhido que o host diz não aceitar imagem
 ganha um aviso; **Ordenar** põe a lista por nome (a ordem de sempre), por contexto (maior primeiro) ou por preço de entrada
-(menor primeiro), com o que o host não informou sempre no fim; **Copiar lista** copia a lista filtrada, separada por tabulação. O que o host informa sobre imagem também
+(menor primeiro), com o que o host não informou sempre no fim; **Copiar lista** copia a lista filtrada, separada por tabulação; o botão direito num modelo oferece **Copiar ID**, que copia o ID completo dele, e **Testar modelo (1 token)…**, que mostra o custo em tokens e só faz a chamada real de 1 token depois de **Testar** (Cancelar é o padrão; nunca roda sozinho). O que o host informa sobre imagem também
 vai para o chat do VS Code (anexar imagem) e para o Codex (modelo declarado só de texto não recebe imagem); `launcher models`
 mostra visão, áudio e vídeo só do que o host informou.
 A lista também traz a saída máxima e, na dica e na cópia, o preço por 1M de tokens (traço quando o host não informa). A lista de
@@ -58,6 +58,12 @@ opções, `launcher preferences --auto-update off` ou `AGENT_LAUNCHER_NO_AUTO_UP
 `launcher update` (`--check` só consulta). O Diagnóstico mostra também quanto levou cada fase da última abertura (import, janela, primeira
 pintura, catálogo e versões das CLIs), gravada em `~/.agent-launcher/abertura.log`. Quem está na 1.0.4 ou anterior atualiza uma última vez à mão, rodando de
 novo o comando de instalação acima.
+
+**O que mudou:** o pacote de cada versão leva a nota dela (`docs/release/RELEASE-X.Y.Z.md`, copiada pelo
+`release/build_package.py` para `agent_launcher/ui/novidades.md`; sem a nota o pacote não é montado). Na primeira abertura
+da interface depois de atualizar, o launcher mostra essa nota uma vez, numa janela dele (a mesma das instruções), e guarda
+a versão vista em `~/.agent-launcher/novidades-vistas.txt`. Uma instalação feita do checkout, sem o pacote, não tem a nota
+e não mostra nada.
 
 Desinstalar: `npx @allansantos-dev/agent-launcher@latest install --uninstall`. Remove o app e os atalhos; seus dados
 ficam em `~/.agent-launcher`.
@@ -138,7 +144,36 @@ por conexão, a partir de 47910), descarta qualquer credencial que o destino man
 ao host com streaming. Trocar a chave ou o host no launcher vale na próxima requisição, sem mexer no destino. O endpoint
 sobe ao abrir o destino e encerra sozinho após 4 h sem uso; `launcher endpoint autostart --connection NOME` faz ele
 subir com o Windows (sem janela, sem admin), para o VS Code e o app acharem a conexão com o launcher fechado. O log
-(`~/.agent-launcher/endpoint.log`) tem rota, modelo, status e duração; nunca corpo, prompt ou chave.
+(`~/.agent-launcher/endpoint.log`) tem rota, modelo, status e duração; nunca corpo, prompt ou chave; `launcher endpoint logs [--lines N] [--summary]` mostra o fim dele (com `--summary`, o resumo: pedidos, erros por modelo, failovers e latência). Além de repassar, o endpoint
+responde `GET /usage` (o uso do mês do perfil em JSON, só números; `?month=AAAA-MM` escolhe o mês e `?all=1` soma os
+perfis) e `GET /v1/models?capability=vision|audio|video|tools`, que lista só os modelos com a capacidade confirmada pelo
+catálogo (valor repetido ou separado por vírgula exige todas; valor desconhecido dá 400). Cada item de `/v1/models`
+traz `source`, o nome da fonte exatamente como o conector declarou, só quando o conector da conexão declara fontes e o
+modelo tem uma (sem fonte, o campo não vem).
+
+**Conexão reserva.** Uma conexão pode ter outra como reserva. Quando a conexão atendida responde cota ou crédito
+esgotado (HTTP 429 com código de cota, ou 402 de pagamento, a mesma detecção do teste de conexão) antes de entregar
+qualquer byte da resposta, o endpoint refaz o mesmo pedido, uma vez só, na reserva (com a chave dela) e marca a primeira
+como "cota esgotada". Enquanto a marca vale (10 minutos, contados da hora gravada nela), os pedidos vão direto à reserva,
+sem tocar na primeira; passado o prazo, o pedido seguinte tenta a primeira de novo: se ela ainda está sem cota a marca
+recomeça o prazo, se respondeu a marca sai. Um teste bem-sucedido da conexão também a tira (o endpoint vê a mudança em poucos segundos). Reserva que também
+responde sem cota é marcada do mesmo jeito e devolve o erro dela (com as duas marcadas, tenta-se a primeira como antes);
+resposta em streaming já iniciada nunca é refeita; sem reserva, o erro do host é repassado como sempre. O `endpoint.log`
+ganha uma linha `failover <de> -> <para> motivo=<429|402>` (ou `motivo=cota marcada` no pedido direto), sem corpo nem chave. A reserva se define em **Gerenciar conexões** (seletor
+**Conexão reserva** e **Salvar**) ou por `launcher connections --set-fallback NOME --to RESERVA` (`--clear-fallback NOME`
+tira); a própria conexão, um ciclo ou uma conexão inexistente são recusados.
+
+**Sessões de terminal pelo endpoint local (opt-in, por conexão).** Por padrão o Claude Code e o Codex vão direto ao
+host da conexão, com a chave no ambiente da sessão, como sempre. Com a preferência ligada (caixa **Abrir sessões de
+terminal pelo endpoint local**, desmarcada por padrão, logo abaixo do painel do endpoint em **Gerenciar conexões**, ou `launcher connections --endpoint-sessions
+on --connection NOME`; `off` volta ao caminho direto) as duas CLIs passam a falar com o endpoint local da conexão:
+o launcher o sobe ao abrir a sessão, aponta o Claude Code para o endereço sem `/v1` e o Codex para o endereço com `/v1`, e
+a chave que vai no ambiente é um texto fixo sem valor (o endpoint acrescenta a credencial real). Com isso o `endpoint.log`
+e a **Conexão reserva** (failover por cota esgotada) passam a valer também para a sessão. Se o endpoint não sobe, a
+abertura é recusada com o motivo, sem cair para o host às escondidas. O resumo do plano (olho) e `launch --dry-run` mostram o
+endereço do endpoint local; o Copilot CLI segue direto. O uso da sessão vem das conversas, como antes: o endpoint reconhece
+o Claude Code e o Codex pelo `User-Agent` e o Uso do mês não soma essas linhas de novo, então a sessão conta uma vez só (VS Code
+e Copilot app continuam somando do endpoint). `launcher connections` marca com "sessões pelo endpoint" a conexão que tem a preferência ligada.
 
 - **VS Code:** o launcher abre o projeto num perfil próprio, **Agent Launcher** (criado pelo VS Code na primeira
   vez), e grava nele os modelos da conexão (`chatLanguageModels.json`, provider Custom Endpoint) e o modelo escolhido
@@ -162,15 +197,40 @@ cada perfil ficam num arquivo próprio. Quem não cria perfil continua no **Padr
 - Conectores do usuário (`~/.agent-launcher/connectors`) valem para todos os perfis.
 - **Importar perfil…** (ou duplo clique num arquivo `.alprofile`) cria o perfil pronto, com conexões e conectores;
   **Exportar perfil…** gera esse arquivo. O arquivo nunca leva chave: se a conexão pede uma, o launcher pergunta.
+- **Compartilhar sem chave…** (painel Conexões) grava só a conexão selecionada num arquivo `.alprofile` (o mesmo formato do perfil,
+  sem chave nem valor de chave); no modo texto, `launcher connections export CONEXAO ARQUIVO` e `launcher connections import ARQUIVO`
+  (nome já usado é recusado, a chave fica por preencher).
 - **Remover perfil** (ou conexão) oferece tirar também o provider do Copilot app e do VS Code e parar o endpoint local.
 - **Uso do mês…**: tokens e custo estimado por destino e modelo, lidos das conversas e do endpoint deste perfil. Com mais de
   um perfil, **Somar todos os perfis** junta o uso de todos numa tabela só.
   É estimativa local; o custo usa o preço que o host informa no catálogo. **Copiar relatório** copia a tabela com os
   valores separados por tabulação: colada numa planilha, cada valor cai na sua coluna.
+- **Limite mensal** (campo no **Uso do mês…**, com **Salvar**): teto de gasto do mês, por perfil, em US$. A faixa de
+  avisos da janela (âmbar) avisa ao chegar a 80% e a 100% dele. Nasce desligado (campo vazio, ou `off`) e só avisa:
+  nada é bloqueado. O gasto é o custo estimado do mês; modelo sem preço fica fora da conta e o aviso diz **soma parcial**.
+  O valor fica no `config.json` do perfil (`preferences.monthly_limit`); sem o campo, o limite está desligado.
+  Cada nível também vira um balão na bandeja do Windows, com o mesmo texto da faixa, uma vez por nível em cada mês e mesmo com
+  a janela minimizada ou sem foco (o balão não puxa o foco nem abre janela). Mudar o limite no mês recomeça os avisos:
+  o nível já avisado vale só para o limite em que foi dado. Nível e limite avisados de cada mês ficam só no
+  `selections.json` do perfil.
+  Se a conexão da janela tem um conector que declara fontes e oferece a rota `costs` (veja o contrato em
+  `connectors/__init__.py`) e uma fonte traz `limit` maior que zero, cada fonte também avisa por balão a 80% e a 100% do
+  limite dela, com o nome da fonte, o custo, o limite, a porcentagem e a moeda do conector (`Limite da fonte X do mês perto do
+  limite: US$ 80,00 de US$ 100,00 (80%).`; com mais de uma conexão no perfil o texto nomeia também a conexão, `Limite da fonte
+  X (conexão Y) do mês perto do limite: ...`). O custo e o limite vêm só do conector: o launcher não calcula nada por fonte. A
+  leitura roda em segundo plano, na mesma checagem do teto (a cada 10 minutos) e de novo na hora em que se troca de conexão ou
+  de perfil na janela; falha do conector aparece como aviso na faixa âmbar com a mensagem dele, nunca como balão. É
+  independente do limite mensal do perfil, que segue igual e pode estar desligado. O nível avisado vale por conexão, fonte e
+  limite: duas conexões com a mesma fonte avisam cada uma o seu, e mudar o limite recomeça o aviso só daquele par; os níveis
+  ficam no mesmo registro do `selections.json`. Sem a rota, sem a declaração de fontes ou sem `limit` não há balão novo.
 - A aba do Terminal usa a cor do perfil (**Cor do perfil…**, também no Padrão). Sem cor escolhida, o Padrão fica com
   a cor de cada CLI (laranja no Claude).
 - Modo texto: `launcher profiles [list|add NOME|rename|remove|use|import ARQUIVO|export REF ARQUIVO]`,
-  `launcher usage [--month AAAA-MM]` e `launcher --profile NOME <comando>`.
+  `launcher usage [--month AAAA-MM] [--all] [--tsv] [--by-source [--connection X]]` (`--all` soma os perfis; `--tsv` imprime o mesmo texto do
+  **Copiar relatório**; `--by-source` imprime o custo do mês por fonte que o conector da conexão informa pela rota `costs`, na
+  moeda dele, e falha se o conector não declara fontes ou não oferece a rota), `launcher usage --limit VALOR|off` (grava ou desliga o limite mensal do perfil; com o limite
+  ligado, o JSON de `usage` e o de `status` ganham `limit` com valor, gasto, percentual, nível e se a soma é parcial),
+  `launcher status` e `launcher --profile NOME <comando>`.
 - Os perfis extras ficam em `~/.agent-launcher/profiles/<id>/`; o orquestrador lista e abre projetos de todos.
 
 ## Conexões
@@ -185,7 +245,8 @@ o resultado de cada uma (ok, chave recusada, host fora do ar, cota esgotada, agu
 as outras. **Copiar lista** copia nome, conector, endereço, padrão e estado de cada conexão, separados por tabulação; a chave
 nunca vai junto.
 Conexão usada pelo VS Code ou pelo Copilot app mostra o endpoint local dela: porta, rodando ou parado, requisições,
-**Iniciar/Parar** e **Iniciar com o Windows**.
+**Iniciar/Parar** e **Iniciar com o Windows**; **Copiar endereço** copia o endereço base do endpoint (sem chave: o endpoint acrescenta a credencial) para colar no campo de endereço de outra ferramenta, e fica desabilitado com o endpoint parado; **Copiar configuração** (menu **PowerShell** ou **cmd**, também desabilitado com o endpoint parado) copia as variáveis de ambiente para outra ferramenta usar o endpoint, só dos protocolos que a conexão serve: `ANTHROPIC_BASE_URL` com o endereço sem `/v1` e `ANTHROPIC_API_KEY` (Messages), `OPENAI_BASE_URL` com o endereço terminado em `/v1` e `OPENAI_API_KEY` (Responses e Chat Completions); a chave é um texto fixo sem valor (o endpoint descarta a do cliente e acrescenta a da conexão), e o endereço copiado antes continua igual; **Ver log** abre o fim do `endpoint.log` do perfil, sem corpo nem chave, com Atualizar e Copiar, e um **resumo** acima do log (pedidos, erros 4xx e 5xx, failovers feitos e não feitos, latência média e maior, e os cinco modelos mais usados com pedidos, erros e latência), calculado só sobre as linhas mostradas: o log tem teto de tamanho e guarda só o fim, então o resumo não cobre o que já saiu dele; o texto do log e o Copiar não mudam. Abaixo da lista, **Conexão reserva** escolhe a conexão que o endpoint local
+usa quando a selecionada fica sem cota; salvar grava na hora, e ao reabrir a tela o seletor mostra o valor gravado.
 
 | Conector | Claude Code | Codex | Modelos | Contexto |
 | --- | --- | --- | --- | --- |
@@ -234,6 +295,9 @@ launcher connections add --name "Meu proxy" --connector litellm --set base_url=h
 $env:OR_KEY = "sk-or-..."; launcher connections add --name OpenRouter --connector openrouter --secret-env api_key=OR_KEY
 launcher connections default "Meu proxy"
 launcher connections test OpenRouter
+launcher connections --set-fallback "Meu proxy" --to OpenRouter   # reserva usada pelo endpoint local se a cota acabar
+launcher connections --clear-fallback "Meu proxy"
+launcher connections --endpoint-sessions on --connection "Meu proxy"   # Claude Code e Codex pelo endpoint local (off volta ao direto)
 ```
 
 Chaves nunca vão na linha de comando: `--secret-env` lê de uma variável de ambiente, e sem ela o comando pergunta de
@@ -249,20 +313,27 @@ também não as mistura com as do launcher. A última conversa do Codex é retom
 se ela estiver aberta em outra janela ou programa, a sessão não abre e o aviso diz onde ela está (uma sessão que já
 fechou e deixou o Codex preso é liberada sozinha). A seta ao lado abre **Escolher conversa…**: a lista das
 conversas do projeto (data, título, mensagens, contexto e custo estimado) para retomar qualquer uma, não só a última; o campo
-acima da lista filtra por título, data ou CLI e **Copiar lista** copia as linhas à vista, separadas por tabulação. Em modo texto:
-`launcher conversations --project X` e `launch --resume --conversation ID`. Sem conversa anterior (inclusive numa sessão aberta pelo orquestrador), a retomada vira
+acima da lista filtra por título, data ou CLI e **Copiar lista** copia as linhas à vista, separadas por tabulação.
+**Copiar comando de retomada** copia, para a conversa selecionada, o comando do cmd que a continua num terminal seu (SSH,
+outro shell): vai à pasta do projeto, limpa do shell as variáveis que o launcher tira do ambiente das sessões, define o
+ambiente da conexão e roda o CLI com o modelo escolhido na tela; é o mesmo plano do botão **Retomar** e do `--dry-run`, que
+segue como está. **Copiar para PowerShell**, ao lado, copia o mesmo comando escrito para o PowerShell (5.1 ou 7). A chave
+nunca vai no texto: no lugar dela fica `<sua chave>`, na variável de ambiente que o CLI lê. Vale para Claude Code, Codex e
+Copilot CLI. Em modo texto:
+`launcher conversations --project X` e `launch --resume --conversation ID`.
+**Reabrir sessões recentes…**, no mesmo menu da seta (e em `Ctrl+Shift+H`, que vale mesmo sem conversa no projeto selecionado), serve para depois de reiniciar o Windows: lista as sessões abertas nas últimas 24 horas que não estão abertas agora, uma por projeto e CLI (a mais recente), e reabre as que você marcar, em sequência, cada uma na própria conversa, como aba da mesma janela do Terminal e sem tirar o foco de quem está trabalhando; o resumo diz quantas abriram e, de cada uma que falhou, o motivo, e uma falha não impede as outras. O Claude Code retoma pelo id exato da conversa. O Codex e o Copilot CLI não guardam o id na abertura: vale a conversa que começou até 10 minutos depois dela, e só quando nenhuma outra abertura da pasta disputa essa conversa. Sem essa certeza a linha vem desmarcada e desabilitada, com o motivo ("conversa não identificada"), e nunca retoma outra conversa; o mesmo vale para o Claude Code aberto por **Retomar última** (sem id gravado). Cada sessão reabre com a conexão e o modelo da abertura, sem bypass. **Retomar última** e **Escolher conversa…** não mudam. Sem conversa anterior (inclusive numa sessão aberta pelo orquestrador), a retomada vira
 sessão nova, com um aviso na janela, em vez de parar em "No conversation found to continue". Com o Windows Terminal instalado, cada sessão vira
 uma aba da janela **agent-launcher** (laranja para Claude Code, verde para Codex), com o título
-**Projeto — Claude Code/Codex**; sem ele, cada sessão abre num console próprio. A sessão confere a conexão antes de iniciar. Fechar o launcher não encerra as
+**Projeto — Claude Code/Codex**; sem ele, cada sessão abre num console próprio. A sessão confere a conexão antes de iniciar. Com a cota da conexão esgotada a sessão abre mesmo assim, e o aviso diz qual é a **Conexão reserva** configurada, se houver: é só o aviso, a sessão não troca de conexão sozinha (para usar a reserva, abra a sessão por ela) e a reserva segue valendo apenas para o endpoint local. Se o modelo escolhido, como o lembrado do projeto, não está mais no catálogo da conexão, o plano traz o aviso "não está no catálogo" (também no olho e no `--dry-run`); a sessão abre como antes, e hosts que aceitam qualquer ID não o mostram. Fechar o launcher não encerra as
 sessões. Quando uma sessão termina com o launcher minimizado ou sem foco, o Windows mostra um aviso na bandeja com a mesma
 mensagem do rodapé; o ícone da bandeja só existe enquanto há sessão aberta ou aviso a mostrar. A lista de projetos fica do mais
 recente para o mais antigo e se reordena a cada abertura, com os projetos fixados no topo; projeto com sessão
 aberta agora (por esta ou por outra janela do launcher) aparece com "· aberta" ou "· 2 abertas", e a dica diz quais CLIs.
 O botão direito em um projeto abre a pasta, abre no VS Code (só com o VS Code instalado, no seu perfil normal), mostra
-**a tela da sessão aberta** (só leitura: nada é digitado nela e a janela dela não vem para a frente), edita (nome e pasta),
+**a tela da sessão aberta** (a tela é só leitura e a janela dela não vem para a frente; o botão **Enviar**, ao lado do campo **Teclas a enviar**, responde um diálogo parado da sessão com as mesmas fichas do `launcher keys`, e só envia quando você clica: nunca ao abrir, ao atualizar nem por timer), edita (nome e pasta),
 **fixa no topo** (ou desafixa; o fixado aparece com um alfinete no lugar da pasta) ou remove o cadastro. O botão do olho ao lado de **Retomar última** mostra, antes de abrir, o que a nova sessão vai iniciar
-(comando, conexão, modelo, ambiente e avisos, sem a chave). `Ctrl+K` busca projetos, `Ctrl+F` modelos, `Ctrl+N` adiciona
-projeto, `F5` atualiza o catálogo, `Ctrl+R` retoma a última conversa, `Ctrl+H` escolhe a conversa, `Ctrl+U` abre o uso do mês e `Ctrl+Enter` abre a Nova sessão.
+(comando, conexão, modelo, ambiente e avisos, sem a chave); **Copiar comando** e **Copiar para PowerShell**, nessa janela, copiam o comando que abre essa mesma sessão nova num terminal seu (SSH, outro shell), como o comando de retomada: pasta, limpeza do ambiente, variáveis e o CLI com o modelo escolhido, com `<sua chave>` no lugar da chave (só sessões de terminal; **Copiar resumo** segue igual). `Ctrl+K` busca projetos, `Ctrl+F` modelos, `Ctrl+N` adiciona
+projeto, `F5` atualiza o catálogo, `Ctrl+R` retoma a última conversa, `Ctrl+H` escolhe a conversa, `Ctrl+Shift+H` reabre sessões recentes, `Ctrl+U` abre o uso do mês e `Ctrl+Enter` abre a Nova sessão.
 No menu **…**, **Tema da interface…** escolhe Claro, Escuro ou Seguir o Windows e a cor de destaque (Verde, Azul, Roxo
 ou Grafite); a troca vale na hora, inclusive nas janelas abertas, e fica gravada para todos os perfis.
 
@@ -288,6 +359,12 @@ alterados.
   se o Codex não conhece o modelo (outro fornecedor via roteador), a sessão abre com aviso de que a janela efetiva pode
   ser menor.
 - Cache de catálogo: seis horas por conexão. Cache vencido ou catálogo sem confirmação nunca ativa aumentos de contexto.
+- Novidades do catálogo: os modelos que entraram e saíram desde a última lista que você viu aparecem na faixa
+  informativa da tela e numa linha logo depois do estado em `launcher models` ("Novidades do catálogo: 2 modelos novos
+  (…); 1 removido (…)."; com `--json` a linha vai para o stderr). A lista vista fica em `models-<id>.json` e só muda
+  quando a tela ou `launcher models` mostra a novidade: se outra rotina (como o `doctor`) atualizar o cache antes, a
+  diferença se acumula até alguém mostrá-la, e mostrada uma vez ela não volta. É só informação: sem lista vista (primeira
+  leitura ou cache de versão anterior) não há comparação.
 
 ### Bypass de permissões
 
@@ -380,7 +457,7 @@ console da sessão sem trazer a janela para a frente: funciona com a janela mini
 Cada janela de sessão fica registrada em `~/.cli-launcher/sessions/<pid>.json` enquanto existir.
 
 ```
-launcher keys [TECLA ...] (--project PROJETO [--cli claude|codex] | --pid PID) [--screen]
+launcher keys [TECLA ...] (--project PROJETO [--cli claude|codex] | --pid PID) [--screen] [--wait TEXTO [--timeout S]]
 launcher keys --list
 ```
 
@@ -390,21 +467,25 @@ launcher keys --list
 | `--project` | Nome, ID ou caminho do projeto da sessão. `--cli` desempata Claude e Codex. |
 | `--pid` | pid da janela da sessão (de `--list`); dispensa `--project`. |
 | `--screen` | Imprime o que a sessão mostra agora (antes das teclas, se houver), para decidir o que enviar. |
+| `--wait` | Espera `TEXTO` aparecer na tela da sessão (lida a cada segundo) antes de ler a tela e enviar as teclas; espaços e quebras de linha valem como um só, porque o console quebra a linha na largura. Com `--screen`, imprime a tela em que o texto apareceu; sem teclas, confirma com `{"ok": true, "pid": ..., "title": ..., "waited": "TEXTO"}`. |
+| `--timeout` | Com `--wait`: prazo da espera em segundos (padrão 30). Sem o texto até o prazo, `Erro: ...` no stderr, código 1 e nenhuma tecla é enviada; sem `--wait`, o comando é o de sempre. |
 | `--list` | JSON com as sessões abertas: `pid, project, project_id, cli, title, controlled, startedAt`. |
 
-Saída ao enviar: `{"ok": true, "pid": 123, "title": "Projeto — Claude Code", "sent": ["down", "enter"]}`, código 0.
-Falha (tecla desconhecida, sessão inexistente ou ambígua, console inacessível): `Erro: ...` no stderr e código 1;
-nada é enviado quando alguma tecla é inválida.
+Saída ao enviar: `{"ok": true, "pid": 123, "title": "Projeto — Claude Code", "sent": ["down", "enter"]}`, código 0 (com
+`--wait`, o JSON ganha `"waited": "TEXTO"`).
+Falha (tecla desconhecida, sessão inexistente ou ambígua, console inacessível, texto que não apareceu no prazo): `Erro: ...`
+no stderr e código 1; nada é enviado quando alguma tecla é inválida.
 
 ```powershell
 launcher keys --project "Meu app" --screen                 # ver o diálogo
 launcher keys --project "Meu app" --cli claude down enter  # escolher a 2ª opção
 launcher keys --project "Meu app" 1                        # opção numerada
 launcher keys --pid 4242 esc                               # dispensar
+launcher keys --project "Meu app" --wait "Do you want to proceed" --timeout 120 1   # esperar o diálogo e então responder
 ```
 
 Em Python: `keys.sessions()`, `keys.resolve(ids_do_projeto, cli, pid)`, `keys.send(pid, tokens)`,
-`keys.read_screen(pid)`.
+`keys.read_screen(pid)`, `keys.wait_for_text(pid, texto, prazo)`.
 
 **Monitor das sessões:** `launcher preferences --sessions-monitor other` leva as sessões em segundo plano para o
 monitor que não tem a janela marcada (ou para um não principal, sem janela marcada), se houver mais de um.
@@ -450,6 +531,20 @@ Para um host diferente, implemente as três funções: `targets(options)` devolv
 `verify(options)` levanta `connectors.ConnectorError` com um motivo acionável; `models(options)` devolve
 `(lista de catalog.ModelInfo, contexto_confirmado)`. O contrato completo está em `connectors/__init__.py`.
 
+Um conector pode declarar, com o atributo opcional `SEGREGATES_SOURCES = True` no módulo, que segrega os modelos por
+**fonte** (o caminho de acesso: serviço compartilhado, Azure, GCP, GitHub...; não é o provider). Cada `ModelInfo` traz então
+`source` com o nome exato que o conector quer ver, e um modelo pertence a uma só fonte: o mesmo modelo por duas fontes são
+dois ids, escolhidos pelo conector (um id com 2+ fontes é recusado com `ConnectorError`). Só com a declaração o launcher
+guarda e mostra a fonte (filtro e coluna **Fonte** na tabela de modelos, `models --source`, campo `source` do `/v1/models`);
+sem ela, a fonte é descartada, a tabela fica sem o filtro e sem a coluna e `models --source` recusa. O launcher não cadastra,
+junta nem renomeia fontes.
+
+Com a declaração, o conector também pode oferecer a função opcional `costs(options, month)` (`month` é `AAAA-MM`), que devolve
+`{"currency": "USD", "sources": [{"source": nome, "cost": número, "limit": número ou None, "tokens_in": inteiro ou None,
+"tokens_out": inteiro ou None}]}`: o custo e o limite de cada fonte, como o conector os conhece. O launcher só confere o
+formato (fonte repetida, custo não numérico ou negativo viram `ConnectorError`) e mostra o que veio, sem estimar nada:
+`launcher usage --by-source` e a seção **Custo por fonte** do diálogo **Uso do mês**, que só existem quando a conexão tem a
+rota.
 Para um host com várias chaves, `connectors._http` traz o campo pronto `KEY_NAME` (ponha em
 `FIELDS`), `with_key_name(url, options)` (acrescenta `/k/<nome>` à raiz quando há `key_name`) e
 `require_key_routing(raiz_com_prefixo, headers)` (exige `key_routing: true` no `/healthz`). Quem embrulha o conector
@@ -463,17 +558,31 @@ caminho.
 ```powershell
 launcher                       # menu de texto
 launcher doctor                # ferramentas + todas as conexões, sem gerar tokens (nenhuma ferramenta é normal)
+launcher doctor --json         # as mesmas verificações em JSON: nome, estado (ok, aviso ou erro) e mensagem, mais o campo ok
 launcher projects add "C:\meus projetos\app" --name "Meu app"
 launcher projects edit "Meu app" --name "App" --path "D:\app"   # só o cadastro muda
 launcher projects import "C:\caminho\config.json"   # só nomes e caminhos
 launcher projects list         # JSON: id, nome, pasta, fixado, último uso, pasta disponível
 launcher projects restore --date 2026-11-20   # devolve os removidos a partir da cópia diária daquele dia
 launcher models --connection OpenRouter --cli claude --search sonnet --refresh
+launcher models --source "Azure Foundry" # só modelos dessa fonte, com o nome que o conector declarou; só vale em conector que declara fontes
+launcher models --capability vision --capability audio   # só os que confirmam as capacidades (vision, audio, video, tools; a mesma regra do endpoint)
+launcher models --json                   # os itens do /v1/models do endpoint local (com a fonte, quando o conector declara)
+launcher models test openai/gpt-6 --connection OpenRouter [--yes]   # chamada real de 1 token, opt-in: sem --yes só mostra o custo em tokens e o preço ("sem preço" quando o host não informou) e não envia nada (código 2); com --yes (ou "s" no console) chama pelo endpoint local, entra no uso do mês e imprime OK com latência e tokens do host, ou o erro real (código 1)
 launcher launch --project "Meu app" --connection OpenRouter --cli codex --model "openai/gpt-6" --dry-run
 launcher launch --project "Meu app" --resume
+launcher conversations --project "Meu app" --cli claude                        # JSON das conversas, mais recente primeiro
+launcher sessions --reopen --dry-run [--hours 48]   # JSON do que reabriria (padrão 24 h): projeto, CLI, conversa, e o motivo da linha que não abre
+launcher sessions --reopen [--hours 48]   # reabre todas as que têm conversa identificada, como abas em segundo plano; código 1 se alguma aba falhar
+launcher conversations --project "Meu app" --command 1 --model "vertex_ai.anthropic.claude-opus-5-5"   # comando do cmd que retoma a conversa 1 (ou o ID), sem a chave
 launcher launch --project "Meu app" --cli copilot --model "vertex_ai.anthropic.claude-sonnet-5-5"
 launcher launch --project "Meu app" --cli vscode --model "azure.gpt-5.4-mini"   # ou --cli copilot_app
 launcher endpoint                # endpoint local de cada conexão (start, stop, autostart [--off])
+launcher endpoint logs --connection OpenRouter --lines 100   # fim do endpoint.log (padrão 50 linhas; o log é único por perfil, --connection só confere o nome e não filtra)
+launcher usage --all --tsv --month 2026-11   # uso do mês de todos os perfis, texto de planilha
+launcher usage --by-source --connection Central --month 2026-11 --tsv   # custo do mês por fonte, como o conector informa (JSON sem --tsv); só em conector com a rota costs
+launcher usage --limit 100,50    # teto de gasto do mês deste perfil (US$); off desliga; a janela só avisa a 80% e 100%
+launcher status                # um JSON: CLIs, conexões (cota), endpoint, sessões abertas, projetos e uso do mês; sem chaves
 launcher cli --install vscode    # qualquer ferramenta por usuário: claude, codex, copilot, vscode, copilot_app
 launcher cli --update all        # atualiza as CLIs instaladas (adia com sessão aberta)
 launcher update                # atualiza agora pelo engine-registry (--check só consulta)
@@ -484,6 +593,27 @@ launcher preferences --sessions-monitor other   # sessões em segundo plano no o
 ```
 
 `--dry-run` mostra o plano (comando, overrides, contexto, avisos) com a chave mascarada, sem rede e sem salvar nada.
+
+`conversations --command ID_OU_POSIÇÃO` imprime, em vez da lista, as linhas para colar no cmd: `cd /d` na pasta, um
+`set "NOME="` por variável que o launcher tira do ambiente das sessões (`ANTHROPIC_*`, `CLAUDE_CODE_OAUTH*`,
+`CLAUDE_CODE_USE_*`, `OPENAI_API_KEY` e as demais de `SCRUB`, menos as que a sessão define de novo), um `set` por variável de
+ambiente da sessão e o comando com `--resume`/`resume` e o modelo. `--shell powershell` troca a forma: `Set-Location
+-LiteralPath '...'`, `Remove-Item Env:NOME -ErrorAction SilentlyContinue`, `$env:NOME='valor'` (aspas simples, apóstrofo
+dobrado) e o comando num bloco `& { $PSNativeCommandArgumentPassing = 'Legacy'; & 'programa' 'arg' ... }`: o 5.1 não escapa as
+aspas duplas de um argumento nativo e o 7.3+ as escapa de outro jeito, então cada argumento já vai no padrão do Windows e o
+7.3+ fica no modo `Legacy` só dentro do bloco, sem mudar o seu shell. O JSON do `--settings` chega com o mesmo valor (pode ganhar
+um espaço depois da `{`) e um valor `chave="a b"` do `-c` do Codex com espaço vira `chave="a\u0020b"`, o mesmo valor TOML;
+argumento vazio ou com espaço e barra invertida no fim o 5.1 não passa e o comando falha dizendo para usar `--shell cmd`.
+`--shell cmd` é o padrão; nele, `&`, `|`, `<`, `>` e `^` fora de aspas ganham `^` (o cmd conta cada `"`, também a `\"` de um
+argumento, e um `|` dentro do JSON do `--settings` quebraria o comando). A posição conta a lista como `conversations` a mostra (1 é a mais recente; `--cli` filtra antes de
+contar). `--connection` e `--model` escolhem a conexão e o modelo; omitidos, valem os últimos do projeto, como no `launch`. A
+chave sai como `<sua chave>`; o valor das variáveis do seu ambiente nunca aparece no texto.
+
+`launch --dry-run --command [--shell cmd|powershell]` imprime, em vez do JSON do plano, o mesmo texto para a sessão **nova** (ou
+para a retomada, com `--resume`): é o que **Copiar comando** copia no olho. Só vale para as sessões de terminal (Claude Code,
+Codex, Copilot CLI); `--command` sem `--dry-run`, `--shell` sem `--command` e um destino que não é de terminal falham com
+mensagem, e o `--dry-run` sem `--command` continua imprimindo o JSON. O Claude Code ganha um `--session-id` novo a cada plano, então o
+texto muda a cada vez nesse trecho.
 
 ## Dados e segurança
 

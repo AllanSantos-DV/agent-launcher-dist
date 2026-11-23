@@ -3,19 +3,21 @@ uma instância de Harness). Um arquivo com erro não derruba os outros (mesmo pa
 from __future__ import annotations
 
 import importlib
-import importlib.util
 from pathlib import Path
 
 from agent_launcher.domain.errors import LauncherError
+from agent_launcher.domain.user_modules import load_user_modules
 
-BUILTIN_NAMES = ("claude_code", "codex", "copilot_cli", "vscode", "copilot_app")
+BUILTIN_MODULES = {"claude": "claude_code", "codex": "codex", "copilot": "copilot_cli", "vscode": "vscode",
+                   "copilot_app": "copilot_app"}  # ID -> módulo: achar um adaptador sem importar os outros
+BUILTIN_NAMES = tuple(BUILTIN_MODULES.values())
 _loaded: dict | None = None
 _errors: list[str] = []
 
 
-def _builtin() -> dict:
+def _builtin(names: tuple[str, ...] = BUILTIN_NAMES) -> dict:
     found = {}
-    for name in BUILTIN_NAMES:
+    for name in names:
         try:
             module = importlib.import_module(f"agent_launcher.harnesses.{name}")
         except ModuleNotFoundError as error:
@@ -28,24 +30,18 @@ def _builtin() -> dict:
 
 
 def load_user(folder: Path | None) -> tuple[dict, list[str]]:
-    found, errors = {}, []
-    if folder is None or not folder.is_dir():
-        return found, errors
-    for path in sorted(folder.glob("*.py")):
-        try:
-            spec = importlib.util.spec_from_file_location(f"agent_launcher_harness_{path.stem}", path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            harness = getattr(module, "HARNESS", None)
-            if harness is None or not getattr(harness, "ID", "") or not getattr(harness, "LABEL", ""):
-                raise ValueError("falta HARNESS com ID e LABEL")
-            for method in ("command", "plan", "eligible"):
-                if not callable(getattr(harness, method, None)):
-                    raise ValueError(f"falta o método {method}()")
-            found[harness.ID] = harness
-        except Exception as error:
-            errors.append(f"{path.name}: {type(error).__name__}: {error}")
-    return found, errors
+    found = {}
+
+    def accept(module, _name):
+        harness = getattr(module, "HARNESS", None)
+        if harness is None or not getattr(harness, "ID", "") or not getattr(harness, "LABEL", ""):
+            raise ValueError("falta HARNESS com ID e LABEL")
+        for method in ("command", "plan", "eligible"):
+            if not callable(getattr(harness, method, None)):
+                raise ValueError(f"falta o método {method}()")
+        found[harness.ID] = harness
+
+    return found, load_user_modules(folder, "agent_launcher_harness", accept)
 
 
 def _all() -> dict:
@@ -77,6 +73,10 @@ def errors() -> list[str]:
 
 
 def find(identifier: str):
+    """O adaptador com esse ID. Um embutido é achado sem carregar os outros (o processo da janela da sessão só precisa do
+    seu); os do usuário e as listas completas carregam todos."""
+    if _loaded is None and identifier in BUILTIN_MODULES:
+        return _builtin((BUILTIN_MODULES[identifier],)).get(identifier)
     return _all().get(identifier)
 
 

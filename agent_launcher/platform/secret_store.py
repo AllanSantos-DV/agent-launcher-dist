@@ -14,12 +14,19 @@ barreira contra código rodando *como o próprio usuário*: esse código chama
 
 A garantia vale por arquivo, não pelo segredo: enquanto o mesmo valor existir em outro
 arquivo desprotegido, quem copia a pasta pega a cópia mais fácil.
+
+Formato gravado: texto com o PREFIX seguido do base64 do blob, entropia nula, escopo do usuário.
+Na leitura também vale o blob cru (o arquivo inteiro é o blob, como grava o `WindowsDpapi` do
+native-java e o `ProtectedData` do .NET com a mesma entropia nula): o blob é o mesmo, só muda o
+invólucro.
 """
 import base64
 import os
+from pathlib import Path
 
 PREFIX = "dpapi:v1:"
 _PREFIX_BYTES = PREFIX.encode("ascii")
+RAW_BLOB_HEADER = bytes.fromhex("01000000d08c9ddf0115d1118c7a00c04fc297eb")  # DWORD de formato + GUID do provedor padrão
 
 _CRYPTPROTECT_UI_FORBIDDEN = 0x01
 
@@ -110,6 +117,8 @@ def unprotect(stored):
     formato válido de entrada, e migrá-lo é responsabilidade de quem grava."""
     if not stored:
         return ""
+    if isinstance(stored, (bytes, bytearray)):
+        return unprotect_raw(bytes(stored))
     if not is_protected(stored):
         return stored
     if not available():
@@ -119,3 +128,30 @@ def unprotect(stored):
     except (ValueError, TypeError) as exc:
         raise SecretProtectionError(f"Segredo protegido com base64 inválido ({exc}).")
     return _crypt("CryptUnprotectData", blob).decode("utf-8", "replace")
+
+
+def is_raw_blob(data):
+    """Bytes que começam pelo cabeçalho fixo de um blob DPAPI."""
+    return isinstance(data, (bytes, bytearray)) and bytes(data[:len(RAW_BLOB_HEADER)]) == RAW_BLOB_HEADER
+
+
+def unprotect_raw(blob):
+    """Decifra o blob DPAPI cru (sem prefixo nem base64), o formato de arquivo do native-java."""
+    if not is_raw_blob(blob):
+        raise SecretProtectionError("O conteúdo não é um blob DPAPI (cabeçalho de versão e provedor ausente).")
+    if not available():
+        raise SecretProtectionError("O segredo está protegido por DPAPI, indisponível nesta plataforma.")
+    return _crypt("CryptUnprotectData", bytes(blob)).decode("utf-8", "replace")
+
+
+def read_file(path):
+    """Segredo de um arquivo do cofre em qualquer dos dois formatos: o texto PREFIX + base64 que o
+    Launcher grava ou o blob cru que o native-java grava. Texto sem prefixo volta como está (legado em claro)."""
+    data = Path(path).read_bytes()
+    if is_raw_blob(data):
+        return unprotect_raw(data)
+    try:
+        text = data.decode("utf-8-sig").strip()
+    except UnicodeDecodeError:
+        raise SecretProtectionError(f"{path}: nem texto UTF-8 nem blob DPAPI.")
+    return unprotect(text)

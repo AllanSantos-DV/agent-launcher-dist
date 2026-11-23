@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 
 MODEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@+\-]{0,199}(?:\[1m\])?\Z")
@@ -65,6 +65,49 @@ def token_label(value: int | None) -> str:
     return str(value)
 
 
+def source_name(value: object) -> str | None:
+    """Fonte como o conector a declarou, texto não vazio; qualquer outra coisa é desconhecida."""
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def known_mode(record: dict) -> str | None:
+    """`mode` do registro se for um dos conhecidos; qualquer outra coisa é desconhecida."""
+    return record.get("mode") if record.get("mode") in {"chat", "responses", "incompatible", "other"} else None
+
+
+def bool_field(record: dict, key: str) -> bool | None:
+    """Campo booleano do registro; qualquer outra coisa é desconhecida, nunca False no lugar de desconhecido."""
+    return record.get(key) if type(record.get(key)) is bool else None
+
+
+@dataclass(frozen=True)
+class Deployment:
+    """Uma implantação do modelo num agregador: a fonte e o que ela própria informa."""
+    source: str | None = None
+    mode: str | None = None
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    tools: bool | None = None
+    responses: bool | None = None
+    input_cost_per_token: float | None = None
+    output_cost_per_token: float | None = None
+    vision: bool | None = None
+    audio_input: bool | None = None
+    video_input: bool | None = None
+
+    @classmethod
+    def from_cache(cls, value: object) -> Deployment | None:
+        """Implantação a partir de um dict do cache ou do model_info; None se não for dict, campo inválido vira None."""
+        if not isinstance(value, dict):
+            return None
+        return cls(
+            source_name(value.get("source")), known_mode(value),
+            positive_integer(value.get("max_input_tokens")), positive_integer(value.get("max_output_tokens")),
+            bool_field(value, "tools"), bool_field(value, "responses"), price(value.get("input_cost_per_token")),
+            price(value.get("output_cost_per_token")), bool_field(value, "vision"), bool_field(value, "audio_input"),
+            bool_field(value, "video_input"))
+
+
 @dataclass(frozen=True)
 class ModelInfo:
     id: str
@@ -82,6 +125,9 @@ class ModelInfo:
     vision: bool | None = None
     audio_input: bool | None = None
     video_input: bool | None = None
+    # Fonte do modelo, com o nome que o conector declarou; só existe em conector que declara segregação por fonte.
+    source: str | None = None
+    deployments: tuple[Deployment, ...] = ()
 
     @classmethod
     def from_cache(cls, value: dict) -> ModelInfo:
@@ -90,15 +136,16 @@ class ModelInfo:
         if value["id"] != base_model(value["id"]):
             raise ValueError("O cache deve conter IDs sem sufixos do CLI.")
         return cls(
-            id=value["id"], mode=value.get("mode") if value.get("mode") in {
-                "chat", "responses", "incompatible", "other"
-            } else None,
+            id=value["id"], mode=known_mode(value),
             max_input_tokens=positive_integer(value.get("max_input_tokens")),
             max_output_tokens=positive_integer(value.get("max_output_tokens")),
-            tools=value.get("tools") if type(value.get("tools")) is bool else None,
-            responses=value.get("responses") if type(value.get("responses")) is bool else None,
+            tools=bool_field(value, "tools"),
+            responses=bool_field(value, "responses"),
             **{key: price(value.get(key)) for key in PRICES},
-            **{key: value.get(key) if type(value.get(key)) is bool else None for key in MEDIA_INPUTS},
+            **{key: bool_field(value, key) for key in MEDIA_INPUTS},
+            source=source_name(value.get("source")),
+            deployments=tuple(found for found in map(Deployment.from_cache, value["deployments"]) if found)
+            if isinstance(value.get("deployments"), (list, tuple)) else (),
         )
 
     @property
@@ -114,7 +161,7 @@ class ModelInfo:
 
     @property
     def provider(self) -> str:
-        """Prefixo de rota do ID: bedrock.anthropic, vertex_ai.anthropic, openai.us, anthropic/, google/..."""
+        """Prefixo de rota do ID: bedrock.anthropic, vertex_ai.anthropic, openai.us, anthropic/, cc/..."""
         match = VENDOR.search(self.id)
         if match:
             return self.id[:match.start()]
@@ -147,6 +194,10 @@ class ModelInfo:
     def to_cache(self) -> dict:
         return asdict(self)
 
+    def without_source(self) -> ModelInfo:
+        """O mesmo registro sem fonte, nele e nas implantações: as capacidades agregadas ficam."""
+        return replace(self, source=None, deployments=tuple(replace(item, source=None) for item in self.deployments))
+
 
 def merge_records(available: list, metadata: list) -> list[ModelInfo]:
     """Cruza /v1/models (o que está disponível) com /v1/model/info do LiteLLM (capacidades), pelo ID completo."""
@@ -176,6 +227,15 @@ def merge_records(available: list, metadata: list) -> list[ModelInfo]:
         values = [value for value in (price(row.get(key)) for row in rows) if value is not None]
         return max(values) if values else None  # implantações com preços diferentes: a estimativa fica pela mais cara
 
+    def deployment(row: dict) -> Deployment:
+        return Deployment.from_cache({
+            "source": row.get("litellm_provider"), "mode": row.get("mode"),
+            "max_input_tokens": row.get("max_input_tokens"), "max_output_tokens": row.get("max_output_tokens"),
+            "tools": row.get("supports_function_calling"), "responses": row.get("supports_responses_api"),
+            "input_cost_per_token": row.get("input_cost_per_token"),
+            "output_cost_per_token": row.get("output_cost_per_token"), "vision": row.get("supports_vision"),
+            "audio_input": row.get("supports_audio_input"), "video_input": row.get("supports_video_input")})
+
     records = []
     for identifier in sorted(identifiers, key=str.casefold):
         rows = grouped[identifier]
@@ -188,12 +248,15 @@ def merge_records(available: list, metadata: list) -> list[ModelInfo]:
         responses = capability(rows, "supports_responses_api")
         if mode == "responses" and responses is None:
             responses = True
+        deployments = tuple(deployment(row) for row in rows)
+        sources = {item.source for item in deployments}
         records.append(ModelInfo(
             identifier, mode, minimum(rows, "max_input_tokens"), minimum(rows, "max_output_tokens"),
             capability(rows, "supports_function_calling"), responses,
             *(cost(rows, key) for key in PRICES),
             vision=capability(rows, "supports_vision"), audio_input=capability(rows, "supports_audio_input"),
             video_input=capability(rows, "supports_video_input"),
+            source=sources.pop() if len(sources) == 1 else None, deployments=deployments,
         ))
     return records
 
@@ -230,13 +293,29 @@ def protocol_for(record: ModelInfo, protocols, any_model: bool, consumes) -> str
 @dataclass
 class Catalog:
     """Modelos de UMA conexão. `clis` vem da conexão: os destinos (adaptadores) que consomem algum protocolo que o host
-    serve; `protocols` são esses protocolos e `any_model` diz se o host traduz qualquer modelo para eles."""
+    serve; `protocols` são esses protocolos e `any_model` diz se o host traduz qualquer modelo para eles.
+    `segregates_sources`: o conector da conexão se declara com fonte por modelo; sem isso nenhum registro tem fonte."""
     records: list[ModelInfo] = field(default_factory=list)
     status: str = "Catálogo indisponível; capacidades não confirmadas."
     verified: bool = False
     clis: frozenset = frozenset(CLIS)
     any_model: bool = False
     protocols: frozenset = frozenset(("messages", "responses"))
+    segregates_sources: bool = False
+    added: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+
+    def news(self, shown: int = 5) -> str:
+        """Frase com os modelos que entraram e saíram desde a última lista que o usuário viu ("" se nada mudou); `added` e
+        `removed` só são preenchidos quando há uma lista vista para comparar (ver `Gateway.mark_news_seen`)."""
+        def part(ids: tuple[str, ...], singular: str, plural: str) -> str:
+            if not ids:
+                return ""
+            names = ", ".join(ids[:shown]) + (f" e mais {len(ids) - shown}" if len(ids) > shown else "")
+            return f"{len(ids)} {singular if len(ids) == 1 else plural} ({names})"
+        parts = [found for found in (part(self.added, "modelo novo", "modelos novos"),
+                                     part(self.removed, "removido", "removidos")) if found]
+        return f"Novidades do catálogo: {'; '.join(parts)}." if parts else ""
 
     def find(self, model: str) -> ModelInfo | None:
         return next((record for record in self.records if record.id == base_model(model)), None)

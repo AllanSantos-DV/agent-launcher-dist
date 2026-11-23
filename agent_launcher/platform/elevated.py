@@ -32,7 +32,7 @@ from pathlib import Path
 
 from agent_launcher import ROOT
 from agent_launcher.domain.errors import LauncherError
-from agent_launcher.domain.files import atomic_json, path_key
+from agent_launcher.domain.files import atomic_json, atomic_text, file_lock, path_key
 from agent_launcher.domain.store import Store
 from version import data_home
 
@@ -162,11 +162,12 @@ def apply(home: Path, mark: set[str], unmark: set[str], folder: Path | None = No
     requests_dir(home).mkdir(parents=True, exist_ok=True)
     if register:
         if projects:
-            import tempfile
-            with tempfile.TemporaryDirectory(prefix="agent-launcher-task-", dir=str(folder)) as work:
-                xml = Path(work) / "task.xml"
-                command, flags = task_action()
-                xml.write_text(task_xml(current_user(), command, f'{flags} "{runner}"'), encoding="utf-16")
+            # O XML fica na pasta protegida (só administrador grava): numa pasta do usuário, outro processo dele
+            # trocaria a ação da tarefa elevada entre a gravação e o schtasks.
+            xml = folder / "task.xml"
+            command, flags = task_action()
+            with file_lock(xml):
+                atomic_text(xml, task_xml(current_user(), command, f'{flags} "{runner}"'), encoding="utf-16")
                 result = subprocess.run(["schtasks.exe", "/create", "/tn", TASK, "/xml", str(xml), "/f"],
                                         capture_output=True, text=True, creationflags=NO_WINDOW)
             if result.returncode:

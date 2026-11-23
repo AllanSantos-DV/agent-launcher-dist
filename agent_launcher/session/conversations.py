@@ -34,6 +34,11 @@ def shared_folder(home: Path | None, directory) -> bool:
         return False
 
 
+def first_started_after(ordered: list[Conversation], moment: float) -> Conversation | None:
+    """A primeira conversa (de `ordered`, da mais antiga à mais nova) que começou até ATTRIBUTION_WINDOW depois de `moment`."""
+    return next((item for item in ordered if moment <= item.started < moment + ATTRIBUTION_WINDOW), None)
+
+
 def attributed(home: Path, cli: str, directory, conversations: list[Conversation]) -> list[Conversation]:
     """As conversas que este perfil abriu (ver o docstring do módulo)."""
     opened = registry.entries(home, directory, cli)
@@ -43,10 +48,31 @@ def attributed(home: Path, cli: str, directory, conversations: list[Conversation
                          if not entry.get("resume") and isinstance(entry.get("at"), (int, float)))
         ordered = sorted(conversations, key=lambda item: item.started)
         for moment in moments:
-            first = next((item for item in ordered if moment <= item.started < moment + ATTRIBUTION_WINDOW), None)
+            first = first_started_after(ordered, moment)
             if first is not None:
                 known.add(first.id)
     return [item for item in conversations if item.id in known]
+
+
+def conversation_of_opening(home: Path, cli: str, directory, entry: dict,
+                            conversations: list[Conversation]) -> str | None:
+    """O id da conversa que esta abertura do registro iniciou ou retomou, ou None quando não há certeza. Com id gravado
+    (Claude novo, retomada por id) vale o id, se a conversa ainda existe. Sem id (Codex e Copilot CLI novos), vale a
+    atribuição por horário de `attributed`, só se nenhuma outra abertura da pasta também a reivindica."""
+    known = {item.id for item in conversations}
+    session_id = entry.get("session_id")
+    if isinstance(session_id, str):
+        return session_id if session_id in known else None
+    if cli == "claude" or entry.get("resume") or not isinstance(entry.get("at"), (int, float)):
+        return None
+    ordered = sorted(conversations, key=lambda item: item.started)
+    first = first_started_after(ordered, float(entry["at"]))
+    if first is None:
+        return None
+    claimants = [other for other in registry.entries(home, directory, cli)
+                 if not other.get("resume") and isinstance(other.get("at"), (int, float))
+                 and first_started_after(ordered, float(other["at"])) is first]
+    return first.id if len(claimants) == 1 else None
 
 
 def conversations_for(home: Path | None, harness: Harness, directory) -> list[Conversation]:

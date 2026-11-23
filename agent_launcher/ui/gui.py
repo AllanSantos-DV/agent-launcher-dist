@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QFileSystemWatcher, QSize, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QDialog, QFileDialog, QFormLayout, QFrame,
@@ -18,35 +19,39 @@ from PySide6.QtWidgets import (
 )
 
 from agent_launcher import ROOT
-from agent_launcher.domain import profiles, usage
-from agent_launcher.domain.conversation_usage import conversation_usage, resume_window_warning, window_warning
+from agent_launcher.domain import cache, model_probe, profiles, usage
+from agent_launcher.domain.usage import USAGE_HEADER, usage_rows, usage_text
+from agent_launcher.domain.conversation_usage import resume_window_warning, window_warning
 from agent_launcher.domain.catalog import base_model, media_states, price_label, token_label
 from agent_launcher.domain.errors import LauncherBusy, LauncherError
-from agent_launcher.domain.files import append_capped, project_path
+from agent_launcher.domain.files import append_capped, atomic_text, project_path
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
 from agent_launcher.harnesses import cli_update
 from agent_launcher.harnesses import installers as clis
 from agent_launcher.harnesses import registry, vscode
 from agent_launcher.platform import keys, terminal
+from agent_launcher.session import reopen
 from agent_launcher.session.conversations import conversations_for, has_conversation_for
-from agent_launcher.session.preview import plan_report, plan_text, planned
+from agent_launcher.session.preview import (REMINDER, new_session_command, plan_report, plan_text, planned,
+                                            resume_command)
 from agent_launcher.session.window import session_title, start_session
 from agent_launcher.ui import placement
 from agent_launcher.ui import theme as theme_module
-from agent_launcher.ui.background import deliver
-from agent_launcher.ui.connections import ConnectionsDialog, quota_warning
-from agent_launcher.ui.instructions import InstructionsDialog
-from agent_launcher.ui.text import label_of
+from agent_launcher.ui.background import BackgroundTask, ProgressSignals, deliver, run_task
+from agent_launcher.ui.connections import ConnectionsDialog, quota_warning, split_cleanup
+from agent_launcher.ui.instructions import InstructionsDialog, release_notes_available
+from agent_launcher.ui.text import conversation_usages, label_of
 from agent_launcher.ui.theme import (
     ACCENT_NAMES, DANGER, GREEN, INFO, MENU_SELECTED, MUTED, THEME_NAMES, WARN, CardGrid, CliButton, DangerMenu, ElidedLabel,
-    FlowRow, InfoStrip, NoticeStrip, ReadableCombo, bind_icon, bind_style, icon, plural, tone, tone_item,
+    FlowRow, InfoStrip, NoticeStrip, ReadableCombo, RowsTable, StatusLine, bind_icon, bind_style, icon, label, plural, tone, tone_item,
 )
 from agent_launcher.update import updater
 from version import APP_NAME, APP_USER_MODEL_ID, VERSION
 
 
 STARTUP_LOG = "abertura.log"
+RELEASE_SEEN = "novidades-vistas.txt"
 STARTUP_LOG_BYTES = 64 * 1024
 _located: dict[str, tuple[tuple, str | None]] = {}
 
@@ -102,7 +107,8 @@ def provider_name(provider: str) -> str:
 
 MEDIA_COLUMNS = (("vision", "Visão", "vision"), ("audio_input", "Áudio", "audio"), ("video_input", "Vídeo", "video"))
 UNKNOWN_MEDIA = "o conector não informou"
-FIRST_MEDIA_COLUMN = 4
+SOURCE_COLUMN_WIDTH = 136
+ALL_SOURCES = "Todas as fontes"
 MEDIA_FILTERS = (("Todas as entradas", None),) + tuple((f"Com {title.lower()}", field) for field, title, _symbol in MEDIA_COLUMNS)
 
 
@@ -137,14 +143,6 @@ def catalog_tag(status: str) -> tuple[str, bool]:
     parts = status.split(";")[0].rstrip(".").split(" • ")
     text = " · ".join(parts[:2] if status.startswith("Cache local") else parts[:1])
     return text, "indisponível" in text
-
-
-def label(text: str, role: str = "", parent=None) -> QLabel:
-    widget = QLabel(text, parent)
-    widget.setTextFormat(Qt.TextFormat.PlainText)
-    if role:
-        widget.setObjectName(role)
-    return widget
 
 
 def button(text: str, symbol: str = "", role: str = "", parent=None) -> QPushButton:
@@ -289,48 +287,146 @@ class DiagnosticsDialog(TextDialog):
 
 
 class PlanDialog(TextDialog):
-    """O que a próxima abertura vai iniciar (comando, conexão, modelo, ambiente e avisos), só para leitura."""
+    """O que a próxima abertura vai iniciar (comando, conexão, modelo, ambiente e avisos), só para leitura. Com
+    `command_for(shell)`, também copia o comando que abre a sessão fora do launcher, para cmd ou PowerShell."""
 
-    def __init__(self, text: str, parent=None):
+    def __init__(self, text: str, parent=None, command_for=None):
         super().__init__("O que vai abrir", text, "Copiar resumo", "Resumo copiado.", parent)
+        self.command_for = command_for
+        self.copied.setWordWrap(True)
+        self.command_button = QPushButton("Copiar comando")
+        self.command_button.setToolTip("Copia o comando que abre esta sessão num terminal seu, com a pasta, o ambiente e "
+                                       "o modelo desta conexão. A chave não vai junto.")
+        self.command_button.clicked.connect(lambda: self.copy_command("cmd"))
+        self.powershell_button = QPushButton("Copiar para PowerShell")
+        self.powershell_button.setToolTip("O mesmo comando, escrito para colar no PowerShell (5.1 ou 7). A chave não vai "
+                                          "junto.")
+        self.powershell_button.clicked.connect(lambda: self.copy_command("powershell"))
+        copies = QHBoxLayout()
+        for button in (self.command_button, self.powershell_button):
+            button.setEnabled(command_for is not None)
+            copies.addWidget(button)
+        copies.addStretch()
+        self.layout().insertLayout(1, copies)
+
+    def copy_command(self, shell: str) -> None:
+        """Copia o comando da nova sessão escrito para o `shell`; sem montá-lo, mostra o motivo e não toca na área de
+        transferência."""
+        copy_command_text(lambda: self.command_for(shell), shell, self.copied, "Comando")
 
 
-class ScreenTask(QRunnable):
+def copy_command_text(build, shell: str, status: QLabel, noun: str) -> None:
+    """Copia o comando que `build()` monta para o `shell` e o diz em `status` ("<noun> copiado"); sem montá-lo, mostra o
+    motivo e não toca na área de transferência."""
+    try:
+        text = build()
+    except (LauncherError, OSError, ValueError) as error:
+        status.setText(f"Não foi possível montar o comando: {error}")
+        return
+    QApplication.clipboard().setText(text)
+    form = " (PowerShell)" if shell == "powershell" else ""
+    swap = f"; troque {REMINDER} pela sua" if REMINDER in text else ""
+    status.setText(f"{noun} copiado{form}{swap}.")
+
+
+class ScreenTask(BackgroundTask):
     """Lê a tela do console de uma sessão aberta fora da thread da interface (o auxiliar pode levar alguns segundos)."""
 
     def __init__(self, pid: int):
         super().__init__()
         self.pid = pid
-        self.signals = RefreshSignals()
 
-    @Slot()
-    def run(self):
-        try:
-            deliver(self.signals, "completed", keys.read_screen(self.pid), "")
-        except Exception as error:  # volta para a tela como erro, nunca derruba a thread
-            deliver(self.signals, "completed", error, "")
+    def outcome(self):
+        return keys.read_screen(self.pid), ""
+
+
+class SendKeysTask(BackgroundTask):
+    """Envia teclas a uma sessão aberta fora da thread da interface (um texto grande leva segundos). Antes confere que a
+    sessão do pid segue aberta."""
+
+    def __init__(self, pid: int, tokens: list[str]):
+        super().__init__()
+        self.pid = pid
+        self.tokens = tokens
+
+    def outcome(self):
+        keys.resolve(set(), pid=self.pid)
+        keys.send(self.pid, self.tokens)
+        return None, ""
+
+
+def split_keys(text: str) -> list[str]:
+    """As fichas do `launcher keys` digitadas num campo: separadas por espaço, aspas agrupam (\"text:olá mundo\") e a barra
+    invertida é literal. Aspas sem fechar levantam ValueError."""
+    lexer = shlex.shlex(text, posix=True)
+    lexer.whitespace_split, lexer.escape, lexer.commenters = True, "", ""
+    return list(lexer)
+
+
+def session_pid(session: dict) -> int | None:
+    """O pid do registro da sessão; None quando falta ou não é número."""
+    try:
+        return int(session["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 class SessionScreenDialog(TextDialog):
-    """O que uma sessão aberta exibe agora, só para leitura: nada é digitado nela e a janela dela não vem para a frente."""
+    """O que uma sessão aberta exibe agora. A tela é só leitura e nada vai à sessão até o clique em Enviar, que manda as
+    fichas do `launcher keys` digitadas no campo à sessão que está sendo lida (pelo caminho de colar, sem foco e sem a
+    área de transferência); a janela dela não vem para a frente."""
+
+    READ_ONLY_HINT = "A tela é só leitura: nada é enviado à sessão até você clicar em Enviar."
 
     def __init__(self, sessions: list[dict], parent=None):
         super().__init__("Tela da sessão", "", "Copiar tela", "Tela copiada.", parent)
+        self.sessions = list(sessions)
+        self.sending = False
+        self.box.setToolTip(self.READ_ONLY_HINT)
+        self.hint = label(self.READ_ONLY_HINT, "muted")
+        self.hint.setWordWrap(True)
+        self.layout().insertWidget(0, self.hint)
         self.choice = ReadableCombo()
         self.choice.setAccessibleName("Sessão aberta")
-        for session in sessions:
+        for session in self.sessions:
             self.choice.addItem(f"{label_of(session.get('cli', ''))} — {session.get('title') or session.get('project', '')}",
-                                int(session["pid"]))
-        self.layout().insertWidget(0, self.choice)
+                                session_pid(session))
+        self.layout().insertWidget(1, self.choice)
         self.error = label("", "notice")
         self.error.setWordWrap(True)
         self.error.hide()
-        self.layout().insertWidget(1, self.error)
+        self.layout().insertWidget(2, self.error)
+        self.target_label = label("", "muted")
+        self.target_label.setWordWrap(True)
+        self.keys_input = QLineEdit()
+        self.keys_input.setPlaceholderText('Ex.: enter · esc · 1 · down · "text:resposta"')
+        self.keys_input.setAccessibleName("Teclas a enviar")
+        self.send_button = QPushButton("Enviar")
+        self.send_button.setAccessibleName("Enviar à sessão")
+        self.send_message = label("", "muted")
+        self.send_message.setWordWrap(True)
+        self.send_error = label("", "notice")
+        self.send_error.setWordWrap(True)
+        self.send_error.hide()
+        keys_row = QHBoxLayout()
+        keys_row.addWidget(label("Teclas a enviar"))
+        keys_row.addWidget(self.keys_input, 1)
+        keys_row.addWidget(self.send_button)
+        self.layout().insertWidget(4, self.target_label)
+        self.layout().insertLayout(5, keys_row)
+        self.layout().insertWidget(6, self.send_message)
+        self.layout().insertWidget(7, self.send_error)
         self.refresh_button = QPushButton("Atualizar")
         self.refresh_button.clicked.connect(self.refresh)
         self.actions.insertWidget(1, self.refresh_button)
+        for each in self.findChildren(QPushButton):
+            each.setAutoDefault(False)  # Enter no campo não aciona botão nenhum: só o clique envia
         self.choice.currentIndexChanged.connect(self.refresh)
+        self.choice.currentIndexChanged.connect(self.update_send)
+        self.keys_input.textChanged.connect(self.update_send)
+        self.send_button.clicked.connect(self.send_typed_keys)
         self.task = None
+        self.update_send()
         self.refresh()
 
     def refresh(self) -> None:
@@ -341,8 +437,7 @@ class SessionScreenDialog(TextDialog):
         self.error.hide()
         self.copied.setText("Lendo a tela…")
         task = self.task = ScreenTask(pid)
-        task.signals.completed.connect(lambda result, text="": task is self.task and self.show_screen(result))
-        QThreadPool.globalInstance().start(task)
+        run_task(task, lambda result, text="": task is self.task and self.show_screen(result))
 
     def show_screen(self, result) -> None:
         self.copied.setText("")
@@ -352,6 +447,75 @@ class SessionScreenDialog(TextDialog):
             return
         self.box.setPlainText(result)
         self.box.verticalScrollBar().setValue(self.box.verticalScrollBar().maximum())
+
+    def chosen_session(self) -> dict | None:
+        index = self.choice.currentIndex()
+        return self.sessions[index] if 0 <= index < len(self.sessions) else None
+
+    def target_text(self) -> str:
+        session = self.chosen_session() or {}
+        pid = self.choice.currentData()
+        return (f"{label_of(session.get('cli', ''))} · {session.get('project', '')} · {session.get('title', '')}"
+                + (f" · pid {pid}" if pid is not None else ""))
+
+    def typed_keys(self) -> tuple[list[str], str]:
+        """(fichas, problema): as fichas do campo já validadas por keys.parse; problema vazio quando valem."""
+        text = self.keys_input.text().strip()
+        if not text:
+            return [], ""
+        try:
+            tokens = split_keys(text)
+            keys.parse(tokens)
+        except ValueError:
+            return [], "Aspas sem fechar no campo de teclas."
+        except keys.KeysError as error:
+            return [], str(error)
+        return tokens, ""
+
+    def update_send(self) -> None:
+        """Mostra a sessão que receberia, o que seria enviado ou o motivo de não poder, e habilita o Enviar só quando há
+        sessão com pid, fichas válidas e nenhum envio em andamento."""
+        session = self.chosen_session()
+        pid = self.choice.currentData()
+        reason = ("Sem sessão para enviar." if session is None else
+                  "Esta sessão não tem pid registrado: não há como enviar a ela." if pid is None else
+                  "")
+        tokens, problem = ([], "") if reason else self.typed_keys()
+        self.target_label.setText(f"Sessão que receberá as teclas: {self.target_text()}")
+        self.send_error.setVisible(bool(problem))
+        self.send_error.setText(problem)
+        self.send_message.setText(reason or ("" if problem or not tokens else f"Será enviado: {self.keys_input.text().strip()}"))
+        self.send_button.setEnabled(bool(tokens) and not self.sending)
+
+    def send_typed_keys(self) -> None:
+        """Clique em Enviar: as fichas do campo vão, uma vez, à sessão que está sendo lida."""
+        tokens, problem = self.typed_keys()
+        pid = self.choice.currentData()
+        if self.sending or not tokens or problem or not self.send_button.isEnabled():
+            return
+        self.sending = True
+        typed = self.keys_input.text().strip()
+        for widget in (self.choice, self.keys_input):
+            widget.setEnabled(False)
+        self.send_button.setEnabled(False)
+        self.send_message.setText("Enviando…")
+        task = SendKeysTask(pid, tokens)
+        self.send_task = task
+        run_task(task, lambda result, text="": self.finish_send(result, typed))
+
+    def finish_send(self, result, typed: str) -> None:
+        """Depois do envio, relê a tela; se falhou, mostra o erro como veio e mantém as fichas para tentar de novo."""
+        self.sending = False
+        for widget in (self.choice, self.keys_input):
+            widget.setEnabled(True)
+        if isinstance(result, Exception):
+            self.update_send()
+            self.send_error.setText(str(result) if isinstance(result, keys.KeysError) else f"{type(result).__name__}: {result}")
+            self.send_error.show()
+            return
+        self.keys_input.clear()
+        self.send_message.setText(f"Enviado: {typed}")
+        self.refresh()
 
 
 def conversation_usage_cells(result, record, verified: bool) -> tuple[str, str]:
@@ -374,19 +538,21 @@ def conversations_text(rows: list[list[str]]) -> str:
     return "\n".join("\t".join(row) for row in [list(CONVERSATIONS_HEADER), *rows])
 
 
-class ConversationsDialog(QDialog):
+class ConversationsDialog(placement.GrowingDialog):
     """Conversas do CLI nesta pasta (as deste perfil, se a pasta é compartilhada): filtro por texto, cópia da lista
-    como está filtrada, duplo clique ou Retomar."""
+    como está filtrada, cópia do comando que retoma a conversa selecionada fora do launcher, para cmd ou para PowerShell
+    (command_for: ID da conversa e shell -> texto), duplo clique ou Retomar. A coluna Título abre com largura para
+    TITLE_CHARS caracteres e a mensagem de cópia tem altura reservada: ela não encolhe a tabela, a janela cresce."""
+
+    TITLE_COLUMN = 2
+    TITLE_CHARS = 40
 
     def __init__(self, conversations: list, parent=None, cli_label: str = "", usages: dict | None = None,
-                 record=None, verified: bool = False):
-        super().__init__(parent)
+                 record=None, verified: bool = False, command_for=None):
+        super().__init__(parent, QSize(720, 420))
         from datetime import datetime
         self.setWindowTitle(f"Conversas do {cli_label}" if cli_label else "Escolher conversa")
-        self.setMinimumSize(720, 420)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 20)
-        layout.setSpacing(12)
+        layout = self.body_layout
         layout.addWidget(label("Escolha a conversa a retomar (mais recente primeiro).", "muted"))
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("Filtrar por título, data ou CLI")
@@ -395,7 +561,7 @@ class ConversationsDialog(QDialog):
         self.filter.textChanged.connect(self.apply_filter)
         layout.addWidget(self.filter)
         usages = usages or {}
-        self.table = QTableWidget(len(conversations), len(CONVERSATIONS_HEADER))
+        self.table = RowsTable(len(conversations), len(CONVERSATIONS_HEADER))
         self.table.setHorizontalHeaderLabels(list(CONVERSATIONS_HEADER))
         self.table.setAccessibleName("Conversas")
         self.table.verticalHeader().hide()
@@ -405,7 +571,7 @@ class ConversationsDialog(QDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.TITLE_COLUMN, QHeaderView.ResizeMode.Stretch)
         for column in (0, 1, 3, 4, 5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         for row, conversation in enumerate(conversations):
@@ -440,9 +606,6 @@ class ConversationsDialog(QDialog):
         self.copy_button.setEnabled(bool(conversations))
         self.copy_button.clicked.connect(self.copy)
         actions.addWidget(self.copy_button)
-        self.copied = QLabel("")
-        self.copied.setObjectName("muted")
-        actions.addWidget(self.copied)
         actions.addStretch()
         cancel = QPushButton("Cancelar")
         cancel.clicked.connect(self.reject)
@@ -453,7 +616,36 @@ class ConversationsDialog(QDialog):
         self.resume.setEnabled(bool(conversations))
         self.resume.clicked.connect(self.accept)
         actions.addWidget(self.resume)
-        layout.addLayout(actions)
+        self.command_for = command_for
+        self.command_button = QPushButton("Copiar comando de retomada")
+        self.command_button.setToolTip("Copia o comando que continua a conversa selecionada num terminal seu, com a pasta, "
+                                       "o ambiente e o modelo desta conexão. A chave não vai junto.")
+        self.command_button.setEnabled(bool(conversations) and command_for is not None)
+        self.command_button.clicked.connect(lambda: self.copy_command("cmd"))
+        self.powershell_button = QPushButton("Copiar para PowerShell")
+        self.powershell_button.setToolTip("O mesmo comando de retomada, escrito para colar no PowerShell (5.1 ou 7). "
+                                          "A chave não vai junto.")
+        self.powershell_button.setEnabled(bool(conversations) and command_for is not None)
+        self.powershell_button.clicked.connect(lambda: self.copy_command("powershell"))
+        self.copied = StatusLine(lines=2)
+        copies = QHBoxLayout()
+        copies.addWidget(self.command_button)
+        copies.addWidget(self.powershell_button)
+        copies.addStretch()
+        self.footer_layout.addLayout(copies)
+        self.footer_layout.addWidget(self.copied)
+        self.footer_layout.addLayout(actions)
+
+    def content_floor(self) -> QSize:
+        """O piso de largura mais o que a tabela precisa para a coluna Título ter TITLE_CHARS caracteres ao lado das outras
+        colunas (que se ajustam ao conteúdo), da barra de rolagem e das margens do diálogo."""
+        table, header = self.table, self.table.horizontalHeader()
+        others = sum(max(table.sizeHintForColumn(column), header.sectionSizeHint(column))
+                     for column in range(table.columnCount()) if column != self.TITLE_COLUMN)
+        title = self.TITLE_CHARS * table.fontMetrics().averageCharWidth()
+        margins = self.MARGINS
+        width = others + title + table.verticalScrollBar().sizeHint().width() + 2 * table.frameWidth()
+        return self.floor.expandedTo(QSize(width + margins.left() + margins.right(), 0))
 
     def visible_rows(self) -> list[int]:
         return [row for row in range(self.table.rowCount()) if not self.table.isRowHidden(row)]
@@ -472,7 +664,17 @@ class ConversationsDialog(QDialog):
             self.table.selectRow(shown[0])
         self.resume.setEnabled(bool(shown))
         self.copy_button.setEnabled(bool(shown))
+        self.command_button.setEnabled(bool(shown) and self.command_for is not None)
+        self.powershell_button.setEnabled(bool(shown) and self.command_for is not None)
         self.copied.setText("")
+
+    def copy_command(self, shell: str = "cmd") -> None:
+        """Copia o comando de retomada da conversa selecionada, escrito para o `shell` (cmd ou powershell); sem
+        montá-lo, mostra o motivo e não toca na área de transferência."""
+        conversation = self.selected()
+        if not conversation or self.command_for is None:
+            return
+        copy_command_text(lambda: self.command_for(conversation, shell), shell, self.copied, "Comando de retomada")
 
     def copy(self) -> None:
         rows = [[self.table.item(row, column).text() for column in range(self.table.columnCount())]
@@ -487,134 +689,173 @@ class ConversationsDialog(QDialog):
         return item.data(Qt.ItemDataRole.UserRole) if item else None
 
 
-class InstallCliTask(QRunnable):
+class ReopenDialog(placement.GrowingDialog):
+    """Sessões que estavam abertas (session/reopen.py), marcáveis. A linha sem conversa identificada vem desmarcada e
+    desabilitada, com o motivo; `selected()` devolve só as marcadas e habilitadas."""
+
+    COLUMNS = ("Projeto", "CLI", "Última abertura", "Conversa")
+    REASON_COLUMN = 3
+
+    def __init__(self, rows: list, parent=None):
+        super().__init__(parent, QSize(640, 340))
+        self.setWindowTitle("Reabrir sessões recentes")
+        self.rows = rows
+        self.body_layout.addWidget(label(
+            f"Sessões abertas nas últimas {reopen.RECENT_HOURS} horas e que não estão abertas agora. Marque as que quer "
+            "reabrir: cada uma retoma a própria conversa, como aba da mesma janela do Terminal, sem tirar o foco.", "muted"))
+        self.table = RowsTable(len(rows), len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(list(self.COLUMNS))
+        self.table.setAccessibleName("Sessões recentes")
+        self.table.verticalHeader().hide()
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(self.REASON_COLUMN, QHeaderView.ResizeMode.Stretch)
+        for column in (0, 1, 2):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        for number, row in enumerate(rows):
+            values = (row.name, reopen.cli_label(row.cli), datetime.fromtimestamp(row.at).strftime("%d/%m/%Y %H:%M"),
+                      row.reason or f"retoma a conversa {row.conversation[:8]}")
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(f"{row.folder}\nID da conversa: {row.conversation}" if row.conversation else row.folder)
+                if row.selectable:
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable if column == 0
+                                  else Qt.ItemFlag.ItemIsEnabled)
+                else:
+                    item.setFlags(Qt.ItemFlag.ItemIsUserCheckable if column == 0 else Qt.ItemFlag.NoItemFlags)
+                if column == 0:
+                    item.setCheckState(Qt.CheckState.Checked if row.selectable else Qt.CheckState.Unchecked)
+                self.table.setItem(number, column, item)
+        self.table.itemChanged.connect(lambda _item: self.update_button())
+        self.body_layout.addWidget(self.table, 1)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel = QPushButton("Cancelar")
+        cancel.clicked.connect(self.reject)
+        actions.addWidget(cancel)
+        self.reopen_button = QPushButton("Reabrir marcadas")
+        self.reopen_button.setObjectName("primary")
+        self.reopen_button.setDefault(True)
+        self.reopen_button.clicked.connect(self.accept)
+        actions.addWidget(self.reopen_button)
+        self.footer_layout.addLayout(actions)
+        self.update_button()
+
+    def selected(self) -> list:
+        return [row for number, row in enumerate(self.rows)
+                if self.table.item(number, 0).checkState() == Qt.CheckState.Checked
+                and self.table.item(number, 0).flags() & Qt.ItemFlag.ItemIsEnabled]
+
+    def update_button(self) -> None:
+        marked = len(self.selected())
+        self.reopen_button.setEnabled(bool(marked))
+        self.reopen_button.setText(f"Reabrir {marked} marcada{'s' if marked != 1 else ''}" if marked else "Reabrir marcadas")
+
+
+class ReopenTask(BackgroundTask):
+    """Reabre as sessões marcadas, uma aba por vez (session/reopen.py), fora da thread da interface: cada aba espera a
+    janela aparecer para devolver o foco a quem estava com ele."""
+
+    def __init__(self, store: Store, rows: list):
+        super().__init__()
+        self.store = store
+        self.rows = rows
+
+    def outcome(self):
+        return reopen.open_all(self.store, self.rows), ""
+
+
+class InstallCliTask(BackgroundTask):
     """Instala a ferramenta fora da thread da interface (download de centenas de MB), relatando o progresso."""
+
+    signals_class = ProgressSignals
 
     def __init__(self, cli: str):
         super().__init__()
         self.cli = cli
-        self.signals = InstallSignals()
+        self.lines = []
 
-    @Slot()
-    def run(self):
-        lines = []
-        try:
-            found = clis.ensure(self.cli, log=lines.append, progress=lambda fraction, text: deliver(self.signals, "progress", fraction, text))
-        except Exception as error:  # falha inesperada também precisa voltar para a tela
-            found, lines = None, lines + [f"{type(error).__name__}: {error}"]
-        deliver(self.signals, "completed", found, "\n".join(lines))
+    def outcome(self):
+        found = clis.ensure(self.cli, log=self.lines.append, progress=lambda fraction, text: deliver(self.signals, "progress", fraction, text))
+        return found, "\n".join(self.lines)
+
+    def failure(self, error):
+        return None, "\n".join(self.lines + [f"{type(error).__name__}: {error}"])
 
 
-class RefreshSignals(QObject):
-    completed = Signal(object, str)
-
-
-class InstallSignals(QObject):
-    completed = Signal(object, str)
-    progress = Signal(object, str)
-
-
-class TerminalTask(QRunnable):
+class TerminalTask(BackgroundTask):
     """Instala o Windows Terminal sem admin (ZIP portátil oficial, depois winget) fora da thread da interface."""
 
     def __init__(self, root: Path):
         super().__init__()
         self.root = root
-        self.signals = RefreshSignals()
+        self.lines = []
 
-    @Slot()
-    def run(self):
-        lines = []
-        try:
-            found = terminal.ensure(self.root, log=lines.append)
-        except Exception as error:  # falha inesperada também precisa voltar para a tela
-            found, lines = None, lines + [str(error)]
-        deliver(self.signals, "completed", found, "\n".join(lines))
+    def outcome(self):
+        found = terminal.ensure(self.root, log=self.lines.append)
+        return found, "\n".join(self.lines)
+
+    def failure(self, error):
+        return None, "\n".join(self.lines + [str(error)])
 
 
-class CliCheckTask(QRunnable):
+class CliCheckTask(BackgroundTask):
     """Lê as versões instaladas (`--version`) e as publicadas no npm das CLIs, fora da thread da interface."""
 
-    def __init__(self):
-        super().__init__()
-        self.signals = RefreshSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            deliver(self.signals, "completed", cli_update.check_all(), "")
-        except Exception as error:  # falha inesperada também precisa voltar para a tela
-            deliver(self.signals, "completed", error, "")
+    def outcome(self):
+        return cli_update.check_all(), ""
 
 
-class CliUpdateTask(QRunnable):
+class CliUpdateTask(BackgroundTask):
     """Atualiza uma CLI (o `update` dela, npm ou winget) fora da thread da interface; o resultado volta com o id da CLI."""
 
     def __init__(self, cli: str):
         super().__init__()
-        self.cli = cli
-        self.signals = RefreshSignals()
+        self.cli = self.tag = cli
 
-    @Slot()
-    def run(self):
-        try:
-            deliver(self.signals, "completed", cli_update.update(self.cli), self.cli)
-        except Exception as error:  # falha inesperada também precisa voltar para a tela
-            deliver(self.signals, "completed", error, self.cli)
+    def outcome(self):
+        return cli_update.update(self.cli), self.cli
 
 
-class TerminalUpdateTask(QRunnable):
+class TerminalUpdateTask(BackgroundTask):
     """Atualiza o Windows Terminal portátil (a cópia que o launcher instalou) fora da thread da interface."""
 
     def __init__(self, root: Path):
         super().__init__()
         self.root = root
-        self.signals = RefreshSignals()
 
-    @Slot()
-    def run(self):
-        try:
-            deliver(self.signals, "completed", terminal.update_portable(self.root) or "", "")
-        except Exception as error:  # falha inesperada também precisa voltar para a tela
-            deliver(self.signals, "completed", error, "")
+    def outcome(self):
+        return terminal.update_portable(self.root) or "", ""
 
 
-class UpdateTask(QRunnable):
+class UpdateTask(BackgroundTask):
     """Confere o engine-registry e, havendo versão nova, instala por cima (fora da thread da interface)."""
 
     def __init__(self, root: Path):
         super().__init__()
         self.root = root
-        self.signals = RefreshSignals()
 
-    @Slot()
-    def run(self):
-        try:
-            deliver(self.signals, "completed", updater.update(self.root), "")
-        except Exception as error:  # rede, integridade ou instalador: volta para a tela/diagnóstico
-            deliver(self.signals, "completed", error, "")
+    def outcome(self):
+        return updater.update(self.root), ""
 
 
-class RefreshTask(QRunnable):
+class RefreshTask(BackgroundTask):
     def __init__(self, home: Path, connection: str, force: bool):
         super().__init__()
         self.home = home
-        self.connection = connection
+        self.connection = self.tag = connection
         self.force = force
-        self.signals = RefreshSignals()
 
-    @Slot()
-    def run(self):
-        try:
-            store = Store(self.home)
-            gateway = Gateway(store, store.find_connection(self.connection))
-            catalog = gateway.catalog(refresh=self.force)
-            deliver(self.signals, "completed", catalog, self.connection)
-        except Exception as error:
-            deliver(self.signals, "completed", error, self.connection)
+    def outcome(self):
+        store = Store(self.home)
+        gateway = Gateway(store, store.find_connection(self.connection))
+        return gateway.catalog(refresh=self.force), self.connection
 
 
-class CleanupTask(QRunnable):
+class CleanupTask(BackgroundTask):
     """Limpeza nos destinos das conexões de um perfil (harnesses/cleanup.py) fora da thread da interface. A
     confirmação já foi feita pela interface: aqui o confirm sempre aceita (nada de QMessageBox em outra thread)."""
 
@@ -622,75 +863,49 @@ class CleanupTask(QRunnable):
         super().__init__()
         self.home = home
         self.cleanup = cleanup
-        self.signals = RefreshSignals()
 
-    @Slot()
-    def run(self):
-        try:
-            from agent_launcher.harnesses.cleanup import cleanup_profile
-            deliver(self.signals, "completed", (self.cleanup or cleanup_profile)(self.home, lambda *_: True), "")
-        except Exception as error:  # volta para a tela como aviso, nunca derruba a thread
-            from agent_launcher.harnesses.cleanup import failure
-            deliver(self.signals, "completed", [failure("Limpeza nos destinos", error)], "")
+    def outcome(self):
+        from agent_launcher.harnesses.cleanup import cleanup_profile
+        return (self.cleanup or cleanup_profile)(self.home, lambda *_: True), ""
+
+    def failure(self, error):
+        from agent_launcher.harnesses.cleanup import failure
+        return [failure("Limpeza nos destinos", error)], ""
 
 
-class UsageTask(QRunnable):
+class UsageTask(BackgroundTask):
     """Uso do mês do perfil (domain/usage.py) fora da thread da interface: pode ler muitos arquivos de conversa."""
 
     def __init__(self, home: Path, month: str | None = None, everyone: bool = False):
         super().__init__()
         self.home, self.month, self.everyone = home, month, everyone
-        self.signals = RefreshSignals()
 
-    @Slot()
-    def run(self):
-        try:
-            report = usage.usage_report_all if self.everyone else usage.usage_report
-            deliver(self.signals, "completed", report(self.home, self.month), "")
-        except Exception as error:  # volta para a tela como erro, nunca derruba a thread
-            deliver(self.signals, "completed", error, "")
+    def outcome(self):
+        report = usage.usage_report_all if self.everyone else usage.usage_report
+        return report(self.home, self.month), ""
 
 
-def usage_rows(report: dict) -> list[tuple[str, str, str, str, str]]:
-    """Linhas da tabela do diálogo de uso: destino, modelo, entrada (com cache), saída, custo."""
-    names = {"claude": "Claude Code", "codex": "Codex", "copilot": "Copilot CLI", "vscode": "VS Code",
-             "copilot_app": "Copilot app", "endpoint": "Endpoint local"}
+class SourceCostsTask(BackgroundTask):
+    """Custo do mês por fonte (a rota `costs` do conector da conexão) fora da thread da interface: é uma chamada de rede."""
 
-    def tokens(value: int) -> str:
-        return f"{value:,}".replace(",", ".")
+    def __init__(self, gateway: Gateway, month: str):
+        super().__init__()
+        self.gateway, self.month = gateway, month
 
-    def money(value) -> str:
-        return f"US$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-    rows = []
-    unpriced = False
-    for row in report.get("models", []):
-        entrada = row["input_tokens"] + row["cache_read"] + row["cache_write"]
-        priced = row.get("priced", row["cost"] is not None) and row["cost"] is not None
-        unpriced = unpriced or not priced
-        rows.append((names.get(row["destination"], row["destination"]), row["model"], tokens(entrada),
-                     tokens(row["output_tokens"]), money(row["cost"]) if priced else "sem preço"))
-    total = report.get("total") or {}
-    if rows:
-        if total.get("cost") is None:
-            total_cost = "sem preço"
-        else:
-            total_cost = money(total["cost"]) + (" (parcial)" if unpriced else "")
-        rows.append(("Total", "", tokens(total.get("input_tokens", 0) + total.get("cache_read", 0)
-                                         + total.get("cache_write", 0)),
-                     tokens(total.get("output_tokens", 0)), total_cost))
-    return rows
+    def outcome(self):
+        return self.gateway.costs(self.month), ""
 
 
-USAGE_HEADER = ("Destino", "Modelo", "Entrada", "Saída", "Custo")
+class ModelTestTask(BackgroundTask):
+    """Chamada real de 1 token (domain/model_probe.py) fora da thread da interface: o host pode demorar a responder."""
 
+    def __init__(self, home: Path, connection_id: str, model: str, protocol: str):
+        super().__init__()
+        self.home, self.connection_id, self.model, self.protocol = home, connection_id, model, protocol
+        self.tag = model
 
-def usage_text(report: dict) -> str:
-    """O relatório de uso separado por tabulação: colado numa planilha, cada valor cai na sua coluna."""
-    scope = " (todos os perfis)" if report.get("profile") == "todos" else ""
-    lines = [f"Mês {report['month']}{scope}", "\t".join(USAGE_HEADER)]
-    lines += ["\t".join(row) for row in usage_rows(report)]
-    return "\n".join(lines)
+    def outcome(self):
+        return model_probe.probe(self.home, self.connection_id, self.model, self.protocol), self.model
 
 
 MODEL_ORDERS = (("Ordenar: Nome", "name"), ("Ordenar: Contexto", "context"), ("Ordenar: Preço", "price"))
@@ -713,28 +928,42 @@ def order_models(records: list, order: str) -> list:
     return known + [record for record in ordered if values[order](record) is None]
 
 
-MODELS_HEADER = ("Modelo", "Provider", "Entrada", "Saída", "Preço (US$ por 1M, entrada/saída)", *(title for _, title, _ in MEDIA_COLUMNS))
-
-
 def models_text(records: list, catalog) -> str:
-    """A lista de modelos separada por tabulação: colada numa planilha, cada valor cai na sua coluna."""
-    lines = ["\t".join(MODELS_HEADER)]
+    """A lista de modelos separada por tabulação: colada numa planilha, cada valor cai na sua coluna. A coluna Fonte só
+    entra quando o conector do catálogo declara fontes."""
+    with_source = catalog.segregates_sources
+    lines = ["\t".join(["Modelo", "Provider", *(["Fonte"] if with_source else []), "Entrada", "Saída",
+                        "Preço (US$ por 1M, entrada/saída)", *(title for _, title, _ in MEDIA_COLUMNS)])]
     for record in records:
         states = ["—" if state is None else "sim" if state else "não" for _title, state in media_states(record)]
         output = "—" if record.max_output_tokens is None else token_label(record.max_output_tokens)
-        lines.append("\t".join([record.id, provider_name(record.provider), token_label(record.max_input_tokens), output,
-                                 price_label(record) or "—", *states]))
+        lines.append("\t".join([record.id, provider_name(record.provider), *([record.source or ""] if with_source else []),
+                                 token_label(record.max_input_tokens), output, price_label(record) or "—", *states]))
     return "\n".join(lines)
+
+
+class UsageTable(RowsTable):
+    """Tabela do uso do mês: o diálogo nunca a deixa com menos de quatro linhas à vista."""
+
+    ROWS = 4
 
 
 class UsageDialog(QDialog):
     from agent_launcher.domain.usage import NOTE
 
-    def __init__(self, parent, home: Path, profile_name: str):
+    SOURCE_COST_ROWS = 6
+
+    limit_saved = Signal()
+
+    def __init__(self, parent, home: Path, profile_name: str, gateway: Gateway | None = None):
+        """`gateway`: a conexão selecionada; só com ela declarando fontes e oferecendo a rota de custo o diálogo ganha a
+        seção "Custo por fonte" (`source_costs_title`, `source_costs_status`, `source_costs_table`); sem isso os três
+        valem None e nada de custo por fonte aparece."""
         super().__init__(parent)
         self.setWindowTitle(f"Uso do mês — {profile_name}")
-        self.resize(760, 420)
         self.home = home
+        self.gateway = gateway if gateway is not None and gateway.offers_costs else None
+        self.resize(760, 420 if self.gateway is None else 600)
         layout = QVBoxLayout(self)
         choice = QHBoxLayout()
         self.month_label = QLabel("Mês")
@@ -757,7 +986,7 @@ class UsageDialog(QDialog):
         self.error.setWordWrap(True)
         self.error.hide()
         layout.addWidget(self.error)
-        self.table = QTableWidget(0, len(USAGE_HEADER))
+        self.table = UsageTable(0, len(USAGE_HEADER))
         self.table.setHorizontalHeaderLabels(list(USAGE_HEADER))
         for column in range(2, len(USAGE_HEADER)):
             self.table.horizontalHeaderItem(column).setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -769,9 +998,41 @@ class UsageDialog(QDialog):
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table, 1)
+        self.source_costs_title = self.source_costs_status = self.source_costs_table = self.source_costs_task = None
+        if self.gateway is not None:
+            self.build_source_costs(layout)
         self.note = QLabel(self.NOTE)
         self.note.setWordWrap(True)
         layout.addWidget(self.note)
+        limit_row = QHBoxLayout()
+        self.limit_label = QLabel("Limite mensal (US$)")
+        limit_row.addWidget(self.limit_label)
+        self.limit_edit = QLineEdit()
+        self.limit_edit.setAccessibleName("Limite mensal")
+        self.limit_edit.setPlaceholderText("Sem limite")
+        self.limit_edit.setToolTip("Teto de gasto do mês deste perfil. A janela avisa a 80% e a 100%; nada é bloqueado. "
+                                   "Vazio desliga.")
+        self.limit_edit.setFixedWidth(130)
+        self.limit, self.limit_unavailable = None, ""
+        try:
+            self.limit = Store(home).monthly_limit()
+        except (LauncherError, OSError, ValueError) as error:
+            self.limit_unavailable = f"Limite mensal indisponível: {error}"
+            self.limit_edit.setEnabled(False)
+        self.limit_edit.setText("" if self.limit is None else usage.format_limit(self.limit))
+        self.limit_edit.returnPressed.connect(self.save_limit)
+        self.limit_label.setBuddy(self.limit_edit)
+        limit_row.addWidget(self.limit_edit)
+        self.limit_save = QPushButton("Salvar")
+        self.limit_save.setEnabled(not self.limit_unavailable)
+        self.limit_save.clicked.connect(self.save_limit)
+        limit_row.addWidget(self.limit_save)
+        self.limit_note = QLabel("")
+        self.limit_note.setObjectName("muted")
+        self.limit_note.setWordWrap(True)
+        limit_row.addWidget(self.limit_note, 1)
+        layout.addLayout(limit_row)
+        self.limit_basis = None  # o último relatório calculado, a base do percentual do limite
         actions = QHBoxLayout()
         self.copy_button = QPushButton("Copiar relatório")
         self.copy_button.setEnabled(False)
@@ -789,16 +1050,82 @@ class UsageDialog(QDialog):
         self.month_choice.currentIndexChanged.connect(self.calculate)
         self.calculate()
 
+    def build_source_costs(self, layout: QVBoxLayout) -> None:
+        """A seção "Custo por fonte" da conexão: título, estado e a tabela de `usage.SOURCE_COST_HEADER`."""
+        self.source_costs_title = label(f"Custo por fonte • {self.gateway.name}", "section")
+        layout.addWidget(self.source_costs_title)
+        self.source_costs_status = label("", "muted")
+        self.source_costs_status.setWordWrap(True)
+        self.source_costs_status.hide()
+        layout.addWidget(self.source_costs_status)
+        table = self.source_costs_table = QTableWidget(0, len(usage.SOURCE_COST_HEADER))
+        table.setAccessibleName("Custo do mês por fonte")
+        table.setHorizontalHeaderLabels(list(usage.SOURCE_COST_HEADER))
+        for column in range(1, len(usage.SOURCE_COST_HEADER)):
+            table.horizontalHeaderItem(column).setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        table.horizontalHeaderItem(0).setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        layout.addWidget(table)
+        self.fit_source_costs_height()
+
+    def fit_source_costs_height(self) -> None:
+        """A tabela de custo tem a altura do cabeçalho e das suas linhas (até `SOURCE_COST_ROWS`, depois rola): sem sobra
+        abaixo do Total."""
+        table = self.source_costs_table
+        shown = min(table.rowCount(), self.SOURCE_COST_ROWS)
+        table.setFixedHeight(table.horizontalHeader().sizeHint().height() + shown * table.verticalHeader().defaultSectionSize()
+                             + 2 * table.frameWidth())
+
+    def set_source_costs_status(self, text: str) -> None:
+        self.source_costs_status.setText(text)
+        self.source_costs_status.setVisible(bool(text))
+
+    def load_source_costs(self) -> None:
+        """Pede ao conector o custo por fonte do mês escolhido; a resposta de um mês anterior que chega depois é descartada."""
+        month = self.month_choice.currentData()
+        self.set_source_costs_status("Calculando…")
+        self.source_costs_table.setRowCount(0)
+        self.fit_source_costs_height()
+        task = self.source_costs_task = SourceCostsTask(self.gateway, month)
+        run_task(task, lambda result, text="": task is self.source_costs_task
+                 and self.show_source_costs(result, month))
+
+    def show_source_costs(self, result, month: str) -> None:
+        if isinstance(result, Exception):
+            self.set_source_costs_status(f"Não foi possível ler o custo por fonte: {result}")
+            return
+        rows = usage.source_costs_rows(result)
+        self.set_source_costs_status("" if rows else f"O conector não informou custo por fonte em {month}.")
+        table = self.source_costs_table
+        table.setRowCount(len(rows))
+        for number, row in enumerate(rows):
+            for column, value in enumerate(row):
+                item = QTableWidgetItem(value)
+                if column >= 1:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if number == len(rows) - 1:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                table.setItem(number, column, item)
+        self.fit_source_costs_height()
+
     def calculate(self) -> None:
         """Calcula o mês escolhido; o resultado de uma escolha anterior que chega depois é descartado."""
+        if self.gateway is not None:
+            self.load_source_costs()
         self.status.setText("Calculando…")
         self.error.hide()
-        self.report = None
+        self.report = self.limit_basis = None
+        self.show_limit_note()
         self.copy_button.setEnabled(False)
         self.table.setRowCount(0)
         task = self.task = UsageTask(self.home, self.month_choice.currentData(), self.everyone_check.isChecked())
-        task.signals.completed.connect(lambda report, text="": task is self.task and self.show_report(report, text))
-        QThreadPool.globalInstance().start(task)
+        run_task(task, lambda report, text="": task is self.task and self.show_report(report, text))
 
     def show_report(self, report, _text: str = ""):
         if isinstance(report, Exception):
@@ -807,6 +1134,8 @@ class UsageDialog(QDialog):
             self.error.show()
             return
         self.error.hide()
+        self.limit_basis = report
+        self.show_limit_note()
         rows = usage_rows(report)
         self.note.setText(self.NOTE.replace("deste perfil", "de cada perfil") if report.get("profile") == "todos" else self.NOTE)
         self.report = report if rows else None
@@ -831,31 +1160,152 @@ class UsageDialog(QDialog):
         QApplication.clipboard().setText(usage_text(self.report))
         self.copied.setText("Relatório copiado: cole numa planilha, cada valor vai para a sua coluna.")
 
+    def show_limit_note(self, saved: bool = False) -> None:
+        """O gasto do mês frente ao limite do perfil (ou o estado do limite, sem relatório ou na soma de perfis)."""
+        report = self.limit_basis
+        if self.limit_unavailable:
+            text = self.limit_unavailable
+        elif self.limit is None:
+            text = "Limite desligado: nenhum aviso." if saved else "Sem limite mensal: a janela não avisa."
+        elif report is not None and report.get("profile") == "todos":
+            text = "O limite vale para cada perfil: a soma de todos não é comparada com ele."
+        elif report is not None:
+            text = f"Limite mensal: {usage.limit_text(usage.limit_status(report, self.limit))}."
+        else:
+            text = "Limite mensal salvo." if saved else ""
+        self.limit_note.setText(text)
+
+    def save_limit(self) -> None:
+        """Grava o limite do campo (vazio desliga) no perfil e avisa a janela para refazer o aviso da faixa."""
+        try:
+            value = usage.parse_limit(self.limit_edit.text())
+            Store(self.home).set_monthly_limit(value)
+        except (LauncherError, OSError, ValueError) as error:
+            self.error.setText(f"Não foi possível salvar o limite: {error}")
+            self.error.show()
+            return
+        self.error.hide()
+        self.limit = value
+        self.limit_edit.setText("" if value is None else usage.format_limit(value))
+        self.show_limit_note(saved=True)
+        self.limit_saved.emit()
+
 
 PROJECT_TEXT = Qt.ItemDataRole.UserRole + 1  # texto e dica do projeto sem a marca de sessão aberta
 PROJECT_PINNED = Qt.ItemDataRole.UserRole + 2
-TRAY_NOTICE_MS = 10_000  # o Windows mostra o balão por tempo próprio; o ícone fica este tempo para o balão não sumir com ele
+SESSION_POLL_MS = 1500
+TRAY_NOTICE_MS = 10_000 # o Windows mostra o balão por tempo próprio; o ícone fica este tempo para o balão não sumir com ele
 GENERAL_ERROR = "geral"  # origem do erro avulso de uma ação; os erros persistentes têm origem própria
+MODEL_TEST = "teste-modelo"  # origem do rodapé e do erro do teste de modelo com uma chamada real
 
 
 class ModelTable(QTableWidget):
-    """Lista de modelos: a coluna do nome ocupa o que sobra das colunas fixas e nunca fica menor que o nome mais
-    comprido (ou NAME_MIN, sem linhas); na janela estreita a tabela rola na horizontal em vez de espremer o nome."""
+    """Lista de modelos, sem rolagem horizontal. Com largura para o conforto (colunas depois do nome na largura de
+    sempre, nome inteiro) a coluna do nome ocupa o que sobra; na janela estreita as margens das células caem para a
+    metade, os cabeçalhos de mídia viram só o ícone (o título fica na dica) e as colunas de texto dividem o que resta,
+    com reticências e a dica com o texto inteiro."""
 
     NAME_MIN = 200
     NAME_PADDING = 24
+    TIGHT = 16
+    TIGHT_STYLE = "QHeaderView::section { padding: 10px 4px; } QTableWidget::item { padding: 0 4px; }"
+    ICON = 16
+
+    def __init__(self, rows: int, columns: int, parent=None):
+        super().__init__(rows, columns, parent)
+        self.roomy: dict[int, int] = {}
+        self.text_columns: tuple[int, ...] = ()
+        self.media: tuple[tuple[int, str, str], ...] = ()
+        self.title_hints: dict[int, int] = {}
+        self.compact = False
+        self.fitting = False
+
+    def configure(self, roomy: dict[int, int], text_columns: tuple[int, ...], media: tuple[tuple[int, str, str], ...]) -> None:
+        """Recomeça no conforto, com os cabeçalhos em texto: `roomy` é a largura de sempre de cada coluna depois do nome,
+        `text_columns` as que dividem o que sobra na janela estreita e `media` as colunas (índice, título, símbolo) cujo
+        cabeçalho vira ícone."""
+        self.roomy, self.text_columns, self.media = roomy, text_columns, media
+        self.title_hints = {}
+        self.compact = False
+        self.setStyleSheet("")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.fit_name_column()
+        self.fit_columns()
 
-    def fit_name_column(self) -> None:
-        fixed = sum(self.columnWidth(column) for column in range(1, self.columnCount()))
-        whole_name = self.sizeHintForColumn(0) + self.NAME_PADDING
-        self.setColumnWidth(0, max(self.viewport().width() - fixed, whole_name, self.NAME_MIN))
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.fit_columns()
+
+    def set_compact(self, compact: bool) -> None:
+        if compact == self.compact:
+            return
+        self.compact = compact
+        self.setStyleSheet(self.TIGHT_STYLE if compact else "")
+        for column, title, symbol in self.media:
+            item = self.horizontalHeaderItem(column)
+            item.setText("" if compact else title)
+            item.setIcon(icon(symbol, MUTED, self.ICON) if compact else QIcon())
+            item.setToolTip(title if compact else "")
+            item.setData(Qt.ItemDataRole.AccessibleTextRole, title)
+
+    def fit_columns(self) -> None:
+        count = self.columnCount()
+        if self.fitting or not count or not self.isVisible():
+            return
+        self.fitting = True
+        try:
+            if not self.roomy:
+                self.roomy = {column: self.columnWidth(column) for column in range(1, count)}
+            header = self.horizontalHeader()
+            if not self.compact:
+                self.title_hints = {column: header.sectionSizeHint(column) for column in range(count)}
+            width = self.viewport().width()
+            extra = self.TIGHT if self.compact else 0
+            wants = {column: max(self.roomy.get(column, 0), self.title_hints.get(column, 0),
+                                 self.sizeHintForColumn(column) + extra) for column in range(1, count)}
+            whole_name = self.sizeHintForColumn(0) + extra + self.NAME_PADDING
+            compact = width < sum(wants.values()) + max(whole_name, self.NAME_MIN)
+            self.set_compact(compact)
+            if compact:
+                self.share_width(width)
+            else:
+                for column, wanted in wants.items():
+                    self.setColumnWidth(column, wanted)
+                self.setColumnWidth(0, width - sum(wants.values()))
+        finally:
+            self.fitting = False
+
+    def share_width(self, width: int) -> None:
+        """Janela estreita: as colunas de números e de mídia ficam do tamanho do cabeçalho ou do valor; as de texto
+        repartem o resto, cada uma com pelo menos o cabeçalho e o excesso do que pede dividido na proporção do que pede."""
+        header = self.horizontalHeader()
+        elastic = (0, *self.text_columns)
+        used = 0
+        for column in range(1, self.columnCount()):
+            if column not in elastic:
+                size = max(header.sectionSizeHint(column), self.sizeHintForColumn(column))
+                self.setColumnWidth(column, size)
+                used += size
+        floor = {column: header.sectionSizeHint(column) for column in elastic}
+        asked = {column: max(floor[column], self.sizeHintForColumn(column)) for column in elastic}
+        room = width - used
+        spare = max(room - sum(floor.values()), 0)
+        extra = sum(asked[column] - floor[column] for column in elastic)
+        shares = {column: floor[column] + (spare * (asked[column] - floor[column]) // extra if extra else 0)
+                  for column in elastic}
+        if spare > extra:
+            shares[0] += spare - extra
+        shares[0] += room - sum(shares.values())
+        for column, size in shares.items():
+            self.setColumnWidth(column, size)
 
 
 class LauncherWindow(QMainWindow):
+    NARROW_WINDOW = 1000
+    NARROW_SIDE = 20
+    WIDE_SIDE = 32
+
     def __init__(self, store: Store | None = None, auto_refresh: bool = True):
         super().__init__()
         self.store = store or active_store()
@@ -874,12 +1324,17 @@ class LauncherWindow(QMainWindow):
         self.online = False
         self.refreshing = False
         self.sessions = []
+        self.reopening = False
         self.terminal_installing = False
         self.terminal_updating = False
         self.cli_versions = {}
         self.cli_queue = []
         self.cli_checking = False
         self.cli_updating = None
+        self.limit_checking = False
+        self.source_limit_checking = False
+        self.source_limit_task = None
+        self.model_testing = False
         self.errors: dict[str, str] = {}  # origem -> erro ativo; cada um some só quando a sua origem se resolve
         self.warnings: dict[str, str] = {}  # origem -> aviso (algo não aconteceu, nada parou de funcionar); some como o erro
         self.infos: dict[str, str] = {}  # origem -> informativo; a mesma origem substitui o seu, origens diferentes convivem
@@ -907,12 +1362,17 @@ class LauncherWindow(QMainWindow):
         self.tray_timer.timeout.connect(self.release_tray)
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.check_sessions)
-        self.refresh_timer.start(1500)
+        self.watching_sessions = False
+        self.session_watcher = QFileSystemWatcher(self)
+        self.session_watcher.directoryChanged.connect(self.sessions_changed)
+        self.watch_sessions()
+        self.check_sessions()
         QApplication.instance().applicationStateChanged.connect(self.recheck_tools)
         self.shortcuts = []
         for sequence, callback in (("Ctrl+K", self.project_search.setFocus), ("Ctrl+F", self.model_search.setFocus),
                                    ("Ctrl+N", self.add_project), ("F5", lambda: self.refresh_catalog(True)),
                                    ("Ctrl+R", self.resume_by_shortcut), ("Ctrl+H", lambda: self.choose_conversation()),
+                                   ("Ctrl+Shift+H", self.reopen_recent_sessions),
                                    ("Ctrl+U", lambda: self.show_usage()), ("Ctrl+Return", self.launch_by_shortcut),
                                    ("Ctrl+Enter", self.launch_by_shortcut)):
             shortcut = QShortcut(QKeySequence(sequence), self)
@@ -925,7 +1385,20 @@ class LauncherWindow(QMainWindow):
             self.update_timer = QTimer(self)
             self.update_timer.timeout.connect(self.start_auto_update)
             self.update_timer.start(UPDATE_INTERVAL_MS)
+            QTimer.singleShot(0, self.check_limit)
+            self.limit_timer = QTimer(self)
+            self.limit_timer.timeout.connect(self.check_limit)
+            self.limit_timer.start(LIMIT_INTERVAL_MS)
             QTimer.singleShot(800, self.ensure_terminal)
+            QTimer.singleShot(1500, self.show_release_notes_once)
+
+    def resizeEvent(self, event):
+        """Na janela estreita as margens laterais do conteúdo caem de 32 para 20 px: a tabela de modelos ganha 24 px."""
+        super().resizeEvent(event)
+        side = self.NARROW_SIDE if event.size().width() < self.NARROW_WINDOW else self.WIDE_SIDE
+        for layout, top, bottom in self.side_margins:
+            if layout.contentsMargins().left() != side:
+                layout.setContentsMargins(side, top, side, bottom)
 
     def _build(self):
         root = QWidget()
@@ -1077,12 +1550,14 @@ class LauncherWindow(QMainWindow):
         self.copied_timer.timeout.connect(lambda: self.end_footer("copia"))
         banner_row = QHBoxLayout()
         banner_row.setContentsMargins(32, 14, 32, 0)
+        self.side_margins = [(banner_row, 14, 0)]
         banner_row.addWidget(self.restart_banner)
         column.addLayout(banner_row)
         scrolled = QWidget()
         scrolled.setObjectName("page")
         body = QVBoxLayout(scrolled)
         body.setContentsMargins(32, 26, 32, 12)
+        self.side_margins.append((body, 26, 12))
         body.setSpacing(12)
         self.page = QScrollArea()
         self.page.setObjectName("page")
@@ -1095,6 +1570,7 @@ class LauncherWindow(QMainWindow):
         dock_frame.setObjectName("actionsBar")
         dock = QVBoxLayout(dock_frame)
         dock.setContentsMargins(32, 12, 32, 18)
+        self.side_margins.append((dock, 12, 18))
         dock.setSpacing(8)
         column.addWidget(dock_frame)
         top = FlowRow(12)
@@ -1130,12 +1606,12 @@ class LauncherWindow(QMainWindow):
         self.update_preference = QAction("Atualizar automaticamente", self)
         self.update_preference.setCheckable(True)
         self.update_preference.setChecked(self.store.preference("auto_update"))
-        self.update_preference.toggled.connect(self.set_auto_update)
+        self.update_preference.toggled.connect(lambda checked: self.save_preference("auto_update", checked))
         menu.addAction(self.update_preference)
         self.cli_update_preference = QAction("Atualizar as CLIs automaticamente", self)
         self.cli_update_preference.setCheckable(True)
         self.cli_update_preference.setChecked(self.store.preference("cli_auto_update"))
-        self.cli_update_preference.toggled.connect(self.set_cli_auto_update)
+        self.cli_update_preference.toggled.connect(lambda checked: self.save_preference("cli_auto_update", checked))
         menu.addAction(self.cli_update_preference)
         menu.addAction("Tema da interface…", self.choose_theme)
         menu.addAction("Instruções e comandos…", self.show_instructions)
@@ -1190,10 +1666,18 @@ class LauncherWindow(QMainWindow):
         self.model_search.textChanged.connect(self.populate_models)
         search_row.addWidget(self.model_search, 1)
         self.provider_filter = ReadableCombo()
+        self.provider_filter.tighten()
         self.provider_filter.setAccessibleName("Filtrar provider")
         self.provider_filter.currentIndexChanged.connect(self.populate_models)
         search_row.addWidget(self.provider_filter)
+        self.source_filter = ReadableCombo()
+        self.source_filter.tighten()
+        self.source_filter.setAccessibleName("Filtrar fonte")
+        self.source_filter.currentIndexChanged.connect(self.populate_models)
+        search_row.addWidget(self.source_filter)
+        self.source_filter.hide()
         self.media_filter = ReadableCombo()
+        self.media_filter.tighten()
         self.media_filter.setAccessibleName("Filtrar por entrada")
         for text, field in MEDIA_FILTERS:
             self.media_filter.addItem(text, field)
@@ -1201,6 +1685,7 @@ class LauncherWindow(QMainWindow):
         self.media_filter.currentIndexChanged.connect(self.populate_models)
         choices_row.addWidget(self.media_filter)
         self.model_order = ReadableCombo()
+        self.model_order.tighten()
         self.model_order.setAccessibleName("Ordenar modelos")
         for text, order in MODEL_ORDERS:
             self.model_order.addItem(text, order)
@@ -1209,10 +1694,12 @@ class LauncherWindow(QMainWindow):
         self.model_order.currentIndexChanged.connect(self.populate_models)
         choices_row.addWidget(self.model_order)
         self.copy_models_button = button("Copiar lista", "copy", "ghost")
+        self.copy_models_button.setAccessibleName("Copiar lista")
         self.copy_models_button.setToolTip("Copia a lista como está filtrada, separada por tabulação, para colar numa planilha")
         self.copy_models_button.clicked.connect(self.copy_models)
         actions_row.addWidget(self.copy_models_button)
         self.refresh_button = button("Atualizar", "refresh")
+        self.refresh_button.setAccessibleName("Atualizar")
         self.refresh_button.setToolTip("Atualizar catálogo e verificar proxy (F5)")
         self.refresh_button.clicked.connect(lambda: self.refresh_catalog(True))
         actions_row.addWidget(self.refresh_button)
@@ -1224,31 +1711,20 @@ class LauncherWindow(QMainWindow):
         filters.add(tools, width=lambda: choices_box.minimumSizeHint().width() + tools.box.spacing()
                     + actions_box.minimumSizeHint().width())
         body.addWidget(filters)
-        self.model_table = ModelTable(0, FIRST_MEDIA_COLUMN + len(MEDIA_COLUMNS))
-        self.model_table.setAccessibleName("Modelos disponíveis: nome, provider, entrada, saída, visão, áudio e vídeo")
-        self.model_table.setHorizontalHeaderLabels(["Modelo", "Provider", "Entrada", "Saída", *(title for _, title, _ in MEDIA_COLUMNS)])
+        self.model_table = ModelTable(0, 0)
         self.model_table.verticalHeader().hide()
         self.model_table.verticalHeader().setDefaultSectionSize(40)
-        self.model_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.model_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.model_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self.model_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.model_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        for column in (2, 3):
-            self.model_table.horizontalHeaderItem(column).setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.model_table.setColumnWidth(1, 115)
-        self.model_table.setColumnWidth(2, 90)
-        self.model_table.setColumnWidth(3, 80)
-        for column in range(FIRST_MEDIA_COLUMN, FIRST_MEDIA_COLUMN + len(MEDIA_COLUMNS)):
-            self.model_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
-            self.model_table.horizontalHeaderItem(column).setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.model_table.setColumnWidth(column, 64)
+        self.source_column = None
+        self.layout_model_columns(False)
         self.model_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.model_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.model_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.model_table.setShowGrid(False)
         self.model_table.setMinimumHeight(160)
         self.model_table.itemSelectionChanged.connect(self.select_model)
+        self.model_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.model_table.customContextMenuRequested.connect(self.model_menu)
         body.addWidget(self.model_table, 1)
         self.empty_models = label("", "muted")
         self.empty_models.setWordWrap(True)
@@ -1380,10 +1856,12 @@ class LauncherWindow(QMainWindow):
         else:
             self.select_project(None)
 
-    def mark_open_sessions(self):
-        """Marca na lista os projetos com sessão aberta agora, aberta por esta ou por outra instância do launcher."""
+    def mark_open_sessions(self) -> int:
+        """Marca na lista os projetos com sessão aberta agora, aberta por esta ou por outra instância do launcher.
+        Devolve quantas sessões estão registradas."""
         open_clis: dict[str, list[str]] = {}
-        for session in keys.sessions():
+        registered = keys.sessions()
+        for session in registered:
             open_clis.setdefault(session.get("project_id"), []).append(label_of(session.get("cli", "")))
         for index in range(self.project_list.count()):
             item = self.project_list.item(index)
@@ -1396,6 +1874,7 @@ class LauncherWindow(QMainWindow):
             if item.text() != text:
                 item.setText(text)
             item.setToolTip(tip)
+        return len(registered)
 
     def filter_projects(self):
         query = self.project_search.text().strip().casefold()
@@ -1429,18 +1908,11 @@ class LauncherWindow(QMainWindow):
     def bypass_default(self) -> bool:
         return self.store.preference("bypass_default")
 
-    def set_auto_update(self, checked):
+    def save_preference(self, key: str, checked: bool) -> None:
+        """Grava a preferência `key` do perfil; a falha vira erro na faixa em vez de derrubar a janela."""
         try:
             fresh = Store(self.store.home)
-            fresh.set_preference("auto_update", checked)
-            self.store = fresh
-        except (LauncherError, OSError, ValueError) as error:
-            self.show_error(f"Não foi possível salvar a preferência: {error}")
-
-    def set_cli_auto_update(self, checked):
-        try:
-            fresh = Store(self.store.home)
-            fresh.set_preference("cli_auto_update", checked)
+            fresh.set_preference(key, checked)
             self.store = fresh
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(f"Não foi possível salvar a preferência: {error}")
@@ -1450,8 +1922,7 @@ class LauncherWindow(QMainWindow):
             return
         self.cli_checking = True
         self.cli_check_task = CliCheckTask()
-        self.cli_check_task.signals.completed.connect(self.finish_cli_check)
-        QThreadPool.globalInstance().start(self.cli_check_task)
+        run_task(self.cli_check_task, self.finish_cli_check)
 
     @Slot(object, str)
     def finish_cli_check(self, result, _unused=""):
@@ -1509,8 +1980,7 @@ class LauncherWindow(QMainWindow):
         self.refresh_cli_versions()
         self.update_actions()
         self.cli_update_task = CliUpdateTask(self.cli_updating)
-        self.cli_update_task.signals.completed.connect(self.finish_cli_update)
-        QThreadPool.globalInstance().start(self.cli_update_task)
+        run_task(self.cli_update_task, self.finish_cli_update)
 
     @Slot(object, str)
     def finish_cli_update(self, result, cli):
@@ -1558,8 +2028,7 @@ class LauncherWindow(QMainWindow):
             return
         self.terminal_updating = True
         self.terminal_update_task = TerminalUpdateTask(ROOT)
-        self.terminal_update_task.signals.completed.connect(self.finish_terminal_update)
-        QThreadPool.globalInstance().start(self.terminal_update_task)
+        run_task(self.terminal_update_task, self.finish_terminal_update)
 
     @Slot(object, str)
     def finish_terminal_update(self, result, _unused=""):
@@ -1585,8 +2054,7 @@ class LauncherWindow(QMainWindow):
         else:
             self.update_status = "verificando…"
             self.update_task = UpdateTask(ROOT)
-            self.update_task.signals.completed.connect(self.finish_auto_update)
-            QThreadPool.globalInstance().start(self.update_task)
+            run_task(self.update_task, self.finish_auto_update)
 
     @Slot(object, str)
     def finish_auto_update(self, result, _unused=""):
@@ -1727,7 +2195,7 @@ class LauncherWindow(QMainWindow):
             item = self.project_list.item(index)
             item.setIcon(project_icon(item, item is current))
         for row, record in enumerate(self.records):
-            for column, (field, _title, symbol) in enumerate(MEDIA_COLUMNS, start=FIRST_MEDIA_COLUMN):
+            for column, (field, _title, symbol) in enumerate(MEDIA_COLUMNS, start=self.media_column):
                 item, state = self.model_table.item(row, column), getattr(record, field)
                 if item is not None and state is not None:
                     item.setIcon(media_icon(symbol, state))
@@ -1747,9 +2215,11 @@ class LauncherWindow(QMainWindow):
         self.select_connection()
 
     def select_connection(self, *_args):
+        """Adota a conexão escolhida no seletor: refaz o catálogo e, se ela oferece custo por fonte, relê o custo dela."""
         identifier = self.connection_picker.currentData()
         self.gateway, self.catalog, self.online = None, None, False
-        self.clear_transient("connection")
+        self.source_limit_checking = False
+        self.clear_transient("connection", "teto-fontes")
         try:
             if identifier:
                 self.gateway = Gateway(self.store, self.store.find_connection(identifier))
@@ -1775,6 +2245,7 @@ class LauncherWindow(QMainWindow):
             if not self.startup_done:
                 self.startup_pending.add("catalogo")
             QTimer.singleShot(0, self.refresh_catalog)
+            QTimer.singleShot(0, self.check_source_limits)
 
     def manage_connections(self):
         ConnectionsDialog(self.store.home, self).exec()
@@ -1862,7 +2333,61 @@ class LauncherWindow(QMainWindow):
         self.model_search.clear()
         self.model_search.blockSignals(False)
         self.populate_providers()
+        self.populate_sources()
         self.populate_models()
+
+    def layout_model_columns(self, with_source: bool) -> None:
+        """Colunas da tabela de modelos: com a Fonte (oito) quando o conector declara fontes; sem ela (sete) nada sobra no
+        lugar dela. Guarda onde ficam a Fonte (`source_column`, None sem ela), a Entrada e a mídia; as células são
+        preenchidas por `populate_models`."""
+        table = self.model_table
+        self.source_column = 2 if with_source else None
+        self.input_column = 3 if with_source else 2
+        self.media_column = self.input_column + 2
+        headers = ["Modelo", "Provider", *(["Fonte"] if with_source else []), "Entrada", "Saída",
+                   *(title for _, title, _ in MEDIA_COLUMNS)]
+        table.clear()
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setAccessibleName("Modelos disponíveis: nome, provider, " + ("fonte, " if with_source else "")
+                                + "entrada, saída, visão, áudio e vídeo")
+        header = table.horizontalHeader()
+        right = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        for column in range(len(headers)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+        roomy = {1: 115, **({self.source_column: SOURCE_COLUMN_WIDTH} if with_source else {}),
+                 self.input_column: 90, self.input_column + 1: 80}
+        for offset in (0, 1):
+            table.horizontalHeaderItem(self.input_column + offset).setTextAlignment(right)
+        media = tuple((column, title, symbol) for column, (_, title, symbol) in enumerate(MEDIA_COLUMNS, self.media_column))
+        for column, _title, _symbol in media:
+            table.horizontalHeaderItem(column).setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            roomy[column] = 64
+        table.configure(roomy, (1, *([self.source_column] if with_source else [])), media)
+        for column, width in roomy.items():
+            table.setColumnWidth(column, width)
+
+    def populate_sources(self):
+        """Mostra ou tira o filtro e a coluna Fonte conforme o conector da conexão declara fontes. Com fonte, lista as do
+        catálogo do CLI atual (ordem alfabética) e mantém a escolha se ela ainda existe; sem fonte, o filtro fica vazio
+        e escondido e a escolha some."""
+        declared = bool(self.catalog and self.catalog.segregates_sources)
+        if declared != (self.source_column is not None):
+            self.layout_model_columns(declared)
+        current = self.source_filter.currentData()
+        records = self.catalog.for_cli(self.cli) if declared else []
+        self.source_filter.blockSignals(True)
+        self.source_filter.clear()
+        if declared:
+            self.source_filter.addItem(ALL_SOURCES, None)
+            for label in sorted({record.source for record in records if record.source}, key=str.casefold):
+                self.source_filter.addItem(label, label)
+            self.source_filter.setCurrentIndex(max(0, self.source_filter.findData(current)))
+            self.source_filter.fit_to_items()
+        self.source_filter.setVisible(declared)
+        self.source_filter.blockSignals(False)
+        self.copy_models_button.setText("" if declared else "Copiar lista")
+        self.refresh_button.setText("" if declared else "Atualizar")
 
     def populate_providers(self):
         current = self.provider_filter.currentData()
@@ -1874,6 +2399,8 @@ class LauncherWindow(QMainWindow):
         match = self.provider_filter.findData(current)
         self.provider_filter.setCurrentIndex(max(0, match))
         self.provider_filter.fit_to_items()
+        self.media_filter.fit_to_items()
+        self.model_order.fit_to_items()
         self.provider_filter.blockSignals(False)
 
     def populate_models(self):
@@ -1882,9 +2409,11 @@ class LauncherWindow(QMainWindow):
             preferred = self.store.last_model(self.project, self.gateway.connection, self.cli)
         query = self.model_search.text().strip().casefold()
         provider = self.provider_filter.currentData()
+        source = self.source_filter.currentData()
         media = self.media_filter.currentData()
         all_records = self.catalog.for_cli(self.cli) if self.catalog else []
         self.records = [record for record in all_records if (provider is None or record.provider == provider)
+                        and (source is None or source == record.source)
                         and (media is None or getattr(record, media) is True)
                         and (query in record.id.casefold() or query in model_name(record.id).casefold())]
         self.records = order_models(self.records, self.model_order.currentData())
@@ -1893,19 +2422,25 @@ class LauncherWindow(QMainWindow):
         self.model_table.setRowCount(len(self.records))
         selected_row = 0
         for row, record in enumerate(self.records):
-            values = (model_name(record.id), provider_name(record.provider), token_label(record.max_input_tokens).replace(".", ","),
-                      "—" if record.max_output_tokens is None else token_label(record.max_output_tokens).replace(".", ","))
+            values = [model_name(record.id), provider_name(record.provider)]
+            if self.source_column is not None:
+                values.append(record.source or "")
+            values += [token_label(record.max_input_tokens).replace(".", ","),
+                       "—" if record.max_output_tokens is None else token_label(record.max_output_tokens).replace(".", ",")]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                item.setToolTip(record.id if column < 2 else self.catalog.describe(record))
-                if column >= 2:
+                if column == self.source_column:
+                    item.setToolTip(f"Fonte: {value}")
+                else:
+                    item.setToolTip(record.id if column < self.input_column else self.catalog.describe(record))
+                if column >= self.input_column:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.model_table.setItem(row, column, item)
-            for column, (field, title, symbol) in enumerate(MEDIA_COLUMNS, start=FIRST_MEDIA_COLUMN):
+            for column, (field, title, symbol) in enumerate(MEDIA_COLUMNS, start=self.media_column):
                 self.model_table.setItem(row, column, self.media_item(title, symbol, getattr(record, field)))
             if record.id == preferred:
                 selected_row = row
-        self.model_table.fit_name_column()
+        self.model_table.fit_columns()
         self.model_table.blockSignals(False)
         if self.records:
             self.model_table.selectRow(selected_row)
@@ -2049,8 +2584,17 @@ class LauncherWindow(QMainWindow):
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(str(error))
             return
-        PlanDialog(plan_text(report) if "command" in report else json.dumps(report, ensure_ascii=False, indent=2),
-                   self).exec()
+        terminal = "command" in report
+        PlanDialog(plan_text(report) if terminal else json.dumps(report, ensure_ascii=False, indent=2), self,
+                   self.new_command_for if terminal else None).exec()
+
+    def new_command_for(self, shell: str = "cmd") -> str:
+        """O comando que abre uma sessão nova fora do launcher, com a conexão e o modelo escolhidos na tela, escrito para
+        o `shell` (cmd ou powershell)."""
+        if not (self.project and self.gateway and self.selected_model and self.catalog):
+            raise LauncherError("Escolha projeto, conexão e modelo para montar o comando.")
+        return new_session_command(self.store.home, self.gateway, self.project["path"], self.cli,
+                                   self.selected_model.id, self.catalog, shell)
 
     def resume_by_shortcut(self) -> None:
         """Ctrl+R faz o que o botão Retomar última faz, só quando o botão está à vista e habilitado."""
@@ -2074,6 +2618,7 @@ class LauncherWindow(QMainWindow):
         self.conversation_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QMenu(self.conversation_button)
         menu.addAction("Escolher conversa…\tCtrl+H", self.choose_conversation)
+        menu.addAction("Reabrir sessões recentes…\tCtrl+Shift+H", self.reopen_recent_sessions)
         self.conversation_button.setMenu(menu)
         actions.addWidget(self.conversation_button)
 
@@ -2090,17 +2635,61 @@ class LauncherWindow(QMainWindow):
         if not found:
             self.show_info(f"Ainda não há conversa do {registry.get(self.cli).LABEL} nesta pasta.", origin="conversa")
             return
-        dialog = ConversationsDialog(found, self, registry.get(self.cli).LABEL, self.conversation_usages(found),
-                                     self.selected_model, bool(self.catalog and self.catalog.verified))
+        dialog = ConversationsDialog(found, self, registry.get(self.cli).LABEL, conversation_usages(self.store.home, found),
+                                     self.selected_model, bool(self.catalog and self.catalog.verified),
+                                     command_for=self.resume_command_for)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected():
             self.launch_session(True, conversation=dialog.selected())
 
-    def conversation_usages(self, conversations: list) -> dict:
-        """Custo e contexto de cada conversa da lista, lidos dos transcripts (cache por arquivo)."""
-        cache, tables = usage.FileCache(self.store.home), usage.price_table(self.store.home)
-        found = {item.id: conversation_usage(self.store.home, item.cli, item.id, tables, cache) for item in conversations}
-        cache.save()
-        return found
+    def reopen_candidates(self) -> list:
+        return reopen.candidates(self.store)
+
+    def reopen_recent_sessions(self) -> None:
+        """Item do menu ao lado de Escolher conversa e Ctrl+Shift+H: lista as sessões recentes que não estão abertas e
+        reabre as marcadas. Não depende do projeto selecionado."""
+        try:
+            rows = self.reopen_candidates()
+        except (LauncherError, OSError, ValueError) as error:
+            self.show_error(f"Não foi possível listar as sessões recentes: {error}", origin="reabrir")
+            return
+        if not rows:
+            self.show_info(f"Nenhuma sessão aberta nas últimas {reopen.RECENT_HOURS} horas para reabrir "
+                           "(as que estão abertas agora ficam de fora).", origin="reabrir")
+            return
+        dialog = ReopenDialog(rows, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected():
+            self.start_reopen(dialog.selected())
+
+    def start_reopen(self, rows: list) -> None:
+        if self.reopening:
+            return
+        self.reopening = True
+        self.infos.pop("reabrir", None)
+        self.clear_error("reabrir")
+        self.set_footer("reabrir", f"Reabrindo {plural(len(rows), 'sessão', 'sessões')}…", busy=True)
+        self.reopen_task = ReopenTask(self.store, rows)
+        run_task(self.reopen_task, self.finish_reopen)
+
+    @Slot(object, str)
+    def finish_reopen(self, results, _origin: str) -> None:
+        self.reopening = False
+        self.end_footer("reabrir")
+        self.infos.pop("reabrir", None)
+        self.clear_error("reabrir")
+        if isinstance(results, Exception):
+            self.show_error(f"Não foi possível reabrir as sessões: {results}", origin="reabrir")
+        elif any(not result["ok"] for result in results):
+            self.show_warning(reopen.describe(results), origin="reabrir")
+        else:
+            self.show_info(reopen.describe(results), origin="reabrir")
+
+    def resume_command_for(self, conversation: str, shell: str = "cmd") -> str:
+        """O comando que retoma a conversa fora do launcher, com a conexão e o modelo escolhidos na tela, escrito para
+        o `shell` (cmd ou powershell)."""
+        if not (self.project and self.gateway and self.selected_model and self.catalog):
+            raise LauncherError("Escolha projeto, conexão e modelo para montar o comando.")
+        return resume_command(self.store.home, self.gateway, self.project["path"], self.cli, self.selected_model.id,
+                              self.catalog, conversation, shell)
 
     def warn_resume_window(self, conversation: str | None):
         """Avisa quando a conversa que será retomada já enche a janela do modelo escolhido."""
@@ -2122,8 +2711,7 @@ class LauncherWindow(QMainWindow):
         self.render_empty_models()
         self.update_actions()
         self.refresh_task = RefreshTask(self.store.home, self.gateway.connection["id"], bool(force))
-        self.refresh_task.signals.completed.connect(self.finish_refresh)
-        QThreadPool.globalInstance().start(self.refresh_task)
+        run_task(self.refresh_task, self.finish_refresh)
 
     @Slot(object, str)
     def finish_refresh(self, result, connection):
@@ -2142,6 +2730,9 @@ class LauncherWindow(QMainWindow):
         self.connection.style().polish(self.connection)
         if catalog is not None:
             self.catalog = catalog
+            if catalog.news():
+                self.show_info(catalog.news(), origin="catalogo-novidades")
+                self.gateway.mark_news_seen(catalog)
         elif self.catalog is not None:
             self.catalog.verified = False
         if error:
@@ -2150,6 +2741,7 @@ class LauncherWindow(QMainWindow):
         else:
             self.clear_error("connection")
         self.populate_providers()
+        self.populate_sources()
         self.populate_models()
 
     def launch_session(self, resume=False, conversation=None):
@@ -2182,6 +2774,7 @@ class LauncherWindow(QMainWindow):
         title = session_title(self.project, self.cli, self.store.home)
         if process is not None:
             self.sessions.append((process, title))
+            self.sync_session_timer()
         self.bypass_checkbox.setChecked(self.bypass_default)
         try:
             fresh = Store(self.store.home)
@@ -2212,8 +2805,7 @@ class LauncherWindow(QMainWindow):
         self.update_actions()
         self.install_task = InstallCliTask(cli)
         self.install_task.signals.progress.connect(self.show_install_progress)
-        self.install_task.signals.completed.connect(self.finish_install_cli)
-        QThreadPool.globalInstance().start(self.install_task)
+        run_task(self.install_task, self.finish_install_cli)
 
     @Slot(object, str)
     def show_install_progress(self, fraction, stage):
@@ -2239,8 +2831,31 @@ class LauncherWindow(QMainWindow):
             self.show_error(log or f"Não foi possível instalar o {registry.get(cli).LABEL}.", origin="cli:instalacao")
         self.update_actions()
 
+    def watch_sessions(self) -> None:
+        """Vigia a pasta de sessões (criada se faltar). Sem como vigiá-la, o laço de sessões fica sempre ligado."""
+        try:
+            keys.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        if not self.session_watcher.directories():
+            self.watching_sessions = self.session_watcher.addPath(str(keys.SESSIONS_DIR))
+
+    def sessions_changed(self, _folder: str = "") -> None:
+        """Sessão registrada ou removida por qualquer processo: marca a lista e liga ou desliga o laço."""
+        self.watch_sessions()
+        self.check_sessions()
+
+    def sync_session_timer(self, registered: int = 0) -> None:
+        """O laço de 1,5 s só roda com sessão registrada ou aberta por esta janela e ainda sem registro; a pasta vigiada o
+        religa quando a primeira sessão aparece."""
+        wanted = bool(registered or self.sessions) or not self.watching_sessions
+        if wanted and not self.refresh_timer.isActive():
+            self.refresh_timer.start(SESSION_POLL_MS)
+        elif not wanted and self.refresh_timer.isActive():
+            self.refresh_timer.stop()
+
     def check_sessions(self):
-        self.mark_open_sessions()
+        registered = self.mark_open_sessions()
         finished = [(process, title) for process, title in self.sessions if process.poll() is not None]
         self.sessions = [(process, title) for process, title in self.sessions if process.poll() is None]
         if finished:
@@ -2249,18 +2864,24 @@ class LauncherWindow(QMainWindow):
             self.set_footer("sessao", message)
             self.notify_session_ended(message)
         self.sync_tray()
+        self.sync_session_timer(registered)
 
     def notify_session_ended(self, message: str) -> None:
         """Balão do Windows com a mensagem do rodapé, só com o launcher minimizado ou sem foco: à vista, o rodapé basta."""
         if self.isActiveWindow() and not self.isMinimized():
             return
+        self.show_tray_notice(message)
+
+    def show_tray_notice(self, message: str) -> bool:
+        """Balão do Windows sem tocar na janela (nem foco, nem restauração). False sem bandeja no Windows: nada aparece."""
         self.tray_notified = True
         self.sync_tray()
         if self.tray is None:
             self.tray_notified = False
-            return
+            return False
         self.tray.showMessage(APP_NAME, message, self.windowIcon(), TRAY_NOTICE_MS)
         self.tray_timer.start()
+        return True
 
     def sync_tray(self) -> None:
         """O ícone da bandeja só existe com sessão aberta ou aviso ainda a mostrar. Sem bandeja no Windows não cria nada."""
@@ -2298,6 +2919,69 @@ class LauncherWindow(QMainWindow):
         QApplication.clipboard().setText(models_text(self.records, self.catalog))
         self.confirm_copy(f"{plural(len(self.records), 'modelo copiado', 'modelos copiados')}: cole numa planilha, cada valor vai para a sua coluna.")
 
+    def model_menu(self, position):
+        """Menu da tabela de modelos (botão direito ou tecla Menu): Copiar ID e Testar modelo (1 token), do modelo sob
+        o cursor ou, sem linha apontada, do selecionado; sem modelo nenhum as ações ficam desabilitadas."""
+        row = self.model_table.rowAt(position.y())
+        if 0 <= row < len(self.records):
+            self.model_table.selectRow(row)
+        menu = DangerMenu(self)
+        menu.addAction("Copiar ID", self.copy_model_id).setEnabled(self.selected_model is not None)
+        menu.addAction("Testar modelo (1 token)…", self.ask_model_test).setEnabled(
+            bool(self.selected_model and self.gateway and not self.model_testing))
+        menu.exec(self.model_table.viewport().mapToGlobal(position))
+
+    def copy_model_id(self):
+        """Copia o ID completo do modelo selecionado, exatamente como o host o informa."""
+        if self.selected_model is None:
+            return
+        QApplication.clipboard().setText(self.selected_model.id)
+        self.confirm_copy("ID copiado: " + self.selected_model.id)
+
+    def ask_model_test(self):
+        """Testa o modelo selecionado com uma chamada real de 1 token, só depois de mostrar o custo em tokens e de o
+        usuário confirmar (Cancelar é o padrão). A chamada corre em segundo plano; um teste por vez."""
+        record = self.selected_model
+        if record is None or self.gateway is None or self.model_testing:
+            return
+        try:
+            protocol = model_probe.protocol_of(self.gateway, record)
+        except LauncherError as error:
+            self.show_error(str(error), origin=MODEL_TEST)
+            return
+        if not self.confirm_model_test(model_probe.cost_text(model_probe.estimate_cost(record, protocol))):
+            return
+        self.model_testing = True
+        self.clear_error(MODEL_TEST)
+        self.set_footer(MODEL_TEST, f"Testando {record.id}…", busy=True)
+        self.model_test_task = ModelTestTask(self.store.home, self.gateway.connection["id"], record.id, protocol)
+        run_task(self.model_test_task, self.finish_model_test)
+
+    def confirm_model_test(self, text: str) -> bool:
+        """Caixa com o custo do teste e os botões Testar e Cancelar; só Testar confirma, e Esc ou fechar cancelam."""
+        box = QMessageBox(QMessageBox.Icon.Question, "Testar modelo (1 token)", text, parent=self)
+        accept = box.addButton("Testar", QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        confirmed = box.clickedButton() == accept
+        box.deleteLater()
+        return confirmed
+
+    @Slot(object, str)
+    def finish_model_test(self, result, model):
+        """Resultado do teste: OK com latência e tokens do host no rodapé; erro (do host, do endpoint ou da subida do
+        endpoint) com a causa real na faixa de erros."""
+        self.model_testing = False
+        if not isinstance(result, Exception) and result.ok:
+            self.clear_error(MODEL_TEST)
+            self.set_footer(MODEL_TEST, f"{model}: {model_probe.result_text(result)}")
+            return
+        self.end_footer(MODEL_TEST)
+        self.show_error(f"Teste de {model}: {result if isinstance(result, Exception) else result.error}",
+                        origin=MODEL_TEST)
+
     def copy_notice(self):
         QApplication.clipboard().setText(self.problem_report(self.notice.toolTip() or self.notice.text()))
         copied = "Erros copiados" if len(self.errors) > 1 else "Erro copiado"
@@ -2321,8 +3005,7 @@ class LauncherWindow(QMainWindow):
             return
         self.terminal_installing = True
         self.terminal_task = TerminalTask(ROOT)
-        self.terminal_task.signals.completed.connect(self.finish_terminal)
-        QThreadPool.globalInstance().start(self.terminal_task)
+        run_task(self.terminal_task, self.finish_terminal)
 
     @Slot(object, str)
     def finish_terminal(self, found, log):
@@ -2476,7 +3159,7 @@ class LauncherWindow(QMainWindow):
         return [session for session in keys.sessions() if session.get("project_id") == project_id]
 
     def show_session_screen(self, open_sessions: list[dict]) -> None:
-        """Mostra, só para leitura, o que a sessão aberta exibe agora; a janela dela fica onde está."""
+        """Mostra o que a sessão aberta exibe agora; só o clique em Enviar manda teclas, e a janela dela fica onde está."""
         SessionScreenDialog(open_sessions, self).exec()
 
     def toggle_pinned(self) -> None:
@@ -2676,10 +3359,132 @@ class LauncherWindow(QMainWindow):
         self.instructions_dialog.raise_()
         self.instructions_dialog.activateWindow()
 
+    def show_release_notes_once(self):
+        """Na primeira abertura de uma versão, mostra a nota dela ("O que mudou") numa janela do launcher e guarda a versão
+        vista na raiz dos perfis. Sem a nota na instalação (checkout de desenvolvimento) não faz nada; sem conseguir
+        guardar a versão vista, avisa em vez de repetir a janela a cada abertura."""
+        seen_file = self.profile_base / RELEASE_SEEN
+        try:
+            seen = seen_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            seen = ""
+        except OSError as error:
+            self.show_warning(f"Não foi possível ler {RELEASE_SEEN}: {error}", origin="novidades")
+            return
+        if seen == VERSION or not release_notes_available():
+            return
+        try:
+            atomic_text(seen_file, VERSION)
+        except OSError as error:
+            self.show_warning(f"Não foi possível guardar a versão vista em {RELEASE_SEEN}: {error}", origin="novidades")
+            return
+        self.release_notes_dialog = InstructionsDialog(self, notes=True)
+        self.release_notes_dialog.show()
+
     def show_usage(self):
         current = profiles.profile_of_home(self.store.home, self.profile_base)
-        self.usage_dialog = UsageDialog(self, self.store.home, current["name"])
+        self.usage_dialog = UsageDialog(self, self.store.home, current["name"], self.gateway)
+        self.usage_dialog.limit_saved.connect(self.limit_changed)
         self.usage_dialog.show()
+
+    def check_limit(self):
+        """Confere em segundo plano o gasto do mês frente ao teto do perfil (sem teto não calcula nada) e, à parte, o
+        limite por fonte que o conector da conexão informa."""
+        self.check_source_limits()
+        if self.limit_checking:
+            return
+        if self.store.monthly_limit() is None:
+            self.clear_error("teto")
+            return
+        self.limit_checking = True
+        self.limit_task = UsageTask(self.store.home)
+        run_task(self.limit_task, self.finish_limit_check)
+
+    @Slot(object, str)
+    def finish_limit_check(self, result, _unused=""):
+        """Faixa âmbar a partir de 80% do teto; só avisa, nada é bloqueado. O teto é lido de novo aqui: pode ter sido
+        mudado ou desligado enquanto o cálculo corria."""
+        self.limit_checking = False
+        limit = self.store.monthly_limit()
+        if limit is None:
+            self.clear_error("teto")
+        elif isinstance(result, Exception):
+            self.show_warning(f"Não foi possível conferir o teto de gasto do mês: {result}", origin="teto")
+        else:
+            status = usage.limit_status(result, limit)
+            warning = usage.limit_warning(status)
+            if warning:
+                self.show_warning(warning, origin="teto")
+                self.notify_limit(result["month"], status, warning)
+            else:
+                self.clear_error("teto")
+
+    def notify_level(self, level: int, noticed: int, warning: str, save, failed: str, origin: str) -> None:
+        """Balão da bandeja com `warning` se `level` passou do nível já avisado (`noticed`); só depois de o balão sair `save()`
+        guarda o nível, e a falha em guardá-lo vira aviso na faixa (`failed`) em vez de repetir o balão sem fim."""
+        if level <= noticed or not self.show_tray_notice(warning):
+            return
+        try:
+            save()
+        except (LauncherError, OSError) as error:
+            self.show_warning(f"{warning}\n{failed}: {error}", origin=origin)
+
+    def notify_limit(self, month: str, status: dict, warning: str) -> None:
+        """Balão da bandeja para cada nível do teto (80%, 100%) ainda não avisado no mês para o limite vigente, com o
+        texto da faixa âmbar; mudar o limite recomeça do nível 0. O nível só é guardado depois de o balão sair: sem
+        bandeja no Windows ele fica para a próxima checagem."""
+        level, limit = LIMIT_LEVELS[status["level"]], status["amount"]
+        self.notify_level(level, self.store.limit_notice(month, limit), warning,
+                          lambda: self.store.set_limit_notice(month, level, limit),
+                          "Não foi possível guardar o aviso do teto", "teto")
+
+    def check_source_limits(self) -> None:
+        """Lê em segundo plano o custo do mês por fonte, só se a conexão da janela declara fontes e oferece a rota
+        `costs` do conector; sem isso não lê nada e some o aviso de falha de uma leitura anterior."""
+        gateway = self.gateway
+        if gateway is None or not gateway.offers_costs:
+            self.clear_error("teto-fontes")
+            return
+        if self.source_limit_checking:
+            return
+        self.source_limit_checking = True
+        task = self.source_limit_task = SourceCostsTask(gateway, usage.recent_months(1)[0])
+        run_task(task, lambda result, _unused="": self.finish_source_limit_check(task, result))
+
+    def finish_source_limit_check(self, task: "SourceCostsTask", result) -> None:
+        """Balão por fonte a partir de 80% do limite dela, com o nome da conexão quando o perfil tem mais de uma; a falha
+        do conector vira aviso na faixa com a mensagem dele, nunca balão. A resposta de uma conexão que deixou de ser a
+        da janela é descartada."""
+        if task is self.source_limit_task:
+            self.source_limit_checking = False
+        if self.gateway is None or task.gateway.connection["id"] != self.gateway.connection["id"]:
+            return
+        if isinstance(result, Exception):
+            self.show_warning(f"Não foi possível conferir o limite por fonte do mês: {result}", origin="teto-fontes")
+            return
+        self.clear_error("teto-fontes")
+        named = task.gateway.name if len(self.store.connections) > 1 else None
+        for status in usage.source_limit_statuses(result):
+            warning = usage.source_limit_warning(status, named)
+            if warning:
+                self.notify_source_limit(task.month, task.gateway.connection["id"], status, warning)
+
+    def notify_source_limit(self, month: str, connection_id: str, status: dict, warning: str) -> None:
+        """Balão da bandeja para cada nível (80%, 100%) do limite da fonte da conexão ainda não avisado no mês para o
+        limite vigente dela; o nível só é guardado depois de o balão sair."""
+        source, level, limit = status["source"], LIMIT_LEVELS[status["level"]], status["amount"]
+        self.notify_level(level, self.store.source_notice(month, connection_id, source, limit), warning,
+                          lambda: self.store.set_source_notice(month, connection_id, source, level, limit),
+                          "Não foi possível guardar o aviso do limite da fonte", "teto-fontes")
+
+    def limit_changed(self):
+        """O limite mudou no Uso do mês: relê a preferência e refaz o aviso da faixa."""
+        try:
+            self.store = Store(self.store.home)
+        except (LauncherError, OSError, ValueError) as error:
+            self.show_error(f"Não foi possível ler o limite mensal: {error}")
+            return
+        self.check_limit()
 
     def remove_profile(self):
         current = profiles.profile_of_home(self.store.home, self.profile_base)
@@ -2711,9 +3516,7 @@ class LauncherWindow(QMainWindow):
         self.set_footer("perfil", f"Removendo as conexões do perfil {current['name']} do Copilot app e do VS Code… "
                         "(pode levar alguns segundos)", busy=True)
         self.cleanup_task = CleanupTask(self.store.home)
-        self.cleanup_task.signals.completed.connect(
-            lambda messages, _text: self.finish_remove_profile(current, delete_data, messages))
-        QThreadPool.globalInstance().start(self.cleanup_task)
+        run_task(self.cleanup_task, lambda messages, _text: self.finish_remove_profile(current, delete_data, messages))
 
     def set_profile_busy(self, busy: bool):
         """Durante a limpeza do perfil: seletor e menu do perfil travados (o perfil ainda existe até o fim)."""
@@ -2722,7 +3525,7 @@ class LauncherWindow(QMainWindow):
         self.profile_options.setEnabled(not busy)
 
     def finish_remove_profile(self, current: dict, delete_data: bool, messages):
-        from agent_launcher.harnesses.cleanup import Failure, failure
+        from agent_launcher.harnesses.cleanup import failure
         messages = [failure("Limpeza nos destinos", messages)] if isinstance(messages, Exception) else list(messages or [])
         self.set_profile_busy(False)
         self.end_footer("perfil")  # o "Removendo…" acabou, com ou sem mensagem de resultado
@@ -2735,18 +3538,19 @@ class LauncherWindow(QMainWindow):
         try:
             profiles.remove(current["id"], delete_data, self.profile_base)
         except (LauncherError, OSError) as error:
-            self.show_error(" ".join([*(m for m in messages if isinstance(m, Failure)), str(error)]), origin="perfil")
-            if any(not isinstance(m, Failure) for m in messages):
-                self.show_info(" ".join(m for m in messages if not isinstance(m, Failure)), origin="perfil")
+            done, failed = split_cleanup(messages)
+            self.show_error(" ".join([*failed, str(error)]), origin="perfil")
+            if done:
+                self.show_info(" ".join(done), origin="perfil")
             return
         self.switch_profile(profiles.DEFAULT)
         if messages:  # o que foi feito (informativo) e o que falhou (erro, ex.: "VS Code: arquivo preso"), sem bloquear
             self.set_footer("perfil", " ".join(messages))
-            failed = [message for message in messages if isinstance(message, Failure)]
+            done, failed = split_cleanup(messages)
             if failed:
                 self.show_error(" ".join(failed), origin="perfil")
-            if len(failed) < len(messages):
-                self.show_info(" ".join(message for message in messages if not isinstance(message, Failure)), origin="perfil")
+            if done:
+                self.show_info(" ".join(done), origin="perfil")
 
     def ask_clean_profile_destinations(self, current: dict) -> bool | None:
         """Pergunta se tira as conexões do perfil do Copilot app, do VS Code e do endpoint local.
@@ -2860,6 +3664,8 @@ class LauncherWindow(QMainWindow):
 
 
 UPDATE_INTERVAL_MS = 4 * 60 * 60 * 1000
+LIMIT_LEVELS = {"warn": int(usage.LIMIT_WARN_PERCENT), "over": int(usage.LIMIT_OVER_PERCENT)}  # nível do status -> % avisado
+LIMIT_INTERVAL_MS = 10 * 60 * 1000  # o cache por arquivo do uso só relê o que cresceu
 NEW_PROFILE = "__novo__"
 
 
@@ -2913,7 +3719,9 @@ def import_argument(arguments: list[str]) -> str | None:
 
 
 def main(arguments: list[str] | None = None):
+    """Abre a interface (apagando antes o cache das versões anteriores) e devolve o código do loop de eventos."""
     arguments = list(sys.argv[1:] if arguments is None else arguments)
+    cache.prune_old_versions()
     application = create_application()
     window = LauncherWindow()
     window.show()

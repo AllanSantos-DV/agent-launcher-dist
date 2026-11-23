@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 from agent_launcher import ROOT  # a pasta instalada (onde fica o updater.py da raiz), não a deste módulo
+from agent_launcher.domain import cache
 from agent_launcher.domain.downloads import GITHUB_HOSTS, restricted_redirects
 from version import APP_ID, REGISTRY_PUBLIC_KEY, VERSION, data_home
 
@@ -279,10 +280,10 @@ def update(root: Path = ROOT, manifest_url: str = MANIFEST_URL, log=lambda messa
         return None
     try:
         log(f"Atualizando o Agent Launcher {VERSION} → {meta['version']}…")
-        import tempfile
-        # ignore_cleanup_errors: antivírus segurando um .py extraído não pode transformar uma instalação que deu certo em "falhou".
-        with tempfile.TemporaryDirectory(prefix="agent-launcher-update-", ignore_cleanup_errors=True) as folder:
-            apply(download(meta, Path(folder), download_base=download_base, key=key, node=node), root)
+        # A limpeza ao sair não levanta: antivírus segurando um .py extraído não pode transformar uma instalação que deu
+        # certo em "falhou".
+        with cache.scratch_folder("atualizacao", busy=UpdateError) as folder:
+            apply(download(meta, folder, download_base=download_base, key=key, node=node), root)
         log(f"Agent Launcher atualizado para {meta['version']}. Reabra para usar a versão nova.")
         return meta["version"]
     finally:

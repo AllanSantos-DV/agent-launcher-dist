@@ -4,6 +4,8 @@
                       "default_connection"}
     connectors/*.py  conectores do usuário que as conexões do perfil usam (opcional)
 
+Uma conexão compartilhada sozinha é o mesmo pacote com uma só conexão (`export_connection`, `import_connection`).
+
 Nunca contém chave: campo secreto do conector (FIELDS com "secret") ou opção com nome de chave (api_key, key, token,
 secret...) é recusado na exportação e na importação. A importação valida tudo antes de gravar e desfaz o que gravou
 se algo falhar no meio (perfil criado e conectores novos ou substituídos)."""
@@ -12,12 +14,11 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import tempfile
 import zipfile
 from pathlib import Path
 
 from agent_launcher import connectors
-from agent_launcher.domain import profiles
+from agent_launcher.domain import cache, profiles
 from agent_launcher.domain.files import replace_retrying
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.store import Store
@@ -31,6 +32,7 @@ CONNECTOR_FILE = re.compile(r"connectors/([A-Za-z0-9_-]{1,60})\.py")
 SECRET_NAMES = {"api_key", "apikey", "key", "token", "secret", "password", "senha", "access_token", "bearer"}
 COLOR = re.compile(r"#[0-9a-fA-F]{6}")
 SECRET_MESSAGE = "O pacote traz uma chave ({}); peça à TI um pacote sem chave."
+MIN_SECRET = 4
 
 
 def _no_ask(kind: str, *args):
@@ -58,27 +60,22 @@ def _user_connector_files(base: Path) -> dict[str, Path]:
     return found
 
 
-def export_profile(base: Path | None, profile_id: str, out_path: Path, include_connectors: bool = True) -> dict:
-    """Grava o .alprofile do perfil (sem chaves). Devolve {"path", "connections", "connectors"}."""
-    base = Path(base) if base else profiles.root()
-    profile = profiles.find(profile_id, base)
-    store = Store(profiles.home_of(profile["id"], base))
-    modules, _errors = store.connectors()
-    entries = []
-    for connection in store.connections:
-        hidden = _secret_fields(modules.get(connection["connector"]))
-        options = {key: value for key, value in connection["options"].items()
-                   if key not in hidden and not _suspicious(key)}
-        entries.append({"name": connection["name"], "connector": connection["connector"], "options": options})
-    default = next((c["name"] for c in store.connections if c["id"] == store.data["default_connection"]), None)
-    manifest = {"schema": SCHEMA, "name": profile["name"], "color": profile.get("color"), "connections": entries,
-                "default_connection": default}
-    files = {}
-    if include_connectors:
-        user = _user_connector_files(base)
-        for name in sorted({entry["connector"] for entry in entries}):
-            if name in user:
-                files[f"connectors/{user[name].name}"] = user[name].read_bytes()
+def _entry(modules: dict, connection: dict) -> dict:
+    """A conexão como vai no pacote: sem campo secreto do conector e sem opção com nome de chave."""
+    hidden = _secret_fields(modules.get(connection["connector"]))
+    options = {key: value for key, value in connection["options"].items() if key not in hidden and not _suspicious(key)}
+    return {"name": connection["name"], "connector": connection["connector"], "options": options}
+
+
+def _bundled_connectors(base: Path, entries: list[dict]) -> dict[str, bytes]:
+    """Os conectores do usuário que as conexões usam, como {connectors/arquivo.py: conteúdo}."""
+    user = _user_connector_files(base)
+    return {f"connectors/{user[name].name}": user[name].read_bytes()
+            for name in sorted({entry["connector"] for entry in entries}) if name in user}
+
+
+def _write_package(out_path: Path, manifest: dict, files: dict[str, bytes]) -> Path:
+    """Grava o zip de forma atômica (acrescenta .alprofile se faltar) e devolve o caminho final."""
     out_path = Path(out_path)
     if out_path.suffix.lower() != EXTENSION:
         out_path = out_path.with_name(out_path.name + EXTENSION)
@@ -89,8 +86,43 @@ def export_profile(base: Path | None, profile_id: str, out_path: Path, include_c
         for name, data in files.items():
             archive.writestr(name, data)
     replace_retrying(partial, out_path)
-    return {"path": str(out_path), "connections": [entry["name"] for entry in entries],
-            "connectors": sorted(files)}
+    return out_path
+
+
+def export_profile(base: Path | None, profile_id: str, out_path: Path, include_connectors: bool = True) -> dict:
+    """Grava o .alprofile do perfil (sem chaves). Devolve {"path", "connections", "connectors"}."""
+    base = Path(base) if base else profiles.root()
+    profile = profiles.find(profile_id, base)
+    store = Store(profiles.home_of(profile["id"], base))
+    modules, _errors = store.connectors()
+    entries = [_entry(modules, connection) for connection in store.connections]
+    default = next((c["name"] for c in store.connections if c["id"] == store.data["default_connection"]), None)
+    manifest = {"schema": SCHEMA, "name": profile["name"], "color": profile.get("color"), "connections": entries,
+                "default_connection": default}
+    files = _bundled_connectors(base, entries) if include_connectors else {}
+    path = _write_package(out_path, manifest, files)
+    return {"path": str(path), "connections": [entry["name"] for entry in entries], "connectors": sorted(files)}
+
+
+def export_connection(store: Store, reference: str, out_path: Path) -> dict:
+    """Grava o .alprofile com só essa conexão (o mesmo formato do pacote de perfil, que o importador de perfil também
+    lê). Recusa, sem gravar nada, se um valor de chave do cofre aparece em qualquer parte do arquivo ou se o
+    manifesto não passa na validação da importação. Devolve {"path", "connection", "connectors"}."""
+    connection = store.find_connection(reference)
+    modules, _errors = store.connectors()
+    entry = _entry(modules, connection)
+    manifest = {"schema": SCHEMA, "name": connection["name"], "color": None, "connections": [entry],
+                "default_connection": connection["name"]}
+    secrets = [str(value) for name, value in store.connection_options(connection).items()
+               if name in _secret_fields(modules.get(connection["connector"])) and len(str(value or "")) >= MIN_SECRET]
+    text = json.dumps(manifest, ensure_ascii=False)
+    if any(secret in text for secret in secrets):
+        raise LauncherError(f"A conexão {connection['name']} tem uma chave dentro de uma opção; "
+                            "o arquivo não foi gravado. Tire a chave da opção em Conexões e exporte de novo.")
+    _validate(manifest)
+    files = _bundled_connectors(profiles.base_of(store.home), [entry])
+    path = _write_package(out_path, manifest, files)
+    return {"path": str(path), "connection": connection["name"], "connectors": sorted(files)}
 
 
 def read_package(path: Path) -> tuple[dict, dict[str, bytes]]:
@@ -179,21 +211,15 @@ def _needs_key(error: Exception) -> bool:
     return any(marker in text for marker in ("HTTP 401", "HTTP 403", "recusou a chave", "exige uma chave"))
 
 
-def import_profile(base: Path | None, path: Path, ask=None, verify: bool = True) -> dict:
-    """Cria o perfil do pacote. `ask(kind, *args)`:
-      ask("replace_connector", nome_do_arquivo) -> True substitui o conector instalado diferente; senão mantém;
-      ask("secret", conexão, campo) -> a chave digitada, ou None (conexão fica sem chave e sem teste, com aviso).
-    Devolve {"profile": {...}, "connections": [nomes], "warnings": [...]}. Falha no meio desfaz tudo."""
-    base = Path(base) if base else profiles.root()
-    ask = ask or _no_ask
-    manifest, files = read_package(path)
+def _stage(base: Path, manifest: dict, files: dict[str, bytes], ask, warnings: list) -> dict[Path, bytes]:
+    """Valida os conectores do pacote numa pasta de trabalho, recusa campo secreto preenchido e decide o que gravar na
+    raiz: o novo entra, o igual fica, o diferente pergunta. Não grava nada. Devolve {destino: conteúdo}."""
     folder = base / "connectors"
-    warnings = []
-    # Os conectores do pacote carregam numa pasta temporária antes de qualquer gravação (erro de carga = recusa).
-    with tempfile.TemporaryDirectory(prefix="al-pacote-") as temp:
+    # Os conectores do pacote carregam numa pasta de trabalho antes de qualquer gravação (erro de carga = recusa).
+    with cache.scratch_folder("pacote", busy=LauncherError) as work:
         for name, data in files.items():
-            (Path(temp) / Path(name).name).write_bytes(data)
-        loaded, errors = connectors.available(Path(temp))
+            (work / Path(name).name).write_bytes(data)
+        loaded, errors = connectors.available(work)
         if errors:
             raise LauncherError("Conector do pacote não carrega: " + "; ".join(errors))
     packaged = {module.NAME: module for module in loaded.values() if module not in connectors.BUILTIN}
@@ -218,13 +244,45 @@ def import_profile(base: Path | None, path: Path, ask=None, verify: bool = True)
                 warnings.append(f"Conector {destination.stem} mantido como já estava instalado (o do pacote é diferente).")
                 continue
         writes[destination] = data
+    return writes
+
+
+def _apply(writes: dict[Path, bytes], previous: dict) -> None:
+    """Grava os arquivos guardando em `previous` o que havia antes (None = não existia), para `_restore`."""
+    for destination, data in writes.items():
+        previous[destination] = destination.read_bytes() if destination.is_file() else None
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+
+
+def _restore(previous: dict) -> None:
+    """Desfaz `_apply`: devolve o conteúdo antigo ou apaga o arquivo novo, com o bytecode dele."""
+    for destination, data in previous.items():
+        try:
+            if data is None:
+                destination.unlink(missing_ok=True)
+            else:
+                destination.write_bytes(data)
+            for compiled in (destination.parent / "__pycache__").glob(f"{destination.stem}.*.pyc"):
+                compiled.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def import_profile(base: Path | None, path: Path, ask=None, verify: bool = True) -> dict:
+    """Cria o perfil do pacote. `ask(kind, *args)`:
+      ask("replace_connector", nome_do_arquivo) -> True substitui o conector instalado diferente; senão mantém;
+      ask("secret", conexão, campo) -> a chave digitada, ou None (conexão fica sem chave e sem teste, com aviso).
+    Devolve {"profile": {...}, "connections": [nomes], "warnings": [...]}. Falha no meio desfaz tudo."""
+    base = Path(base) if base else profiles.root()
+    ask = ask or _no_ask
+    manifest, files = read_package(path)
+    warnings = []
+    writes = _stage(base, manifest, files, ask, warnings)
     created_profile = None
     previous = {}
     try:
-        for destination, data in writes.items():
-            previous[destination] = destination.read_bytes() if destination.is_file() else None
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(data)
+        _apply(writes, previous)
         created_profile = profiles.create(_free_name(manifest["name"], base), base)
         if manifest.get("color"):
             created_profile = profiles.set_color(created_profile["id"], manifest["color"], base)
@@ -248,18 +306,51 @@ def import_profile(base: Path | None, path: Path, ask=None, verify: bool = True)
                 profiles.remove(created_profile["id"], True, base)
             except (LauncherError, OSError):
                 shutil.rmtree(base / profiles.FOLDER / created_profile["id"], ignore_errors=True)
-        for destination, data in previous.items():
-            try:
-                if data is None:
-                    destination.unlink(missing_ok=True)
-                else:
-                    destination.write_bytes(data)
-                for compiled in (destination.parent / "__pycache__").glob(f"{destination.stem}.*.pyc"):
-                    compiled.unlink(missing_ok=True)
-            except OSError:
-                pass
+        _restore(previous)
         raise
     return {"profile": created_profile, "connections": names, "warnings": warnings}
+
+
+def import_connection(store: Store, path: Path, ask=None, verify: bool = True) -> dict:
+    """Cria no perfil de `store` a única conexão do arquivo, sem chave: nome já usado, arquivo com mais de uma conexão
+    ou com chave são recusados sem gravar nada, e falha no meio devolve os conectores ao que eram. `ask` é o de
+    `import_profile`. Devolve {"connection": {...}, "needs_key": bool, "warnings": [...]}."""
+    ask = ask or _no_ask
+    manifest, files = read_package(path)
+    entries = manifest["connections"]
+    if len(entries) != 1:
+        raise LauncherError(f"O arquivo tem {len(entries)} conexões e aqui entra uma só; para trazer o perfil inteiro "
+                            "use 'profiles import'.")
+    entry = entries[0]
+    if any(connection["name"].casefold() == entry["name"].casefold() for connection in store.connections):
+        raise LauncherError(f"Já existe uma conexão chamada {entry['name']} neste perfil. Nada foi alterado: remova ou "
+                            "renomeie a existente em Conexões e importe de novo.")
+    warnings = []
+    writes = _stage(profiles.base_of(store.home), manifest, files, ask, warnings)
+    previous = {}
+    try:
+        _apply(writes, previous)
+        modules, load_errors = store.connectors()
+        module = modules.get(entry["connector"])
+        if module is None:
+            raise LauncherError(f"Conector {entry['connector']!r} não carregou: {'; '.join(load_errors)}")
+        created = _create_connection(store, module, entry, ask, verify, warnings)
+    except BaseException:
+        _restore(previous)
+        raise
+    status = created.get("status") or {}
+    if status.get("state") == "quota_exhausted":
+        warnings.append(f"Conexão {created['name']} criada, mas a cota está esgotada: {status.get('message', '')}")
+    return {"connection": created, "needs_key": bool(_secret_fields(module)), "warnings": warnings}
+
+
+def describe_connection(result: dict) -> str:
+    """O texto do resultado de `import_connection`: o nome, o aviso de que a chave fica por preencher e os avisos."""
+    lines = [f"Conexão importada: {result['connection']['name']}."]
+    if result["needs_key"]:
+        lines.append("A chave não vem no arquivo: informe a sua em Conexões antes de usar.")
+    lines += [f"Aviso: {warning}" for warning in result["warnings"]]
+    return "\n".join(lines)
 
 
 def _create_connection(store: Store, module, entry: dict, ask, verify: bool, warnings: list) -> dict:
@@ -318,4 +409,5 @@ def describe(result: dict) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["export_profile", "import_profile", "read_package", "describe", "EXTENSION"]
+__all__ = ["export_profile", "import_profile", "export_connection", "import_connection", "read_package", "describe",
+           "describe_connection", "EXTENSION"]

@@ -26,6 +26,8 @@ PASTE_START, PASTE_END = "\x1b[200~", "\x1b[201~"  # colagem em modo "bracketed 
 PASTE_CHUNK = 4096  # eventos por WriteConsoleInputW
 PASTE_DRAIN_TIMEOUT = 60.0  # espera a sessão consumir a colagem antes da próxima tecla
 PASTE_SETTLE = 0.3  # a sessão processa a colagem inteira antes de receber o Enter que vem depois
+WAIT_TIMEOUT = 30.0  # prazo padrão de `keys --wait`
+WAIT_POLL = 1.0  # cada leitura da tela sobe um processo auxiliar
 
 # nome -> (código virtual, caractere, tecla estendida, estado dos modificadores)
 SHIFT_PRESSED, LEFT_CTRL_PRESSED, ENHANCED_KEY = 0x10, 0x08, 0x100
@@ -315,6 +317,26 @@ def send(pid: int, tokens: list[str]) -> list[str]:
 
 def read_screen(pid: int) -> str:
     return run_helper(["--screen", str(pid)])
+
+
+def wait_for_text(pid: int, text: str, timeout: float, poll: float = WAIT_POLL) -> str:
+    """Relê a tela da sessão a cada `poll` s até `text` aparecer e devolve essa tela. Passado `timeout` s sem o texto é
+    KeysError; a tela é lida ao menos uma vez. Os espaços e quebras de linha valem como um só, porque o console quebra
+    a linha onde a largura acaba."""
+    wanted = " ".join(text.split())
+    if not wanted:
+        raise KeysError("O texto a esperar está vazio.")
+    if timeout < 0:
+        raise KeysError(f"O prazo da espera não pode ser negativo ({timeout:g} s).")
+    end = time.monotonic() + timeout
+    while True:
+        screen = read_screen(pid)
+        if wanted in " ".join(screen.split()):
+            return screen
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            raise KeysError(f"O texto {text!r} não apareceu na tela da sessão (pid {pid}) em {timeout:g} s.")
+        time.sleep(min(poll, remaining))
 
 
 def helper_main(argv: list[str]) -> int:

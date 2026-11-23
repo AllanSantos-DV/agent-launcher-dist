@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import os
 import subprocess
-import tempfile
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent_launcher.connectors._http import NO_KEY, is_local_host
+from agent_launcher.domain import cache
 from agent_launcher.domain.catalog import Catalog, ModelInfo, base_model
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import project_path, validate_model
@@ -19,6 +19,18 @@ from agent_launcher.session.controlled import without_parent_session
 # sessão usar só a conexão escolhida. Cada adaptador acrescenta as variáveis do seu CLI (Harness.SCRUB).
 SCRUB_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_OAUTH", "CLAUDE_CODE_USE_")
 SCRUB_NAMES = frozenset({"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "CODEX_API_KEY", "AGENT_LAUNCHER_API_KEY"})
+
+
+@dataclass(frozen=True)
+class EndpointRoute:
+    """Sessão pelo endpoint local da conexão: a pasta de dados e a conexão que o sobem, e a porta que o plano usa."""
+    home: Path
+    connection_id: str
+    port: int
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
 
 
 @dataclass
@@ -40,6 +52,9 @@ class LaunchPlan:
     session_id: str | None = None   # id da conversa conhecido na abertura (Claude novo: --session-id; retomada por id)
     resume: bool = False            # retomada de fato (retomar sem conversa vira sessão nova)
     vision: bool | None = None      # o conector diz se o modelo aceita imagem; None = não informou
+    window_pid: int | None = None   # primeiro processo da janela, quando não é este (janela nativa); None = este processo
+    scrubbed: tuple[str, ...] = ()  # nomes das variáveis herdadas que saem do ambiente da sessão
+    endpoint: EndpointRoute | None = None  # a sessão vai pelo endpoint local, não direto ao host
 
     @property
     def public_overrides(self) -> dict[str, str]:
@@ -67,6 +82,22 @@ class LaunchContext:
     warnings: list[str]
     input_limit: int | None
     conversation: str | None = None  # id da conversa a retomar (None: a última, --continue/resume --last)
+    endpoint: EndpointRoute | None = None  # preferência da conexão ligada: o adaptador aponta a sessão para o endpoint
+
+
+def uses_endpoint(gateway, harness) -> bool:
+    """A conexão pede as sessões de terminal pelo endpoint local e o adaptador as aceita?"""
+    return harness.ENDPOINT_SESSIONS and gateway.store.endpoint_sessions_of(gateway.connection)
+
+
+def endpoint_route(gateway, harness) -> EndpointRoute | None:
+    """O destino e a porta do endpoint local quando a sessão vai por ele; None é o caminho direto ao host. Só consulta a
+    porta, sem reservá-la nem subir nada (quem abre sobe, em `Harness.ensure_endpoint`)."""
+    if not uses_endpoint(gateway, harness):
+        return None
+    from agent_launcher.endpoint import registry as endpoints
+    store, connection_id = gateway.store, gateway.connection["id"]
+    return EndpointRoute(store.home, connection_id, endpoints.port_for(store.home, connection_id, reserve=False))
 
 
 def build_plan(gateway, cli: str, directory: str, model: str, resume: bool = False,
@@ -82,7 +113,8 @@ def build_plan(gateway, cli: str, directory: str, model: str, resume: bool = Fal
         raise LauncherError(f"A conexão {gateway.name} não atende o {cli}. Escolha outra conexão ou o outro CLI.")
     model = validate_model(model)
     catalog = catalog or gateway.empty_catalog()
-    selected = catalog.find(model) or ModelInfo(base_model(model))
+    listed = catalog.find(model)
+    selected = listed or ModelInfo(base_model(model))
     if not catalog.allows(selected, cli):
         raise LauncherError(f"O modelo {selected.id} não é compatível com o {cli} nesta conexão. Escolha um ID da lista.")
     model = harness.model_id(model, selected, catalog)
@@ -92,6 +124,9 @@ def build_plan(gateway, cli: str, directory: str, model: str, resume: bool = Fal
         warnings.append("Bypass ativo: comandos sem confirmação de permissões. No Codex, o sandbox também está desativado.")
     if input_limit is None:
         warnings.append("Janela de entrada não confirmada; não serão aplicados aumentos de contexto a este modelo.")
+    if catalog.records and not catalog.any_model and listed is None:
+        warnings.append(f"O modelo {selected.id} não está no catálogo de {gateway.name}; o host pode tê-lo aposentado. "
+                        "Escolha outro modelo da lista.")
     path = project_path(directory)
     if resume:
         from agent_launcher.session.conversations import resume_target
@@ -101,14 +136,20 @@ def build_plan(gateway, cli: str, directory: str, model: str, resume: bool = Fal
         conversation = None
     command = harness.command()
     environment = without_parent_session(dict(os.environ))
+    scrubbed = set(SCRUB_NAMES | harness.SCRUB)
     for key in list(environment):
         upper = key.upper()
         if upper.startswith(SCRUB_PREFIXES + harness.SCRUB_PREFIXES) or upper in SCRUB_NAMES | harness.SCRUB:
             environment.pop(key)
+            scrubbed.add(upper)
+    route = endpoint_route(gateway, harness)
     context = LaunchContext(gateway, catalog, selected, model, model, path, resume, bypass_permissions, controlled,
-                            preserve_terminal_title, admin_note, command, environment, warnings, input_limit, conversation)
+                            preserve_terminal_title, admin_note, command, environment, warnings, input_limit, conversation,
+                            route)
     plan = harness.plan(context)
+    plan.endpoint = route
     plan.resume = resume
+    plan.scrubbed = tuple(sorted(scrubbed))
     if resume and conversation:
         plan.session_id = conversation
     environment.update(plan.overrides)
@@ -124,6 +165,24 @@ def build_plan(gateway, cli: str, directory: str, model: str, resume: bool = Fal
     return plan
 
 
+def quota_notice(gateway, quota: str, cli: str | None = None) -> str:
+    """Aviso de cota esgotada da abertura. Com conexão reserva configurada, diz qual é; a sessão direta ao host nunca
+    troca de conexão sozinha, porque isso mudaria quem cobra, mas a que vai pelo endpoint local (`cli` diz o destino) tem o
+    failover dele. `quota` vazio (cota disponível) não gera aviso."""
+    if not quota:
+        return ""
+    reserve = gateway.store.fallback_of(gateway.connection)
+    if reserve is None:
+        return quota
+    from agent_launcher.harnesses import registry
+    harness = registry.find(cli) if cli else None
+    if harness and uses_endpoint(gateway, harness):
+        return (f"{quota} • Conexão reserva configurada: {reserve['name']}. Esta sessão passa pelo endpoint local, que "
+                "refaz os pedidos na reserva enquanto a cota estiver esgotada.")
+    return (f"{quota} • Conexão reserva configurada: {reserve['name']}. Esta sessão não troca de conexão sozinha; "
+            f"para usar a reserva, abra a sessão pela conexão {reserve['name']}.")
+
+
 def has_previous_conversation(cli: str, directory: Path) -> bool:
     """Existe conversa desta pasta para o destino retomar (--continue do Claude, resume --last do Codex...)?"""
     from agent_launcher.harnesses import registry
@@ -131,19 +190,29 @@ def has_previous_conversation(cli: str, directory: Path) -> bool:
     return bool(harness and harness.has_previous_conversation(Path(directory)))
 
 
+def session_command(harness, plan: LaunchPlan) -> tuple[list[str], str]:
+    """Comando final do plano, (comando, aviso). Os arquivos que o adaptador precisa (`session_files_key`) ficam na
+    pasta estável do cache, uma por chave: a mesma entrada acha a mesma pasta e nada novo nasce. Sem chave, nada é gravado."""
+    key = harness.session_files_key(plan)
+    if key is None:
+        return harness.final_command(plan, None)
+    cache.prune_old_versions()
+    with cache.keyed_folder("sessao", key) as directory:
+        return harness.final_command(plan, directory)
+
+
 def run_plan(plan: LaunchPlan) -> int:
     from agent_launcher.harnesses import registry
     harness = registry.get(plan.cli)
     try:
-        with tempfile.TemporaryDirectory(prefix="agent-launcher-session-") as directory:
-            command, warning = harness.final_command(plan, Path(directory))
-            if warning:
-                print(f"  Aviso: {warning}")
-            process = subprocess.Popen(command, cwd=plan.directory, env=plan.environment, shell=False)
-            while True:
-                try:
-                    return process.wait()
-                except KeyboardInterrupt:
-                    continue
+        command, warning = session_command(harness, plan)
+        if warning:
+            print(f"  Aviso: {warning}")
+        process = subprocess.Popen(command, cwd=plan.directory, env=plan.environment, shell=False)
+        while True:
+            try:
+                return process.wait()
+            except KeyboardInterrupt:
+                continue
     except OSError as error:
         raise LauncherError(f"Não foi possível iniciar {plan.cli}: {error.strerror or 'erro do sistema'}.") from error

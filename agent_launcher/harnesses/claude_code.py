@@ -13,8 +13,8 @@ from agent_launcher.domain.catalog import CLAUDE_FAMILIES, Catalog, ModelInfo, b
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import read_text_retrying, replace_retrying
 from agent_launcher.harnesses import installers
-from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines, is_exe,
-                                           key_mcp_urls, native_wrapper, node_script, parse_time, unrecognized)
+from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines,
+                                           key_mcp_urls, npm_cli_command, parse_time)
 from agent_launcher.session.controlled import CONTROLLED_NOTE, UNATTENDED_RESUME_THRESHOLD, delegation_code
 from agent_launcher.session.plan import LaunchPlan
 
@@ -188,6 +188,7 @@ class ClaudeCode(Harness):
     BYPASS_RISK = "Ignora as verificações de permissão do Claude Code."
     BYPASS_HINT = "Sem pedir permissão"
     EXECUTABLE = "claude"
+    ENDPOINT_SESSIONS = True
 
     def find_executable(self) -> str | None:
         return installers.find(self.ID, usable=True)
@@ -219,13 +220,7 @@ class ClaudeCode(Harness):
             raise LauncherError(str(error)) from error
         if native is not None:
             return [str(native)]
-        if is_exe(path):
-            return [str(path)]
-        return node_script(path, "@anthropic-ai/claude-code/cli.js") or native_wrapper(path) or self._fail(path)
-
-    @staticmethod
-    def _fail(path: Path):
-        raise unrecognized(path)
+        return npm_cli_command(path, "@anthropic-ai/claude-code/cli.js")
 
     def connection_url(self, gateway) -> str:
         return gateway.targets["claude"] or ""
@@ -233,7 +228,10 @@ class ClaudeCode(Harness):
     def plan(self, context) -> LaunchPlan:
         gateway, catalog, selected, model = context.gateway, context.catalog, context.selected, context.model
         warnings, command = context.warnings, context.command
-        token = gateway.token
+        token, base_url = gateway.token, gateway.targets["claude"]
+        if context.endpoint:
+            from agent_launcher.endpoint.registry import PLACEHOLDER_KEY
+            token, base_url = PLACEHOLDER_KEY, context.endpoint.url
         context_window = None
         family_records = catalog.claude_families(selected)
         families = {family: record.claude_id(catalog.verified) for family, record in family_records.items()}
@@ -251,7 +249,7 @@ class ClaudeCode(Harness):
         api_key = gateway.targets.get("claude_auth") == "api_key"
         secret_variable = "ANTHROPIC_API_KEY" if api_key else "ANTHROPIC_AUTH_TOKEN"
         overrides = {
-            "ANTHROPIC_BASE_URL": gateway.targets["claude"],
+            "ANTHROPIC_BASE_URL": base_url,
             "ANTHROPIC_AUTH_TOKEN": "" if api_key else token,
             "ANTHROPIC_API_KEY": token if api_key else "",
             "ANTHROPIC_CUSTOM_HEADERS": "",
@@ -321,12 +319,15 @@ class ClaudeCode(Harness):
             session_id = str(uuid.uuid4())
             command += ["--session-id", session_id]
         plan = LaunchPlan(self.ID, model, context.directory, command, context.environment, overrides, context.input_limit,
-                          context_window, None, families, warnings, context.controlled, gateway.name, (secret_variable,))
+                          context_window, None, families, warnings, context.controlled, gateway.name,
+                          () if context.endpoint else (secret_variable,))
         plan.session_id = session_id
         return plan
 
     def prepare(self, plan) -> None:
-        """Antes de abrir uma sessão controlada do Claude Code: confia a pasta do projeto cadastrado. Falha visível."""
+        """Antes de abrir: sobe o endpoint local se a sessão vai por ele; em sessão controlada, confia a pasta do projeto
+        cadastrado. Falha visível."""
+        self.ensure_endpoint(plan)
         if plan.controlled:
             try:
                 if trust_claude_folder(plan.directory):

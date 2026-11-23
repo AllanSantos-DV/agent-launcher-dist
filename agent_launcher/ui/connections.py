@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import functools
 import itertools
+import re
 import time
 import urllib.parse
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices, QFontDatabase, QTextOption
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QApplication, QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
 from agent_launcher.connectors import ConnectorError, LoginPending, QuotaExhausted
@@ -18,17 +21,12 @@ from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
 from agent_launcher.endpoint import registry as endpoint_registry
-from agent_launcher.ui.background import deliver
-from agent_launcher.ui.theme import ReadableCombo, plural
+from agent_launcher.ui.background import BackgroundTask, run_task
+from agent_launcher.ui.placement import GrowingDialog, reveal
+from agent_launcher.ui.theme import ReadableCombo, StatusLine, bind_style, label, plural
 
 
-def _label(text: str, role: str = "") -> QLabel:
-    widget = QLabel(text)
-    widget.setTextFormat(Qt.TextFormat.PlainText)
-    widget.setWordWrap(True)
-    if role:
-        widget.setObjectName(role)
-    return widget
+_label = functools.partial(label, wrap=True)
 
 
 CLEAN_NOTE = ("Se o Copilot app estiver aberto, ele é fechado e aberto de novo (inclusive o ícone da bandeja). O "
@@ -38,32 +36,33 @@ CLEAN_NOTE = ("Se o Copilot app estiver aberto, ele é fechado e aberto de novo 
 DONE_DELAY_MS = 1500  # o painel de login mostra "Autorizado" por este tempo antes de o formulário fechar
 
 
-class _Signals(QObject):
-    done = Signal(object, str)
-
-
-class _Task(QRunnable):
+class _Task(BackgroundTask):
     """Teste/gravação de conexão fora da thread da interface (a verificação consulta a rede). A exceção fica em
-    `failure`: o login por código (LoginPending) chega à tela pela causa dela, não pelo texto."""
+    `failure_cause`: o login por código (LoginPending) chega à tela pela causa dela, não pelo texto."""
 
     def __init__(self, job):
         super().__init__()
         self.job = job
-        self.failure = None
-        self.signals = _Signals()
+        self.failure_cause = None
 
-    @Slot()
-    def run(self):
-        try:
-            deliver(self.signals, "done", self.job(), "")
-        except Exception as error:
-            self.failure = error
-            deliver(self.signals, "done", None, str(error))
+    def outcome(self):
+        return self.job(), ""
+
+    def failure(self, error):
+        self.failure_cause = error
+        return None, str(error)
+
+
+def split_cleanup(messages) -> tuple[list, list]:
+    """As mensagens de uma limpeza separadas em (o que foi feito, o que falhou), cada lado na ordem em que vieram."""
+    from agent_launcher.harnesses.cleanup import Failure
+    done = [message for message in messages if not isinstance(message, Failure)]
+    return done, [message for message in messages if isinstance(message, Failure)]
 
 
 def cause_of(task, kind: type):
     """A causa do tipo `kind` que fez a tarefa falhar (a verificação embrulha o erro do conector em LauncherError)."""
-    failure = getattr(task, "failure", None)
+    failure = getattr(task, "failure_cause", None)
     while failure is not None and not isinstance(failure, kind):
         failure = failure.__cause__
     return failure
@@ -118,6 +117,14 @@ def public_address(url: str) -> str:
 def connections_text(rows: list[list[str]]) -> str:
     """A lista de conexões separada por tabulação: colada numa planilha, cada valor cai na sua coluna."""
     return "\n".join("\t".join(row) for row in [list(CONNECTIONS_HEADER), *rows])
+
+
+LOG_LINES = 200
+SUMMARY_MODELS = 5
+SUMMARY_ROWS = 10
+LOG_VIEW_STYLE = ("QPlainTextEdit { background: #ffffff; color: #233e32; border: 1px solid #d5ded1; "
+                  "border-radius: 8px; padding: 6px; selection-background-color: #d5e6cf; }")
+EMPTY_LOG = "O endpoint local ainda não registrou nenhum pedido neste perfil."
 
 
 def _remaining(seconds: float) -> str:
@@ -371,8 +378,7 @@ class ConnectionForm(QDialog):
             self.notice.hide()
             self.login_panel.clear()
         self.task = _Task(lambda: Store(home).save_connection(name, connector, values, reference))
-        self.task.signals.done.connect(self.saved_result)
-        QThreadPool.globalInstance().start(self.task)
+        run_task(self.task, self.saved_result)
 
     @Slot()
     def poll_login(self):
@@ -425,7 +431,10 @@ class EndpointPanel(QWidget):
 
     Só aparece para conexão com porta gravada (já usada por VS Code ou Copilot app). O estado é lido ao abrir a tela,
     depois de cada ação e no botão Atualizar; sem polling. Tudo que consulta a rede ou espera o processo roda fora da
-    thread da interface (ensure_running espera até 15 s)."""
+    thread da interface (ensure_running espera até 15 s). Copiar endereço leva o endereço base mostrado no painel, sem
+    chave (o endpoint acrescenta a credencial); Ver log abre o fim do endpoint.log do perfil."""
+
+    copied = Signal(str)
 
     def __init__(self, home: Path, parent=None):
         super().__init__(parent)
@@ -453,6 +462,24 @@ class EndpointPanel(QWidget):
         self.refresh_button.clicked.connect(self.refresh)
         row.addWidget(self.refresh_button)
         layout.addLayout(row)
+        tools = QHBoxLayout()
+        self.copy_address_button = QPushButton("Copiar endereço")
+        self.copy_address_button.setToolTip("Copia o endereço do endpoint para colar no campo de endereço de outra ferramenta")
+        self.copy_address_button.clicked.connect(self.copy_address)
+        tools.addWidget(self.copy_address_button)
+        self.copy_config_button = QPushButton("Copiar configuração")
+        self.copy_config_button.setToolTip("Copia as variáveis de ambiente do endpoint (endereço certo por protocolo e uma "
+                                           "chave sem valor) para o PowerShell ou o cmd")
+        config_menu = QMenu(self.copy_config_button)
+        for title, shell in (("PowerShell", "powershell"), ("cmd", "cmd")):
+            config_menu.addAction(title, lambda shell=shell: self.copy_config(shell))
+        self.copy_config_button.setMenu(config_menu)
+        tools.addWidget(self.copy_config_button)
+        self.log_button = QPushButton("Ver log")
+        self.log_button.clicked.connect(self.show_log)
+        tools.addWidget(self.log_button)
+        tools.addStretch()
+        layout.addLayout(tools)
         self.notice = _label("", "notice")
         self.notice.hide()
         layout.addWidget(self.notice)
@@ -463,15 +490,24 @@ class EndpointPanel(QWidget):
     def render_notice(self):
         """Erros ativos desta conexão: o da leitura do estado e o da última ação nela (o de outra conexão não aparece)."""
         text = "\n".join(filter(None, [self.state_error, self.action_errors.get(self.connection_id or "", "")]))
+        news = bool(text) and text != self.notice.text()
         self.notice.setText(text)
         self.notice.setVisible(bool(text))
+        if news:
+            reveal(self.notice)
 
     def _start(self, job, slot):
         task = _Task(job)
         self.tasks.add(task)
-        task.signals.done.connect(slot)
-        task.signals.done.connect(lambda *_args, task=task: self.tasks.discard(task))
-        QThreadPool.globalInstance().start(task)
+        task.signals.completed.connect(lambda *_args, task=task: self.tasks.discard(task))
+        run_task(task, slot)
+
+    def _act(self, connection_id: str, job, busy_text: str = ""):
+        """Dispara a ação do usuário sobre a conexão: apaga o erro da ação anterior dela, trava os botões e roda `job`."""
+        self.action_errors.pop(connection_id, None)
+        self.render_notice()
+        self._set_busy(True, busy_text)
+        self._start(job, self._acted_for(connection_id))
 
     def _set_busy(self, busy: bool, text: str = ""):
         self.busy = busy
@@ -514,8 +550,41 @@ class EndpointPanel(QWidget):
         if not self.busy:
             self.summary.setText(" • ".join(parts) + (f"\n{state['url']}" if state.get("url") else ""))
         self.toggle_button.setText("Parar" if running else "Iniciar")
+        self.copy_address_button.setEnabled(running and bool(state.get("url")))
+        self.copy_config_button.setEnabled(running and bool(state.get("url")))
         self.autostart_box.setChecked(bool(state.get("autostart")))
         self.show()
+
+    def copy_address(self):
+        """Copia o endereço base do endpoint da conexão selecionada; parado, não copia nada."""
+        state = self.states.get(self.connection_id or "") or {}
+        if not state.get("running") or not state.get("url"):
+            return
+        QApplication.clipboard().setText(state["url"])
+        self.copied.emit("Endereço copiado: cole no campo de endereço da outra ferramenta. Não precisa de chave, o "
+                         "endpoint acrescenta a credencial.")
+
+    def copy_config(self, shell: str):
+        """Copia as variáveis de ambiente do endpoint da conexão selecionada para o `shell` (powershell ou cmd); parado,
+        não copia nada. Falha ao montar aparece na faixa do painel."""
+        connection_id = self.connection_id or ""
+        state = self.states.get(connection_id) or {}
+        if not state.get("running") or not state.get("port"):
+            return
+        self.action_errors.pop(connection_id, None)
+        try:
+            text = endpoint_registry.connection_config(self.home, connection_id, state["port"], shell)
+        except LauncherError as error:
+            self.action_errors[connection_id] = str(error)
+            self.render_notice()
+            return
+        self.render_notice()
+        QApplication.clipboard().setText(text)
+        self.copied.emit(f"Configuração copiada ({'PowerShell' if shell == 'powershell' else 'cmd'}): cole no terminal da "
+                         "outra ferramenta. Vai sem chave real, o endpoint acrescenta a credencial.")
+
+    def show_log(self):
+        EndpointLogDialog(self.home, self.window()).exec()
 
     def toggle(self):
         connection_id = self.connection_id
@@ -523,24 +592,17 @@ class EndpointPanel(QWidget):
         if not state:
             return
         home = self.home
-        self.action_errors.pop(connection_id, None)
-        self.render_notice()
         if state.get("running"):
-            self._set_busy(True, "Parando o endpoint…")
-            self._start(lambda: endpoint_registry.stop(home, connection_id), self._acted_for(connection_id))
+            self._act(connection_id, lambda: endpoint_registry.stop(home, connection_id), "Parando o endpoint…")
         else:
-            self._set_busy(True, "Iniciando o endpoint…")
-            self._start(lambda: endpoint_registry.ensure_running(home, connection_id), self._acted_for(connection_id))
+            self._act(connection_id, lambda: endpoint_registry.ensure_running(home, connection_id), "Iniciando o endpoint…")
 
     def set_autostart(self, enabled: bool):
         connection_id = self.connection_id
         if not connection_id:
             return
         home = self.home
-        self.action_errors.pop(connection_id, None)
-        self.render_notice()
-        self._set_busy(True)
-        self._start(lambda: endpoint_registry.autostart(home, connection_id, bool(enabled)), self._acted_for(connection_id))
+        self._act(connection_id, lambda: endpoint_registry.autostart(home, connection_id, bool(enabled)))
 
     def _acted_for(self, connection_id):
         """A resposta chega depois: o erro é da conexão que disparou a ação, não da que está selecionada agora."""
@@ -555,17 +617,258 @@ class EndpointPanel(QWidget):
         self.refresh()
 
 
-class ConnectionsDialog(QDialog):
+class EndpointLogDialog(GrowingDialog):
+    """O fim do endpoint.log do perfil, só para leitura, com Atualizar, Copiar e Fechar. Log ausente ou vazio mostra o
+    texto de vazio; log que não abre mostra o erro, nunca um vazio de mentira."""
+
+    def __init__(self, home: Path, parent=None):
+        super().__init__(parent, QSize(560, 360))
+        self.home = home
+        self.text = ""
+        self.setWindowTitle("Log do endpoint local")
+        layout = self.body_layout
+        layout.addWidget(_label("Log do endpoint local", "title"))
+        layout.addWidget(_label(f"As últimas {LOG_LINES} linhas do endpoint.log deste perfil: rota, modelo, status e "
+                                "duração de cada pedido. Nunca o corpo nem a chave.", "muted"))
+        self.summary = QPlainTextEdit()
+        self.summary.setReadOnly(True)
+        self.summary.setAccessibleName("Resumo do log do endpoint local")
+        self.summary.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        bind_style(self.summary, LOG_VIEW_STYLE)
+        self.summary.hide()
+        layout.addWidget(self.summary)
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setAccessibleName("Log do endpoint local")
+        self.view.setMinimumHeight(140)
+        self.view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.view.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        bind_style(self.view, LOG_VIEW_STYLE)
+        layout.addWidget(self.view, 1)
+        self.status = StatusLine()
+        layout.addWidget(self.status)
+        row = QHBoxLayout()
+        self.refresh_button = QPushButton("Atualizar")
+        self.refresh_button.clicked.connect(self.load)
+        row.addWidget(self.refresh_button)
+        self.copy_button = QPushButton("Copiar")
+        self.copy_button.clicked.connect(self.copy)
+        row.addWidget(self.copy_button)
+        row.addStretch()
+        self.close_button = QPushButton("Fechar")
+        self.close_button.setObjectName("primary")
+        self.close_button.clicked.connect(self.accept)
+        row.addWidget(self.close_button)
+        self.footer_layout.addLayout(row)
+        self.load()
+
+    def load(self):
+        """Lê o log de novo e mostra o fim dele."""
+        self.status.setText("")
+        try:
+            self.text = endpoint_registry.read_log(self.home, LOG_LINES)
+            shown = self.text or EMPTY_LOG
+        except OSError as error:
+            self.text = ""
+            shown = f"Não foi possível ler o log do endpoint: {error}"
+        self.show_summary(endpoint_registry.summary_text(endpoint_registry.summarize_log(self.text), SUMMARY_MODELS)
+                          if self.text else "")
+        self.view.setPlainText(shown)
+        self.view.moveCursor(self.view.textCursor().MoveOperation.End)
+        self.copy_button.setEnabled(bool(self.text))
+
+    def showEvent(self, event):
+        """Abre já na altura que o corpo e o rodapé pedem: a medida da área rolável é limitada a umas 24 linhas de texto,
+        e um corpo mais alto abriria com barra de rolagem. A área útil da tela (PopupKeeper) ainda limita o tamanho."""
+        super().showEvent(event)
+        self.fit_summary()
+        body = self.body_host.layout().heightForWidth(self.body_scroll.viewport().width())
+        self.resize(self.width(), max(self.height(), body + self.footer_host.sizeHint().height()))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.fit_summary()
+
+    def show_summary(self, text: str):
+        """Mostra o resumo numa área só de leitura de altura fixa (as linhas já quebradas, no máximo SUMMARY_ROWS): rótulo
+        que quebra linha muda de altura com a largura e o diálogo mede errado."""
+        self.summary.setPlainText(text)
+        self.summary.setVisible(bool(text))
+        self.fit_summary()
+
+    def fit_summary(self):
+        """Altura da área do resumo = as linhas visuais do texto na largura de agora, até SUMMARY_ROWS."""
+        if not self.summary.isVisibleTo(self):
+            return
+        self.summary.ensurePolished()
+        rows = min(max(int(self.summary.document().size().height()), 1), SUMMARY_ROWS)
+        frame = 2 * self.summary.frameWidth() + 2 * int(self.summary.document().documentMargin()) + 12
+        height = rows * self.summary.fontMetrics().lineSpacing() + frame
+        if self.summary.height() != height or self.summary.minimumHeight() != height:
+            self.summary.setFixedHeight(height)
+
+    def copy(self):
+        if not self.text:
+            return
+        QApplication.clipboard().setText(self.text)
+        self.status.setText(f"{plural(len(self.text.splitlines()), 'linha copiada', 'linhas copiadas')}.")
+
+
+class ConnectionSettingPanel(QWidget):
+    """Base dos painéis de uma configuração gravada na conexão selecionada: guarda a conexão, esconde-se sem ela, tem a
+    faixa de recusa (`notice`) e deixa à subclasse só `fill`, o desenho do valor gravado."""
+
     def __init__(self, home: Path, parent=None):
         super().__init__(parent)
+        self.home = home
+        self.connection_id: str | None = None
+        self.notice = _label("", "notice")
+        self.notice.hide()
+
+    def reset_for_other_connection(self) -> None:
+        """Limpa o que era da conexão anterior; a subclasse acrescenta o que mais guarda."""
+        self.notice.hide()
+
+    def fill(self, store: Store, connection: dict) -> None:
+        """Mostra no painel o valor gravado em `connection`."""
+        raise NotImplementedError(f"{type(self).__name__} não define fill()")
+
+    def show_for(self, connection_id: str | None):
+        """Mostra o painel com o valor gravado da conexão `connection_id`; sem conexão, esconde o painel."""
+        if connection_id != self.connection_id:
+            self.reset_for_other_connection()
+        self.connection_id = connection_id
+        store = Store(self.home)
+        try:
+            connection = store.find_connection(connection_id) if connection_id else None
+        except LauncherError:
+            connection = None  # a conexão sumiu entre a lista e a leitura
+        if connection is None:
+            self.hide()
+            return
+        self.fill(store, connection)
+        self.show()
+
+    def refuse(self, error: Exception) -> None:
+        """Mostra a recusa do cadastro na faixa do painel."""
+        self.notice.setText(str(error))
+        self.notice.show()
+        reveal(self.notice)
+
+    def commit(self, write: Callable[[Store, str], None], undo: Callable[[], None]) -> bool:
+        """Grava com `write(store, connection_id)` na conexão selecionada (sem conexão, não faz nada). Se o cadastro
+        recusar, chama `undo` e mostra a recusa na faixa; se aceitar, esconde a faixa. Devolve se gravou."""
+        connection_id = self.connection_id
+        if not connection_id:
+            return False
+        try:
+            write(Store(self.home), connection_id)
+        except LauncherError as error:
+            undo()
+            self.refuse(error)
+            return False
+        self.notice.hide()
+        return True
+
+
+class FallbackPanel(ConnectionSettingPanel):
+    """Conexão reserva da conexão selecionada: quando ela responde cota esgotada, o endpoint local refaz o pedido na
+    reserva. Seletor com as outras conexões e Salvar; ao trocar de conexão mostra o valor gravado. A recusa do cadastro
+    (ciclo, conexão que sumiu) aparece na faixa do painel e nada é gravado."""
+
+    NONE = "Sem reserva"
+
+    def __init__(self, home: Path, parent=None):
+        super().__init__(home, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(_label("Conexão reserva", "section"))
+        layout.addWidget(_label("Se esta conexão responder cota esgotada, o endpoint local refaz o pedido na reserva.",
+                                "muted"))
+        row = QHBoxLayout()
+        self.combo = ReadableCombo()
+        self.combo.setAccessibleName("Conexão reserva")
+        row.addWidget(self.combo, 1)
+        self.save_button = QPushButton("Salvar")
+        self.save_button.clicked.connect(self.save)
+        row.addWidget(self.save_button)
+        layout.addLayout(row)
+        self.status = StatusLine()
+        layout.addWidget(self.status)
+        layout.addWidget(self.notice)
+        self.hide()
+
+    def reset_for_other_connection(self) -> None:
+        self.status.setText("")
+        super().reset_for_other_connection()
+
+    def fill(self, store: Store, connection: dict) -> None:
+        """O seletor com as outras conexões e a reserva gravada de `connection` marcada."""
+        current = store.fallback_of(connection)
+        self.combo.clear()
+        self.combo.addItem(self.NONE, None)
+        for other in store.connections:
+            if other["id"] != connection["id"]:
+                self.combo.addItem(other["name"], other["id"])
+        self.combo.setCurrentIndex(max(self.combo.findData(current["id"]) if current else 0, 0))
+        self.combo.fit_to_items()
+
+    def save(self):
+        """Grava a reserva escolhida (ou tira a reserva com "Sem reserva")."""
+        reserve_id = self.combo.currentData()
+
+        def write(store: Store, connection_id: str) -> None:
+            if reserve_id:
+                store.set_fallback(connection_id, reserve_id)
+            else:
+                store.clear_fallback(connection_id)
+
+        if self.commit(write, lambda: self.status.setText("")):
+            self.status.setText("Reserva salva." if reserve_id else "Reserva removida.")
+
+
+class EndpointSessionsPanel(ConnectionSettingPanel):
+    """Preferência da conexão selecionada: abrir as sessões de terminal (Claude Code e Codex) pelo endpoint local. Fica
+    abaixo do painel do endpoint e aparece para toda conexão, com ou sem porta gravada. Marcar ou desmarcar grava na hora;
+    a recusa do cadastro aparece na faixa do painel e a caixa volta ao valor gravado."""
+
+    def __init__(self, home: Path, parent=None):
+        super().__init__(home, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self.box = QCheckBox("Abrir sessões de terminal pelo endpoint local")
+        self.box.setToolTip("Claude Code e Codex desta conexão passam pelo endpoint local: o log, a conexão reserva e o uso "
+                            "valem para a sessão, e a chave real não vai para o ambiente dela. Desmarcado, a sessão vai "
+                            "direto ao host, como sempre.")
+        self.box.clicked.connect(self.save)  # clicked: só a ação do usuário, não o setChecked
+        layout.addWidget(self.box)
+        layout.addWidget(self.notice)
+        self.hide()
+
+    def fill(self, store: Store, connection: dict) -> None:
+        """A caixa com o valor gravado de `connection`."""
+        self.box.setChecked(Store.endpoint_sessions_of(connection))
+
+    def save(self, enabled: bool):
+        """Grava a preferência da conexão selecionada."""
+        self.commit(lambda store, connection_id: store.set_endpoint_sessions(connection_id, bool(enabled)),
+                    lambda: self.box.setChecked(not enabled))
+
+
+class ConnectionsDialog(GrowingDialog):
+    """Conexões cadastradas, com o painel da reserva e o do endpoint local da selecionada. A janela cresce quando um
+    painel ou uma faixa de erro aparece: os botões da lista nunca ficam abaixo do tamanho do texto."""
+
+    def __init__(self, home: Path, parent=None):
+        super().__init__(parent, QSize(620, 520))
         self.home = home
         self.cleaning = False
         self.cleanup_task = None
         self.setWindowTitle("Conexões")
-        self.setMinimumSize(620, 420)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 20)
-        layout.setSpacing(12)
+        layout = self.body_layout
         layout.addWidget(_label("Conexões com provedores", "title"))
         layout.addWidget(_label("Cada conexão é um host de modelos: LiteLLM ou host próprio, 9router, OmniRoute, "
                                 "OpenRouter, Anthropic, OpenAI ou qualquer host compatível. As chaves ficam cifradas "
@@ -573,7 +876,7 @@ class ConnectionsDialog(QDialog):
         body = QHBoxLayout()
         self.list = QListWidget()
         self.list.setAccessibleName("Conexões cadastradas")
-        self.list.currentItemChanged.connect(self.update_buttons)
+        self.list.currentItemChanged.connect(self.selection_changed)
         self.list.itemDoubleClicked.connect(lambda _item: self.edit())
         body.addWidget(self.list, 1)
         buttons = QVBoxLayout()
@@ -582,7 +885,8 @@ class ConnectionsDialog(QDialog):
                                     ("duplicate", "Duplicar…", self.duplicate),
                                     ("test", "Testar", self.test), ("test_all", "Testar todas", self.test_all),
                                     ("default", "Tornar padrão", self.make_default),
-                                    ("copy", "Copiar lista", self.copy_list), ("remove", "Remover…", self.remove)):
+                                    ("copy", "Copiar lista", self.copy_list),
+                                    ("share", "Compartilhar sem chave…", self.share), ("remove", "Remover…", self.remove)):
             widget = QPushButton(text)
             widget.clicked.connect(callback)
             buttons.addWidget(widget)
@@ -591,8 +895,13 @@ class ConnectionsDialog(QDialog):
         buttons.addStretch()
         body.addLayout(buttons)
         layout.addLayout(body, 1)
+        self.fallback = FallbackPanel(home, self)
+        layout.addWidget(self.fallback)
         self.endpoint = EndpointPanel(home, self)
+        self.endpoint.copied.connect(lambda text: self.set_status("copia", text))
         layout.addWidget(self.endpoint)
+        self.sessions = EndpointSessionsPanel(home, self)
+        layout.addWidget(self.sessions)
         self.login_panel = LoginPanel()
         self.login_panel.poll.connect(lambda: self.test(polling=True))
         layout.addWidget(self.login_panel)
@@ -610,12 +919,12 @@ class ConnectionsDialog(QDialog):
         self.status = _label("", "muted")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        close = QPushButton("Fechar")
-        close.clicked.connect(self.accept)
+        self.close_button = QPushButton("Fechar")
+        self.close_button.clicked.connect(self.accept)
         row = QHBoxLayout()
         row.addStretch()
-        row.addWidget(close)
-        layout.addLayout(row)
+        row.addWidget(self.close_button)
+        self.footer_layout.addLayout(row)
         self.populate()
         self.endpoint.refresh()
 
@@ -661,14 +970,21 @@ class ConnectionsDialog(QDialog):
         item = self.list.currentItem()
         return Store(self.home).find_connection(item.data(Qt.ItemDataRole.UserRole)) if item else None
 
+    def selection_changed(self, *_args):
+        """A confirmação de cópia era da conexão anterior: não fica na faixa da nova."""
+        self.set_status("copia", "")
+        self.update_buttons()
+
     def update_buttons(self, *_args):
-        for key in ("edit", "duplicate", "default", "remove"):
+        for key in ("edit", "duplicate", "default", "share", "remove"):
             self.buttons[key].setEnabled(self.list.currentItem() is not None)
         self.buttons["test"].setEnabled(self.list.currentItem() is not None and not self.testing_all)
         self.buttons["test_all"].setEnabled(self.list.count() > 0 and not self.testing_all)
         self.buttons["copy"].setEnabled(self.list.count() > 0)
-        item = self.list.currentItem()
-        self.endpoint.show_for(item.data(Qt.ItemDataRole.UserRole) if item else None)
+        selected = self.selected_id()
+        self.endpoint.show_for(selected)
+        self.sessions.show_for(selected)
+        self.fallback.show_for(selected)
 
     def add(self):
         form = ConnectionForm(self.home, parent=self)
@@ -703,8 +1019,7 @@ class ConnectionsDialog(QDialog):
                 self.populate(connection["id"])
         self.task = self.verification(connection)
         task = self.task
-        task.signals.done.connect(lambda _result, error: self.show_test_result(connection["name"], error, task))
-        QThreadPool.globalInstance().start(task)
+        run_task(task, lambda _result, error: self.show_test_result(connection["name"], error, task))
 
     def verification(self, connection: dict) -> _Task:
         """Tarefa de fundo que confere a conexão pelo Gateway: a mesma do teste individual e a de cada passo do Testar
@@ -743,8 +1058,7 @@ class ConnectionsDialog(QDialog):
                                  f"{connection['name']}…")
         self.task = self.verification(connection)
         task = self.task
-        task.signals.done.connect(lambda _result, error: self.batch_result(connection, error, task))
-        QThreadPool.globalInstance().start(task)
+        run_task(task, lambda _result, error: self.batch_result(connection, error, task))
 
     def batch_result(self, connection: dict, error: str, task):
         """Guarda o resultado de uma conexão da rodada, mostra na lista e segue para a próxima."""
@@ -777,6 +1091,28 @@ class ConnectionsDialog(QDialog):
         QApplication.clipboard().setText(connections_text(rows))
         self.set_status("copia", f"{plural(len(rows), 'conexão copiada', 'conexões copiadas')}: cole numa planilha, "
                                  "cada valor vai para a sua coluna.")
+
+    def share(self):
+        """Grava a conexão selecionada, sem a chave, no arquivo que o usuário escolhe. Nada é gravado antes disso."""
+        from agent_launcher.domain import profile_package
+        connection = self.current()
+        if not connection:
+            return
+        suggested = str(Path.home() / (re.sub(r'[\\/:*?"<>|]', "-", connection["name"]) + profile_package.EXTENSION))
+        path, _filter = QFileDialog.getSaveFileName(self, "Compartilhar conexão sem chave", suggested,
+                                                    "Conexão do Agent Launcher (*.alprofile)")
+        if not path:
+            return
+        try:
+            result = profile_package.export_connection(Store(self.home), connection["id"], Path(path))
+        except (LauncherError, OSError) as error:
+            self.errors["compartilhar"] = f"{connection['name']}: não foi possível compartilhar: {error}"
+            self.set_status("compartilhar", "")
+        else:
+            self.errors.pop("compartilhar", None)
+            self.set_status("compartilhar", f"{connection['name']}: {Path(result['path']).name} gravado. O arquivo não "
+                                            "leva a chave: quem receber informa a sua em Conexões.")
+        self.render_errors()
 
     def show_test_result(self, name: str, error: str, task=None):
         self.testing = False
@@ -824,8 +1160,11 @@ class ConnectionsDialog(QDialog):
 
     def render_errors(self):
         text = "\n".join(self.errors.values())
+        news = bool(text) and text != self.error_notice.text()
         self.error_notice.setText(text)
         self.error_notice.setVisible(bool(text))
+        if news:
+            reveal(self.error_notice)
 
     def make_default(self):
         connection = self.current()
@@ -862,14 +1201,11 @@ class ConnectionsDialog(QDialog):
             self.cleanup_task = None
             if then:
                 then(messages)
-        task.signals.done.connect(finished)
-        QThreadPool.globalInstance().start(task)
+        run_task(task, finished)
 
     def show_cleanup_result(self, messages):
         """O que foi feito vai para a linha de status; o que falhou, para a faixa própria, até a próxima limpeza."""
-        from agent_launcher.harnesses.cleanup import Failure
-        failed = [message for message in messages if isinstance(message, Failure)]
-        done = [message for message in messages if not isinstance(message, Failure)]
+        done, failed = split_cleanup(messages)
         if failed:
             self.errors["limpeza"] = " ".join(failed)
         else:

@@ -1,6 +1,11 @@
 """Download que só segue redirecionamento para onde se espera: o host pedido e os que o GitHub usa para servir release."""
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
+
+from agent_launcher.domain.files import replace_retrying
+
 # Hosts que o GitHub usa para servir release e arquivo bruto: um redirecionamento só pode ir para eles ou para o host pedido.
 GITHUB_HOSTS = ("github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com",
                 "raw.githubusercontent.com")
@@ -21,3 +26,34 @@ def restricted_redirects(url: str, refuse, hosts: tuple[str, ...] = GITHUB_HOSTS
                              "download recusado.")
             return super().redirect_request(req, fp, code, msg, headers, newurl)
     return RestrictedRedirect
+
+
+class DownloadRefused(Exception):
+    """Download interrompido: `kind` é "limit" (passou do teto) ou "sha256" (não confere com o publicado)."""
+
+    def __init__(self, kind: str):
+        super().__init__(kind)
+        self.kind = kind
+
+
+def save_verified(response, destination: Path, expected_sha256: str, limit: int, progress=None) -> None:
+    """Grava `response` em `destination` por um arquivo `.parte`, que só ganha o nome final depois de o SHA-256 conferir;
+    `progress(bytes_recebidos)` a cada bloco. Levanta DownloadRefused ao passar de `limit` bytes ou se o SHA-256 diverge;
+    erro de disco sobe como OSError. O `.parte` nunca fica."""
+    digest, received = hashlib.sha256(), 0
+    partial = destination.with_name(destination.name + ".parte")
+    try:
+        with open(partial, "wb") as stream:
+            while chunk := response.read(1024 * 1024):
+                received += len(chunk)
+                if received > limit:
+                    raise DownloadRefused("limit")
+                digest.update(chunk)
+                stream.write(chunk)
+                if progress:
+                    progress(received)
+        if digest.hexdigest() != expected_sha256.lower():
+            raise DownloadRefused("sha256")
+        replace_retrying(partial, destination)
+    finally:
+        partial.unlink(missing_ok=True)

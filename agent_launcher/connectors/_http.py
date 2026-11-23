@@ -81,6 +81,13 @@ def _error_payload(error) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def quota_suffix(payload: dict) -> str:
+    """Fim do aviso de cota esgotada: ": <mensagem do erro>" (uma linha, até 200 caracteres) ou "." sem mensagem."""
+    error = payload.get("error")
+    detail = error.get("message") if isinstance(error, dict) else None
+    return f": {' '.join(str(detail).split())[:200]}" if detail else "."
+
+
 def get_json(url: str, headers: dict | None = None, timeout: float = 15, quota=None) -> dict:
     """GET de JSON. `quota(status, corpo_do_erro)` diz quais respostas de erro são cota esgotada (QuotaExhausted) neste
     provedor; sem ele, todo status de erro é ConnectorError comum."""
@@ -97,9 +104,7 @@ def get_json(url: str, headers: dict | None = None, timeout: float = 15, quota=N
         payload = _error_payload(error) if quota else {}
         error.close()
         if quota and quota(error.code, payload):
-            detail = payload["error"].get("message") if isinstance(payload.get("error"), dict) else None
-            failure = QuotaExhausted(f"Cota ou crédito esgotado (HTTP {error.code} em {url})"
-                                     + (f": {' '.join(str(detail).split())[:200]}" if detail else "."))
+            failure = QuotaExhausted(f"Cota ou crédito esgotado (HTTP {error.code} em {url})" + quota_suffix(payload))
         elif error.code in (401, 403):
             failure = ConnectorError(f"O host recusou a chave (HTTP {error.code}) em {url}.")
         elif error.code == 404:

@@ -147,14 +147,20 @@ def write(db: Path, name: str, base: str, rows: list[tuple], wait: float = 20) -
     return retry_busy(lambda: _write(db, name, base, rows), wait)
 
 
-def _write(db: Path, name: str, base: str, rows: list[tuple]) -> str:
+def _backup(source: sqlite3.Connection, db: Path) -> Path:
+    """Cópia consistente do banco aberto em `source`, ao lado dele, com a hora no nome."""
     backup = db.with_name(f"{db.name}.agent-launcher-backup-{time.strftime('%Y%m%d-%H%M%S')}")
+    target = sqlite3.connect(backup)
+    source.backup(target)
+    target.close()
+    return backup
+
+
+def _write(db: Path, name: str, base: str, rows: list[tuple]) -> str:
     source = sqlite3.connect(db)
     try:
         check_schema(source)
-        target = sqlite3.connect(backup)
-        source.backup(target)
-        target.close()
+        backup = _backup(source, db)
         provider, _models = read_provider(source, name)
         identifier = provider["id"] if provider else str(uuid.uuid4())
         with source:
@@ -203,10 +209,7 @@ def _delete_provider(db: Path, name: str) -> str | None:
         provider, _models = read_provider(source, name)
         if not provider:
             return None
-        backup = db.with_name(f"{db.name}.agent-launcher-backup-{time.strftime('%Y%m%d-%H%M%S')}")
-        target = sqlite3.connect(backup)
-        source.backup(target)
-        target.close()
+        backup = _backup(source, db)
         with source:
             source.execute("delete from provider_models where provider_id=?", (provider["id"],))
             source.execute("delete from model_providers where id=?", (provider["id"],))
@@ -283,10 +286,7 @@ class CopilotApp(Harness):
                 f"No app: provider \"{PROVIDER_PREFIX}\" pelo endpoint local ({wire}); o app não recebe chave nem host.")
 
     def command(self) -> list[str]:
-        executable = self.find_executable()
-        if not executable:
-            raise LauncherError(f"{self.LABEL} não encontrado. {self.MISSING_HINT}")
-        return [executable]
+        return [self.require_executable()]
 
     def plan(self, context):
         raise LauncherError("O Copilot app abre pela interface ou por 'launch --cli copilot_app', não num terminal.")
@@ -317,9 +317,7 @@ class CopilotApp(Harness):
 
     def open(self, store, project: dict, gateway, model: str, catalog: Catalog, confirm=lambda question: True) -> str:
         from agent_launcher.endpoint import registry as endpoints
-        executable = self.find_executable()
-        if not executable:
-            raise LauncherError(f"{self.LABEL} não encontrado. {self.MISSING_HINT}")
+        executable = self.require_executable()
         db = database()
         if not db.is_file():
             raise LauncherError("O Copilot app ainda não criou o banco dele: abra o app uma vez, entre com a conta "

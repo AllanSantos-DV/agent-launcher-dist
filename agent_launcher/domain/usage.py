@@ -10,7 +10,8 @@ Fontes (só números; nada de conteúdo de conversa sai dos arquivos):
 - Copilot CLI: ~/.copilot/session-state/<id>/workspace.yaml (cwd, created_at) e events.jsonl: session.usage_record
   (uma por chamada, data.usage {model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens}); sem elas,
   session.shutdown com data.modelMetrics (acumulado por modelo, cresce a cada retomada).
-- VS Code e Copilot app: <raiz>/usage.jsonl que o endpoint local grava (endpoint/server.py).
+- VS Code e Copilot app: <raiz>/usage.jsonl que o endpoint local grava (endpoint/server.py). As linhas dele com destino
+  Claude Code ou Codex (sessão aberta pelo endpoint local) não entram: as conversas já contam esse uso.
 
 Conversas do perfil: as das pastas dos projetos dele. Pasta em mais de um perfil: só as que o registro (§1) atribui a
 este perfil (Claude por session_id; Codex/Copilot pela primeira conversa criada até 10 min depois de cada abertura, ou
@@ -22,6 +23,7 @@ import calendar
 import datetime
 import glob
 import json
+import math
 import os
 import re
 import time
@@ -29,10 +31,12 @@ from pathlib import Path
 
 from agent_launcher.domain import profiles
 from agent_launcher.domain.catalog import PRICES, ModelInfo, base_model
+from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import atomic_json, note_state_recovery
 from agent_launcher.session import registry
 
 DESTINATIONS = ("claude", "codex", "copilot", "vscode", "copilot_app", "endpoint")
+CONVERSATION_DESTINATIONS = ("claude", "codex")  # o uso deles vem das conversas, mesmo quando a sessão passa pelo endpoint
 ATTRIBUTION_WINDOW = 10 * 60
 CACHE_FILE = "usage.json"
 CACHE_SCHEMA = 2  # 2: resultado com "context" e o ponto de continuação ("resume")
@@ -511,8 +515,11 @@ def _endpoint(base: Path, profile_id: str, start: float, end: float, totals: dic
             at = entry.get("at")
             if not isinstance(at, (int, float)) or not start <= at < end:
                 continue
+            destination = endpoint_destination(entry)
+            if destination in CONVERSATION_DESTINATIONS:
+                continue
             model = str(entry.get("model") or "?")
-            row = totals.setdefault((endpoint_destination(entry), model), {
+            row = totals.setdefault((destination, model), {
                 "values": [0, 0, 0, 0], "conversations": set(), "requests": 0, "connections": set()})
             for index, field in enumerate(FIELDS):
                 row["values"][index] += _number(entry.get(field))
@@ -644,3 +651,156 @@ def usage_report_all(home: Path, month: str | None = None) -> dict:
                                                       if row["destination"] in DESTINATIONS else 99,
                                                       row["model"].casefold()))
     return _summary("todos", month_label or month_bounds(month)[0], models)
+
+
+def money(value: float) -> str:
+    """Valor na moeda do relatório, no formato brasileiro (US$ 1.234,50)."""
+    return f"US$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+USAGE_HEADER = ("Destino", "Modelo", "Entrada", "Saída", "Custo")
+DESTINATION_NAMES = {"claude": "Claude Code", "codex": "Codex", "copilot": "Copilot CLI", "vscode": "VS Code",
+                     "copilot_app": "Copilot app", "endpoint": "Endpoint local"}
+
+
+def tokens(value: int) -> str:
+    """Quantidade de tokens com ponto de milhar (1.234)."""
+    return f"{value:,}".replace(",", ".")
+
+
+def usage_rows(report: dict) -> list[tuple[str, str, str, str, str]]:
+    """Linhas da tabela de uso (diálogo e relatório de texto): destino, modelo, entrada (com cache), saída, custo."""
+
+    rows = []
+    unpriced = False
+    for row in report.get("models", []):
+        entrada = row["input_tokens"] + row["cache_read"] + row["cache_write"]
+        priced = row.get("priced", row["cost"] is not None) and row["cost"] is not None
+        unpriced = unpriced or not priced
+        rows.append((DESTINATION_NAMES.get(row["destination"], row["destination"]), row["model"], tokens(entrada),
+                     tokens(row["output_tokens"]), money(row["cost"]) if priced else "sem preço"))
+    total = report.get("total") or {}
+    if rows:
+        if total.get("cost") is None:
+            total_cost = "sem preço"
+        else:
+            total_cost = money(total["cost"]) + (" (parcial)" if unpriced else "")
+        rows.append(("Total", "", tokens(total.get("input_tokens", 0) + total.get("cache_read", 0)
+                                         + total.get("cache_write", 0)),
+                     tokens(total.get("output_tokens", 0)), total_cost))
+    return rows
+
+
+def usage_text(report: dict) -> str:
+    """O relatório de uso separado por tabulação: colado numa planilha, cada valor cai na sua coluna."""
+    scope = " (todos os perfis)" if report.get("profile") == "todos" else ""
+    lines = [f"Mês {report['month']}{scope}", "\t".join(USAGE_HEADER)]
+    lines += ["\t".join(row) for row in usage_rows(report)]
+    return "\n".join(lines)
+
+
+SOURCE_COST_HEADER = ("Fonte", "Custo", "Limite", "Entrada", "Saída")
+
+
+def currency_money(value: float, currency: str) -> str:
+    """Valor na moeda do conector, no formato brasileiro (US$ 1.234,50 para USD; EUR 1.234,50 para as demais)."""
+    return money(value) if currency == "USD" else money(value).replace("US$", currency, 1)
+
+
+def source_costs_rows(costs: dict) -> list[tuple[str, str, str, str, str]]:
+    """Linhas do custo por fonte que o conector devolveu (`connectors.normalize_costs`): fonte, custo, limite, entrada e
+    saída ("—" onde o conector não informou), mais o total dos custos; sem fontes, nenhuma linha."""
+    currency = costs["currency"]
+
+    def tokens_or_dash(value: int | None) -> str:
+        return "—" if value is None else tokens(value)
+    rows = [(item["source"], currency_money(item["cost"], currency),
+             "—" if item["limit"] is None else currency_money(item["limit"], currency),
+             tokens_or_dash(item["tokens_in"]), tokens_or_dash(item["tokens_out"])) for item in costs["sources"]]
+    if rows:
+        rows.append(("Total", currency_money(sum(item["cost"] for item in costs["sources"]), currency), "—", "—", "—"))
+    return rows
+
+
+def source_costs_text(month: str, costs: dict) -> str:
+    """O custo por fonte separado por tabulação (como `usage_text`): colado numa planilha, cada valor cai na sua coluna."""
+    lines = [f"Mês {month}", "\t".join(SOURCE_COST_HEADER)]
+    return "\n".join(lines + ["\t".join(row) for row in source_costs_rows(costs)])
+
+
+# ----------------------------------------------------------------------------------------------- teto de gasto do mês
+LIMIT_WARN_PERCENT = 80.0
+LIMIT_OVER_PERCENT = 100.0
+
+
+def parse_limit(text: str) -> float | None:
+    """Teto mensal digitado (ponto ou vírgula decimal, sem separador de milhar); vazio ou "off" desliga (None)."""
+    text = text.strip()
+    if text.lower() in ("", "off"):
+        return None
+    try:
+        value = float(text.replace(",", ".")) if text.count(",") + text.count(".") <= 1 else math.nan
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value <= 0:
+        raise LauncherError(f"Limite mensal inválido: {text!r}. Use um valor maior que zero (100 ou 100,50) ou off.")
+    return value
+
+
+def format_limit(value: float) -> str:
+    """O teto como o campo da interface o mostra: o mesmo valor que parse_limit lê de volta."""
+    return f"{value:.10g}".replace(".", ",")
+
+
+def limit_status(report: dict, limit: float | None) -> dict | None:
+    """Gasto do relatório frente ao teto: valor, percentual, nível (ok, warn a 80%, over a 100%) e se a soma é parcial
+    (modelo sem preço fica fora do gasto). None quando o limite está desligado."""
+    if limit is None:
+        return None
+    spent = (report.get("total") or {}).get("cost") or 0.0
+    percent = round(spent * 100 / limit, 2)
+    level = "over" if percent >= LIMIT_OVER_PERCENT else "warn" if percent >= LIMIT_WARN_PERCENT else "ok"
+    return {"amount": limit, "currency": report.get("currency", "USD"), "spent": spent, "percent": percent,
+            "partial": any(row["cost"] is None for row in report.get("models", [])), "level": level}
+
+
+def limit_text(status: dict) -> str:
+    """O gasto frente ao teto numa linha; diz "soma parcial" quando há modelo sem preço."""
+    text = f"{money(status['spent'])} de {money(status['amount'])} ({int(status['percent'])}%)"
+    if status["partial"]:
+        text += " — soma parcial: modelo sem preço fica fora da conta e o gasto real pode ser maior"
+    return text
+
+
+def limit_warning(status: dict | None) -> str | None:
+    """Aviso da faixa de status a partir dos 80% do teto; None abaixo disso ou com o limite desligado."""
+    if status is None or status["level"] == "ok":
+        return None
+    prefix = "Teto de gasto do mês atingido" if status["level"] == "over" else "Teto de gasto do mês perto do limite"
+    return f"{prefix}: {limit_text(status)}."
+
+
+def source_limit_statuses(costs: dict) -> list[dict]:
+    """Custo frente ao limite de cada fonte que o conector deu (`connectors.normalize_costs`): fonte, custo, limite,
+    moeda, percentual e nível (ok, warn a 80%, over a 100%). Fonte sem limite ou com limite zero fica fora."""
+    statuses = []
+    for item in costs["sources"]:
+        if not item["limit"]:
+            continue
+        percent = round(item["cost"] * 100 / item["limit"], 2)
+        level = "over" if percent >= LIMIT_OVER_PERCENT else "warn" if percent >= LIMIT_WARN_PERCENT else "ok"
+        statuses.append({"source": item["source"], "cost": item["cost"], "amount": item["limit"],
+                         "currency": costs["currency"], "percent": percent, "level": level})
+    return statuses
+
+
+def source_limit_warning(status: dict, connection: str | None = None) -> str | None:
+    """Texto do balão do limite de uma fonte, no estilo do aviso do teto; None abaixo dos 80%. Com `connection` o texto
+    nomeia também a conexão (perfil com mais de uma)."""
+    if status["level"] == "ok":
+        return None
+    state = "atingido" if status["level"] == "over" else "perto do limite"
+    currency = status["currency"]
+    owner = f" (conexão {connection})" if connection else ""
+    return (f"Limite da fonte {status['source']}{owner} do mês {state}: {currency_money(status['cost'], currency)} de "
+            f"{currency_money(status['amount'], currency)} ({int(status['percent'])}%).")

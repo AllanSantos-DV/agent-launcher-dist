@@ -20,7 +20,6 @@ Nada é instalado sem pedido: só pelo cartão da ferramenta, por cli --install 
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import platform
@@ -28,11 +27,11 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 from pathlib import Path
 
-from agent_launcher.domain.downloads import restricted_redirects
-from agent_launcher.domain.files import append_capped, replace_retrying
+from agent_launcher.domain import cache
+from agent_launcher.domain.downloads import DownloadRefused, restricted_redirects, save_verified
+from agent_launcher.domain.files import log_line, replace_retrying
 from agent_launcher.harnesses.base import path_without_vscode_shim
 from agent_launcher.platform import terminal
 from version import data_home
@@ -189,11 +188,7 @@ def _tail(result: subprocess.CompletedProcess, count: int = 8) -> str:
 
 
 def record(message: str) -> None:
-    try:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        append_capped(LOG_FILE, f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n", LOG_MAX_BYTES)
-    except OSError:
-        pass  # o texto segue na exceção e no log da tela; o arquivo é só o registro
+    log_line(LOG_FILE, message, LOG_MAX_BYTES)  # o texto segue na exceção e no log da tela; o arquivo é só o registro
 
 
 def _fail(cli: str, step: str, message: str):
@@ -443,30 +438,30 @@ def release_asset(tool: str) -> tuple[str, str, int]:
 
 
 def download(tool: str, url: str, destination: Path, expected_sha256: str, size: int, progress) -> None:
-    """Baixa o instalador para `destination` relatando a fração baixada; só segue redirecionamento para DOWNLOADS."""
-    digest, received = hashlib.sha256(), 0
+    """Baixa o instalador para `destination` relatando a fração baixada; só segue redirecionamento para DOWNLOADS. O
+    arquivo só ganha o nome final depois de o SHA-256 conferir."""
     try:
-        with _open(url, DOWNLOADS[tool][1], timeout=120) as response, open(destination, "wb") as stream:
+        with _open(url, DOWNLOADS[tool][1], timeout=120) as response:
             total = int(response.headers.get("Content-Length") or 0) or size
-            while chunk := response.read(1024 * 1024):
-                received += len(chunk)
-                if received > DOWNLOAD_LIMIT:
-                    raise CliInstallError(f"download do {label(tool)} acima do limite esperado; interrompido.")
-                digest.update(chunk)
-                stream.write(chunk)
+
+            def report(received: int) -> None:
                 if total:
                     progress(min(received / total, 1.0), f"Baixando {min(received * 100 // total, 100)}%")
+            save_verified(response, destination, expected_sha256, DOWNLOAD_LIMIT, report)
+    except DownloadRefused as refused:
+        raise CliInstallError(
+            f"download do {label(tool)} acima do limite esperado; interrompido." if refused.kind == "limit" else
+            f"SHA-256 do instalador do {label(tool)} não confere com o publicado; arquivo descartado.") from None
     except OSError as error:
         raise CliInstallError(f"download do {label(tool)} falhou ({url}): {error}") from error
-    if digest.hexdigest() != expected_sha256:
-        raise CliInstallError(f"SHA-256 do instalador do {label(tool)} não confere com o publicado; arquivo descartado.")
 
 
 def install_download(tool: str, progress=lambda fraction, text: None) -> None:
-    """Instalador oficial por usuário baixado pelo launcher: SHA-256 e assinatura conferidos antes de rodar, em silêncio."""
+    """Instalador oficial por usuário baixado pelo launcher: SHA-256 e assinatura conferidos antes de rodar, em silêncio.
+    Trabalha na pasta estável da versão, esvaziada ao entrar e ao sair: o instalador baixado não fica no disco."""
     url, sha256, size = release_asset(tool)
-    with tempfile.TemporaryDirectory(prefix="agent-launcher-instalador-") as work:
-        setup = Path(work) / url.rsplit("/", 1)[-1].split("?")[0]
+    with cache.scratch_folder("instalador", tool, busy=CliInstallError) as work:
+        setup = work / url.rsplit("/", 1)[-1].split("?")[0]
         download(tool, url, setup, sha256, size, progress)
         progress(None, "Conferindo assinatura")
         try:

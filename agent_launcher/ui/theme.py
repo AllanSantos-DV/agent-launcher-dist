@@ -118,6 +118,16 @@ def bind_style(widget: QWidget, css: str) -> None:
     widget.setStyleSheet(toned(css))
 
 
+def label(text: str, role: str = "", parent=None, wrap: bool = False) -> QLabel:
+    """Rótulo de texto puro; `role` vira o nome do objeto (o seletor da folha de estilo) e `wrap` deixa o texto quebrar."""
+    widget = QLabel(text, parent)
+    widget.setTextFormat(Qt.TextFormat.PlainText)
+    widget.setWordWrap(wrap)
+    if role:
+        widget.setObjectName(role)
+    return widget
+
+
 def refresh_widgets() -> None:
     """Refaz os ícones, as folhas de estilo e as cores de célula que guardaram a especificação (`bind_icon`,
     `bind_style`, `tone_item`)."""
@@ -460,6 +470,51 @@ class CurrentMark(QStyledItemDelegate):
         painter.restore()
 
 
+class StatusLine(QLabel):
+    """Message label that always takes the height of `lines` text lines, with or without a message, so showing or clearing
+    it moves nothing around it. A message longer than that grows the label."""
+
+    def __init__(self, role: str = "muted", lines: int = 1, parent=None):
+        super().__init__("", parent)
+        self.lines = lines
+        self.setObjectName(role)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setWordWrap(True)
+
+    def reserved(self) -> int:
+        margins = self.contentsMargins()
+        return self.lines * self.fontMetrics().lineSpacing() + margins.top() + margins.bottom()
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        return QSize(hint.width(), max(hint.height(), self.reserved()))
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        return QSize(hint.width(), max(hint.height(), self.reserved()))
+
+    def heightForWidth(self, width: int) -> int:
+        return max(super().heightForWidth(width), self.reserved())
+
+
+class RowsTable(QTableWidget):
+    """Table whose preferred and minimum height show `ROWS` rows under the header, so a message or banner below it makes
+    the window grow instead of hiding one."""
+
+    ROWS = 6
+
+    def rows_height(self) -> int:
+        shown = max(min(self.rowCount(), self.ROWS), 1)
+        row = self.rowHeight(0) if self.rowCount() else self.verticalHeader().defaultSectionSize()
+        return self.horizontalHeader().sizeHint().height() + shown * row + 2 * self.frameWidth()
+
+    def sizeHint(self):
+        return QSize(super().sizeHint().width(), self.rows_height())
+
+    def minimumSizeHint(self):
+        return QSize(super().minimumSizeHint().width(), self.rows_height())
+
+
 class ReadableCombo(QComboBox):
     """Combo box whose open list follows the stylesheet item rules (dark text on white, 40 px rows) and is wide enough
     for every name next to the "Em uso" mark; the default menu-style delegate paints the list with the combo's own text
@@ -476,6 +531,11 @@ class ReadableCombo(QComboBox):
         widest = max((metrics.horizontalAdvance(self.itemText(row)) for row in range(self.count())), default=0)
         view.setMinimumWidth(widest + 2 * CurrentMark.PADDING + self.itemDelegate().mark_width() + 8)
         super().showPopup()
+
+    def tighten(self) -> None:
+        """Keeps the text clear of the arrow with 4 px instead of the stylesheet's 25: the filter row of the main window
+        needs the 21 px per combo to stay on one line."""
+        self.setStyleSheet("QComboBox { padding-right: 4px; }")
 
     def fit_to_items(self) -> None:
         """Minimum width that shows the longest item whole: the stylesheet's min-width would otherwise let a crowded
@@ -546,9 +606,7 @@ class NoticeStrip(QFrame):
         mark = QLabel()
         bind_icon(mark, symbol, color, 18)
         self.row.addWidget(mark, 0, Qt.AlignmentFlag.AlignTop)
-        self.text = QLabel()
-        self.text.setWordWrap(True)
-        self.text.setTextFormat(Qt.TextFormat.PlainText)
+        self.text = label("", wrap=True)
         self.text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.row.addWidget(self.text, 1)
         self.hide()
@@ -572,9 +630,7 @@ class InfoStrip(QFrame):
         row.addWidget(mark, 0, Qt.AlignmentFlag.AlignTop)
         column = QVBoxLayout()
         column.setSpacing(2)
-        self.info = QLabel()
-        self.info.setWordWrap(True)
-        self.info.setTextFormat(Qt.TextFormat.PlainText)
+        self.info = label("", wrap=True)
         self.status = WrappingLabel()
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         column.addWidget(self.info)
@@ -644,6 +700,12 @@ class FlowRow(QWidget):
         widest = max((widget.minimumSizeHint().width() for widget, _ in self.widths if widget.isVisibleTo(self)),
                      default=0)
         return QSize(widest, super().minimumSizeHint().height())
+
+    def sizeHint(self):
+        """Pede a largura da linha inteira: uma FlowRow dentro de outra, em coluna, receberia só a largura da coluna e
+        nunca voltaria a caber lado a lado."""
+        needed = [natural() for widget, natural in self.widths if widget.isVisibleTo(self)]
+        return QSize(sum(needed) + self.box.spacing() * max(len(needed) - 1, 0), super().sizeHint().height())
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

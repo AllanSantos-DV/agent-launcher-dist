@@ -2,12 +2,15 @@
 resumo da tela, com a chave do host escondida."""
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
 from agent_launcher.domain.catalog import Catalog, token_label
 from agent_launcher.domain.conversation_usage import resume_window_warning
+from agent_launcher.domain.errors import LauncherError
 from agent_launcher.harnesses import registry
+from agent_launcher.session import powershell
 from agent_launcher.session.conversations import conversations_for
 from agent_launcher.session.plan import LaunchPlan, build_plan
 
@@ -34,13 +37,16 @@ def plan_report(plan: LaunchPlan, gateway, resume: bool, catalog: Catalog) -> di
     controlled_commands = registry.get(plan.cli).dry_run_extra(plan) or None
     hidden = {gateway.token} - {""}
     command = ["<chave>" if part in hidden else part for part in plan.command]
-    return {"cli": plan.cli, "project": str(plan.directory), "model": plan.model, "connection": gateway.name,
-            "connector": gateway.module.NAME, "targets": gateway.targets, "resume": resume, "command": command,
-            "controlled": plan.controlled, "controlled_codex": controlled_commands,
-            "environment_overrides": plan.public_overrides, "catalog_status": catalog.status,
-            "input_limit": plan.input_limit, "context_window": plan.context_window,
-            "auto_compact_token_limit": plan.auto_compact_limit, "claude_families": plan.families,
-            "warnings": plan.warnings}
+    report = {"cli": plan.cli, "project": str(plan.directory), "model": plan.model, "connection": gateway.name,
+              "connector": gateway.module.NAME, "targets": gateway.targets, "resume": resume, "command": command,
+              "controlled": plan.controlled, "controlled_codex": controlled_commands,
+              "environment_overrides": plan.public_overrides, "catalog_status": catalog.status,
+              "input_limit": plan.input_limit, "context_window": plan.context_window,
+              "auto_compact_token_limit": plan.auto_compact_limit, "claude_families": plan.families,
+              "warnings": plan.warnings}
+    if plan.endpoint:
+        report["endpoint"] = plan.endpoint.url
+    return report
 
 
 def plan_text(report: dict) -> str:
@@ -50,6 +56,8 @@ def plan_text(report: dict) -> str:
              f"Pasta:    {report['project']}", f"Modelo:   {report['model']}",
              f"Conexão:  {report['connection']} ({report['connector']})", f"Catálogo: {report['catalog_status']}",
              f"Entrada informada: {token_label(report['input_limit'])}"]
+    if report.get("endpoint"):
+        lines.append(f"Endpoint local: {report['endpoint']} (a chave da conexão fica fora do ambiente da sessão)")
     if report.get("context_window") is not None:
         lines.append(f"Contexto configurado: {token_label(report['context_window'])}")
     if report.get("auto_compact_token_limit") is not None:
@@ -64,3 +72,74 @@ def plan_text(report: dict) -> str:
         lines += ["", "Avisos:"]
         lines += [f"- {warning}" for warning in report["warnings"]]
     return "\n".join(lines)
+
+
+RESUME_SHELLS = ("cmd", "powershell")
+_SIMPLE_NAME = re.compile(r"[A-Za-z_]\w*")
+REMINDER = "<sua chave>"
+_CMD_OPERATORS = "&|<>^"
+
+
+def _cmd_safe(line: str) -> str:
+    """A linha de comando para colar no cmd: `& | < > ^` fora de aspas ganham `^`, para chegarem ao programa como texto. O
+    cmd conta cada `"` (também a `\\"` de um argumento) para saber o que está entre aspas, e um `|` dentro de um JSON
+    entre `\\"` ficaria de fora."""
+    quoted, escaped = False, []
+    for char in line:
+        if char == '"':
+            quoted = not quoted
+        elif char in _CMD_OPERATORS and not quoted:
+            escaped.append("^")
+        escaped.append(char)
+    return "".join(escaped)
+
+
+def resume_command_text(report: dict, shell: str = "cmd", scrubbed: tuple[str, ...] = ()) -> str:
+    """O plano de uma sessão (nova ou de retomada) em linhas para colar no `shell` (cmd ou powershell): vai à pasta, limpa as variáveis que o
+    launcher tira do ambiente das sessões (`scrubbed`, menos as que a sessão define de novo), define o ambiente da
+    sessão e roda o comando. A chave nunca está no relatório; o lembrete `<sua chave>` ocupa o lugar dela. No cmd,
+    aspas em `set` mantêm `&` e `<` como texto."""
+    if shell not in RESUME_SHELLS:
+        raise LauncherError(f"Shell {shell!r} desconhecido; use {' ou '.join(RESUME_SHELLS)}.")
+    command = [REMINDER if part == "<chave>" else part for part in report["command"]]
+    overrides = {name: REMINDER if value == "<chave>" else value for name, value in report["environment_overrides"].items()}
+    cleared = [name for name in scrubbed if name.upper() not in {key.upper() for key in overrides}]
+    if shell == "cmd":
+        lines = [f'cd /d "{report["project"]}"']
+        lines += [f'set "{name}="' for name in cleared]
+        lines += [f'set "{name}={value}"' for name, value in overrides.items()]
+        lines.append(_cmd_safe(subprocess.list2cmdline(command)))
+        return "\n".join(lines)
+    lines = [f"Set-Location -LiteralPath {powershell.quote(str(report['project']))}"]
+    lines += [f"Remove-Item Env:{name} -ErrorAction SilentlyContinue" if _SIMPLE_NAME.fullmatch(name) else
+              f"Remove-Item -LiteralPath {powershell.quote('Env:' + name)} -ErrorAction SilentlyContinue"
+              for name in cleared]
+    for name in overrides:
+        if not _SIMPLE_NAME.fullmatch(name):
+            raise LauncherError(f"A variável {name!r} não tem forma de $env: no PowerShell; use --shell cmd.")
+    lines += [f"$env:{name}={powershell.quote(value)}" for name, value in overrides.items()]
+    lines.append(powershell.native_command(command))
+    return "\n".join(lines)
+
+
+def plan_command(plan: LaunchPlan, gateway, resume: bool, catalog: Catalog, shell: str = "cmd") -> str:
+    """O plano da sessão (nova ou de retomada) como texto para colar no `shell`, com a chave escondida."""
+    return resume_command_text(plan_report(plan, gateway, resume, catalog), shell, plan.scrubbed)
+
+
+def resume_command(home: Path, gateway, project_folder: str, cli: str, model: str, catalog: Catalog,
+                   conversation: str, shell: str = "cmd") -> str:
+    """O comando que continua a conversa fora do launcher, no `shell`: o mesmo plano da retomada pelo botão e do
+    `launch --resume --conversation --dry-run`."""
+    plan = planned(home, gateway, project_folder, cli, model, True, catalog, conversation=conversation)
+    if not plan.resume:
+        raise LauncherError("; ".join(plan.warnings) or f"Não há conversa {conversation} do {cli} nesta pasta.")
+    return plan_command(plan, gateway, True, catalog, shell)
+
+
+def new_session_command(home: Path, gateway, project_folder: str, cli: str, model: str, catalog: Catalog,
+                        shell: str = "cmd") -> str:
+    """O comando que abre uma sessão nova fora do launcher, no `shell`: o mesmo plano do botão Nova sessão e do
+    `launch --dry-run`."""
+    return plan_command(planned(home, gateway, project_folder, cli, model, False, catalog), gateway, False, catalog,
+                        shell)

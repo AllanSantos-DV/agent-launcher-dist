@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { childEnv, describeError, fetchFromGitHub, relaunchArgs } from "./rede.mjs";
@@ -13,7 +13,12 @@ const UV_VERSION = "0.12.23";
 const UV_ASSET = "uv-x86_64-pc-windows-msvc.zip";
 const UV_SHA256 = "75d05de6762778c31ee183398de7dd15093fad0ed90b1f236d8205ea5ec00c90";
 const UV_DIR = join(RUNTIME_DIR, `uv-${UV_VERSION}`);
-const UV_EXE = join(UV_DIR, "uv.exe");
+export const UV_EXE = join(UV_DIR, "uv.exe");
+// A mesma pasta estável por versão do launcher (%LOCALAPPDATA%\\AgentLauncher\\cache\\<versão>), nunca um nome novo por execução.
+const PACKAGE_VERSION = JSON.parse(readFileSync(join(PACKAGE_DIR, "package.json"), "utf8")).version;
+export const UV_SCRATCH = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "AgentLauncher", "cache", PACKAGE_VERSION, "uv");
+const LOCK_WAIT_MS = 60_000;
+const LOCK_STALE_MS = 15 * 60_000;
 const PYTHON_VERSION = "3.12";
 const PYTHON_DIR = join(RUNTIME_DIR, "python");
 const USAGE = `Uso: npx @allansantos-dev/agent-launcher@latest install [opções]
@@ -37,8 +42,45 @@ function run(command, args, options = {}) {
   return (result.stdout || "").trim();
 }
 
-async function ensureUv() {
-  if (existsSync(UV_EXE)) return;
+/**
+ * Exclusão entre execuções do npx: o arquivo de trava nasce exclusivo (`wx`) e some ao fim; o de um processo morto vale
+ * como velho depois de LOCK_STALE_MS.
+ * @param {string} lockPath arquivo de trava
+ * @param {() => Promise<*>} action roda com a trava; falha em LOCK_WAIT_MS se outra execução a segura
+ * @returns {Promise<*>} o que `action` devolve
+ */
+async function withLock(lockPath, action) {
+  mkdirSync(dirname(lockPath), { recursive: true });
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      closeSync(openSync(lockPath, "wx"));
+      break;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      let age;
+      try {
+        age = Date.now() - statSync(lockPath).mtimeMs;
+      } catch {
+        continue;
+      }
+      if (age > LOCK_STALE_MS) rmSync(lockPath, { force: true });
+      else if (Date.now() >= deadline) fail(`${lockPath} is held by another run; try again.`);
+      else await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  try {
+    return await action();
+  } finally {
+    rmSync(lockPath, { force: true });
+  }
+}
+
+/**
+ * Baixa o zip do uv e confere o SHA-256 fixado.
+ * @returns {Promise<Buffer>} o arquivo baixado
+ */
+async function downloadUv() {
   const url = `https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ASSET}`;
   console.log(`Baixando uv ${UV_VERSION} (gerenciador de Python)...`);
   let response;
@@ -51,15 +93,55 @@ async function ensureUv() {
   const archive = Buffer.from(await response.arrayBuffer());
   const digest = createHash("sha256").update(archive).digest("hex");
   if (digest !== UV_SHA256) fail(`${UV_ASSET} checksum mismatch (expected ${UV_SHA256}, got ${digest}).`);
-  const scratch = mkdtempSync(join(tmpdir(), "agent-launcher-uv-"));
+  return archive;
+}
+
+/**
+ * Extrai o zip com o tar.exe do Windows.
+ * @param {string} zip arquivo
+ * @param {string} directory pasta de destino
+ */
+function extractZip(zip, directory) {
+  run(join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe"), ["-xf", zip, "-C", directory]);
+}
+
+/**
+ * Grava `data` em `path` por um temporário `.parte` na mesma pasta seguido de rename: quem lê nunca vê o arquivo pela
+ * metade, e uma falha não deixa o temporário.
+ * @param {string} path destino
+ * @param {Buffer|string} data conteúdo
+ */
+export function writeAtomic(path, data) {
+  const partial = `${path}.parte`;
   try {
-    const zip = join(scratch, UV_ASSET);
-    writeFileSync(zip, archive);
-    mkdirSync(UV_DIR, { recursive: true });
-    run(join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe"), ["-xf", zip, "-C", UV_DIR]);
-  } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    writeFileSync(partial, data);
+    renameSync(partial, path);
+  } catch (error) {
+    rmSync(partial, { force: true });
+    throw error;
   }
+}
+
+/**
+ * Garante o uv.exe em RUNTIME_DIR; baixa e extrai pela pasta de trabalho fixa da versão (UV_SCRATCH), esvaziada ao fim.
+ * @param {{download?: () => Promise<Buffer>, extract?: (zip: string, directory: string) => void}} steps
+ */
+export async function ensureUv({ download = downloadUv, extract = extractZip } = {}) {
+  if (existsSync(UV_EXE)) return;
+  await withLock(`${UV_SCRATCH}.lock`, async () => {
+    if (existsSync(UV_EXE)) return;
+    const archive = await download();
+    rmSync(UV_SCRATCH, { recursive: true, force: true });
+    mkdirSync(UV_SCRATCH, { recursive: true });
+    try {
+      const zip = join(UV_SCRATCH, UV_ASSET);
+      writeAtomic(zip, archive);
+      mkdirSync(UV_DIR, { recursive: true });
+      extract(zip, UV_DIR);
+    } finally {
+      rmSync(UV_SCRATCH, { recursive: true, force: true });
+    }
+  });
   if (!existsSync(UV_EXE)) fail(`uv.exe not found in ${UV_DIR} after extracting ${UV_ASSET}.`);
 }
 
@@ -108,7 +190,9 @@ async function main() {
   process.exitCode = installer.status ?? 1;
 }
 
-main().catch((error) => {
-  console.error(`agent-launcher: ${error instanceof Failure ? error.message : error.stack || describeError(error)}`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
+  main().catch((error) => {
+    console.error(`agent-launcher: ${error instanceof Failure ? error.message : error.stack || describeError(error)}`);
+    process.exitCode = 1;
+  });
+}

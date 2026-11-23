@@ -6,6 +6,7 @@ import json
 import os
 import random
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -52,35 +53,32 @@ def _give_up(attempt: int, attempts: int, started: float, timeout: float) -> boo
     return False
 
 
-def replace_retrying(source, destination, attempts: int = REPLACE_ATTEMPTS, timeout: float = REPLACE_TIMEOUT) -> None:
-    """os.replace que repete quando o Windows recusa por um leitor ou outro escritor com o destino aberto (EPERM,
-    EACCES e EBUSY chegam como PermissionError). Repete por no mínimo `attempts` tentativas e por `timeout` segundos;
-    esgotados os dois, levanta."""
+def _retrying(action, attempts: int, timeout: float):
+    """Devolve o resultado de `action()`, repetindo enquanto ela levanta PermissionError (ver `_give_up`); esgotados
+    as tentativas e o prazo, levanta o último erro."""
     started = time.monotonic()
     attempt = 0
     while True:
         attempt += 1
         try:
-            os.replace(source, destination)
-            return
+            return action()
         except PermissionError:
             if _give_up(attempt, attempts, started, timeout):
                 raise
+
+
+def replace_retrying(source, destination, attempts: int = REPLACE_ATTEMPTS, timeout: float = REPLACE_TIMEOUT) -> None:
+    """os.replace que repete quando o Windows recusa por um leitor ou outro escritor com o destino aberto (EPERM,
+    EACCES e EBUSY chegam como PermissionError). Repete por no mínimo `attempts` tentativas e por `timeout` segundos;
+    esgotados os dois, levanta."""
+    _retrying(lambda: os.replace(source, destination), attempts, timeout)
 
 
 def read_text_retrying(path, attempts: int = REPLACE_ATTEMPTS, encoding: str = "utf-8-sig", errors: str = "strict",
                        timeout: float = REPLACE_TIMEOUT) -> str:
     """read_text que repete quando o Windows recusa a abertura por um replace em andamento no mesmo arquivo (a leitura
     concorrente com o rename atômico chega como PermissionError); mesmo prazo de replace_retrying, depois levanta."""
-    started = time.monotonic()
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            return Path(path).read_text(encoding=encoding, errors=errors)
-        except PermissionError:
-            if _give_up(attempt, attempts, started, timeout):
-                raise
+    return _retrying(lambda: Path(path).read_text(encoding=encoding, errors=errors), attempts, timeout)
 
 
 def note_state_recovery(folder: Path, message: str) -> None:
@@ -129,16 +127,7 @@ def read_json_state(path, accept=lambda data: isinstance(data, dict), backups: P
 def remove_tree(path, attempts: int = 5) -> None:
     """shutil.rmtree que repete quando o Windows recusa por arquivo em uso (um pythonw da venv ainda carregado, o
     antivírus varrendo); esgotadas as tentativas, levanta o último erro."""
-    started = time.monotonic()
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            shutil.rmtree(path)
-            return
-        except PermissionError:
-            if _give_up(attempt, attempts, started, REPLACE_TIMEOUT):
-                raise
+    _retrying(lambda: shutil.rmtree(path), attempts, REPLACE_TIMEOUT)
 
 
 class LockBusy(LauncherError):
@@ -149,7 +138,7 @@ class LockBusy(LauncherError):
 def file_lock(path, timeout: float = 10.0):
     """Exclusão mútua entre processos para ler-alterar-gravar `path`: bloqueio do sistema num arquivo ao lado
     (<nome>.lock), solto sozinho se o processo morre, então nunca fica velho. Passado `timeout`, levanta."""
-    import msvcrt  # fora do topo: os scripts de release importam este módulo no runner Linux do Actions
+    lock_byte, unlock_byte = _byte_lock_functions()
     lock = Path(path).with_name(Path(path).name + ".lock")
     lock.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(lock, os.O_CREAT | os.O_RDWR)
@@ -157,7 +146,7 @@ def file_lock(path, timeout: float = 10.0):
         deadline = time.monotonic() + timeout
         while True:
             try:
-                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                lock_byte(descriptor)
                 break
             except OSError:
                 if time.monotonic() >= deadline:
@@ -166,9 +155,21 @@ def file_lock(path, timeout: float = 10.0):
         try:
             yield
         finally:
-            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            unlock_byte(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _byte_lock_functions():
+    """(trava, solta) do primeiro byte de um arquivo, sem esperar: msvcrt no Windows, fcntl onde os scripts de release
+    rodam no runner Linux do Actions. Importados aqui porque cada módulo só existe no seu sistema."""
+    if sys.platform == "win32":
+        import msvcrt
+        return (lambda descriptor: msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1),
+                lambda descriptor: msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1))
+    import fcntl
+    return (lambda descriptor: fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB, 1),
+            lambda descriptor: fcntl.lockf(descriptor, fcntl.LOCK_UN, 1))
 
 
 def append_capped(path: Path, line: str, max_bytes: int) -> None:
@@ -180,17 +181,27 @@ def append_capped(path: Path, line: str, max_bytes: int) -> None:
         stream.write(line)
 
 
+def log_line(path: Path, message: str, max_bytes: int) -> None:
+    """Acrescenta `AAAA-MM-DD HH:MM:SS mensagem` a um log com teto (ver `append_capped`), criando a pasta; log que não
+    grava não derruba quem anota."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        append_capped(path, f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n", max_bytes)
+    except OSError:
+        pass
+
+
 def atomic_json(path: Path, data: dict) -> None:
     atomic_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
-def atomic_text(path: Path, text: str) -> None:
+def atomic_text(path: Path, text: str, encoding: str = "utf-8") -> None:
     """Grava por temporário de nome próprio (vários processos escrevem o mesmo arquivo) e rename com retry."""
     path.parent.mkdir(parents=True, exist_ok=True)
     import tempfile
     descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        with os.fdopen(descriptor, "w", encoding=encoding) as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())

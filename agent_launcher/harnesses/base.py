@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent_launcher.domain import usage
 from agent_launcher.domain.catalog import Catalog, ModelInfo
 from agent_launcher.domain.errors import LauncherError
 
@@ -59,12 +60,8 @@ def conversation_title(text) -> str:
 
 def parse_time(value, default: float = 0.0) -> float:
     """ISO 8601 (com Z) dos arquivos dos CLIs -> epoch; inválido = default."""
-    if isinstance(value, (int, float)):
-        return float(value) / (1000 if value > 1e11 else 1)
-    try:
-        return datetime.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return default
+    parsed = usage.parse_time(value)
+    return default if parsed is None else parsed
 
 
 def head_lines(path: Path, limit: int = HEAD_LINES) -> list[str]:
@@ -155,6 +152,7 @@ class Harness:
     RESUME_BY_ID = False            # "retomar última" vai pelo id da conversa mais recente da pasta, não pelo CLI
     SCRUB_PREFIXES: tuple = ()
     EXECUTABLE = ""                 # nome no PATH
+    ENDPOINT_SESSIONS = False       # a sessão pode apontar para o endpoint local da conexão (preferência por conexão)
 
     # Instalação
 
@@ -202,6 +200,13 @@ class Harness:
                                 f"'launcher.py cli --install {self.ID}'.")
         return self.command_for(Path(executable))
 
+    def require_executable(self) -> str:
+        """Caminho do destino que abre fora do terminal (IDE ou app); LauncherError com a dica de instalação se falta."""
+        executable = self.find_executable()
+        if not executable:
+            raise LauncherError(f"{self.LABEL} não encontrado. {self.MISSING_HINT}")
+        return executable
+
     def command_for(self, path: Path, repair: bool = True) -> list[str]:
         """Comando que roda o executável `path`; levanta LauncherError quando ele não pode rodar. `repair=False` só
         confere, sem consertar nada no disco."""
@@ -226,16 +231,40 @@ class Harness:
     def prepare(self, plan) -> None:
         """Efeitos antes de abrir (confiança da pasta, perfil...). Falha visível, nunca silenciosa."""
 
+    def ensure_endpoint(self, plan) -> None:
+        """Sessão pelo endpoint local: sobe o endpoint da conexão antes de abrir. LauncherError com o motivo se ele não
+        sobe ou se a porta não é a do plano; a sessão nunca cai sozinha para o host."""
+        route = plan.endpoint
+        if route is None:
+            return
+        from agent_launcher.endpoint import registry as endpoints
+        port = endpoints.ensure_running(route.home, route.connection_id)
+        if port != route.port:
+            raise LauncherError(f"O endpoint local da conexão está na porta {port}, e o plano apontava para a {route.port}. "
+                                "Abra a sessão de novo.")
+        print(f"  Sessão pelo endpoint local: {route.url}")
+
     def ensure_resumable(self, plan) -> None:
         """Antes de abrir a janela: LauncherError se a conversa a retomar não pode ser retomada agora."""
 
-    def final_command(self, plan, directory: Path) -> tuple[list[str], str]:
-        """Comando final, com arquivos temporários em `directory` se o destino precisar; (comando, aviso)."""
+    def session_files_key(self, plan) -> object | None:
+        """Entrada que determina os arquivos que `final_command` grava (serializável em JSON, sem segredo): a mesma entrada
+        reusa a mesma pasta do cache. None quando o destino não grava arquivo."""
+        return None
+
+    def final_command(self, plan, directory: Path | None) -> tuple[list[str], str]:
+        """Comando final; (comando, aviso). `directory` é a pasta estável do cache da entrada de `session_files_key` e
+        só vem quando ela devolveu uma chave: o que já estiver lá vale para a mesma entrada."""
         return list(plan.command), ""
 
     def run(self, plan, project: dict) -> int:
         from agent_launcher.session.plan import run_plan
         return run_plan(plan)
+
+    def hosts_itself(self, plan) -> bool:
+        """O plano precisa do Python vivo durante a sessão: com a janela nativa, o processo Python roda a sessão inteira em
+        vez de entregar o comando a ela."""
+        return False
 
     def has_previous_conversation(self, directory: Path) -> bool:
         return False
@@ -290,3 +319,14 @@ def unrecognized(path: Path) -> LauncherError:
 
 def is_exe(path: Path) -> bool:
     return os.name != "nt" or path.suffix.lower() == ".exe"
+
+
+def npm_cli_command(path: Path, package: str) -> list[str]:
+    """Comando de um CLI que não vem com binário nativo próprio: o .exe do caminho, o .js do pacote npm `package` com
+    o node ou o .exe que o wrapper .cmd chama; LauncherError se o caminho é outra coisa."""
+    if is_exe(path):
+        return [str(path)]
+    command = node_script(path, package) or native_wrapper(path)
+    if command is None:
+        raise unrecognized(path)
+    return command

@@ -11,7 +11,6 @@ Sem Terminal, as sessões abrem em consoles separados (Ctrl+J continua quebrando
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import platform
@@ -23,7 +22,8 @@ import time
 import uuid
 from pathlib import Path
 
-from agent_launcher.domain.downloads import restricted_redirects
+from agent_launcher.domain import cache
+from agent_launcher.domain.downloads import DownloadRefused, restricted_redirects, save_verified
 from agent_launcher.domain.files import LockBusy, file_lock, replace_retrying
 
 RELEASE_API = "https://api.github.com/repos/microsoft/terminal/releases/latest"
@@ -181,20 +181,15 @@ def latest_zip() -> tuple[str, str, str]:
 
 
 def _download(url: str, destination: Path, expected_sha256: str) -> None:
-    digest = hashlib.sha256()
-    size = 0
     try:
-        with _open(url, timeout=120) as response, open(destination, "wb") as stream:
-            while chunk := response.read(1024 * 1024):
-                size += len(chunk)
-                if size > DOWNLOAD_LIMIT:
-                    raise TerminalError("Download do Windows Terminal acima do limite esperado; interrompido.")
-                digest.update(chunk)
-                stream.write(chunk)
+        with _open(url, timeout=120) as response:
+            save_verified(response, destination, expected_sha256, DOWNLOAD_LIMIT)
+    except DownloadRefused as refused:
+        raise TerminalError(
+            "Download do Windows Terminal acima do limite esperado; interrompido." if refused.kind == "limit" else
+            "SHA-256 do ZIP baixado não confere com o publicado na release; arquivo descartado.") from None
     except OSError as error:
         raise TerminalError(f"Download do Windows Terminal falhou ({url}): {error}") from error
-    if digest.hexdigest() != expected_sha256.lower():
-        raise TerminalError("SHA-256 do ZIP baixado não confere com o publicado na release; arquivo descartado.")
 
 
 def powershell_env(extra: dict | None = None) -> dict:
@@ -253,10 +248,8 @@ def install_portable(root: Path, zip_path: Path | None = None, verify=signature_
     """Extrai o Terminal em <root>/terminal (modo portátil). Substitui uma cópia anterior só depois de validar a nova;
     com o Terminal portátil em uso o Windows recusa renomear a pasta (PermissionError) e a cópia anterior fica intacta."""
     target = portable_dir(root)
-    import tempfile
     import zipfile
-    with tempfile.TemporaryDirectory(prefix="agent-launcher-terminal-", dir=str(Path(root))) as work:
-        work = Path(work)
+    with cache.scratch_folder("terminal", busy=TerminalError) as work:
         if zip_path is None:
             name, url, sha256 = latest_zip()
             zip_path = work / name
@@ -288,8 +281,10 @@ def install_portable(root: Path, zip_path: Path | None = None, verify=signature_
         try:
             shutil.move(str(extracted), str(target))
         except OSError:
-            if previous.exists() and not target.exists():
-                replace_retrying(previous, target)
+            if previous.exists():
+                shutil.rmtree(target, ignore_errors=True)  # cópia parcial de uma troca entre volumes
+                if not target.exists():
+                    replace_retrying(previous, target)
             raise
         shutil.rmtree(previous, ignore_errors=True)
     return target / "wt.exe"

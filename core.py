@@ -31,13 +31,3 @@ def resolve_cli(cli: str) -> list[str]:
     if harness.KIND != "terminal":
         raise LauncherError(f"O {harness.LABEL} não roda em terminal.")
     return harness.command()
-
-
-def prepare_unattended(plan: LaunchPlan) -> None:
-    """Antes de abrir uma sessão controlada do Claude Code: confia a pasta do projeto cadastrado. Falha visível."""
-    if plan.controlled and plan.cli == "claude":
-        try:
-            if trust_claude_folder(plan.directory):
-                print(f"  Pasta marcada como confiável no Claude Code: {plan.directory}")
-        except (LauncherError, OSError) as error:
-            print(f"  Aviso: {error} A sessão pode pedir confirmação de confiança da pasta.")

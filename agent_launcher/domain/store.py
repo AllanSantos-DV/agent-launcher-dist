@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -24,12 +25,16 @@ PREFERENCES = {"bypass_default": False, "auto_update": True, "cli_auto_update": 
                "sessions_secondary_monitor": False}
 # Escolhas de texto da interface guardadas junto das preferências; o primeiro valor de cada uma é o padrão.
 CHOICES = {"theme": ("light", "dark", "system"), "accent": ("green", "blue", "purple", "graphite")}
+# Teto de gasto do mês: número opcional nas preferências do perfil. Fora de PREFERENCES e CHOICES, uma versão que não o
+# conhece o preserva sem recusar o arquivo; ausente ou ilegível vale como desligado.
+LIMIT_KEY = "monthly_limit"
 BACKUP_DAYS = 30
 DEFAULT_HOME = Path.home() / ".agent-launcher"
 # Destinos novos (Copilot CLI, VS Code, Copilot app) guardam a última escolha em selections.json: o config.json
 # continua no formato da 1.0 (last_cli e models só com claude/codex), legível por uma instalação 1.0.x que divida a
 # mesma pasta de dados (o orquestrador pode estar numa versão anterior durante a atualização automática).
 SELECTIONS = "selections.json"
+LIMIT_NOTICE_KEY = "limit_notice"
 QUOTA_MESSAGE_MAX = 300
 
 
@@ -40,6 +45,11 @@ def quota_message(text: str, secrets: list[str]) -> str:
         text = text.replace(secret, "[omitido]")
     text = " ".join(text.split())
     return text if len(text) <= QUOTA_MESSAGE_MAX else text[:QUOTA_MESSAGE_MAX - 1] + "…"
+
+
+def valid_limit(value) -> bool:
+    """True para um número finito maior que zero (bool não conta como número)."""
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
 def secret_values(module, options: dict) -> list[str]:
@@ -90,23 +100,17 @@ class Store:
         except (OSError, ValueError):
             rejected = None
         for copy in sorted(self.backups.glob("config-*.json"), reverse=True):
-            try:
-                self.data = json.loads(read_text_retrying(copy))
-                self.validate()
-            except (OSError, ValueError, TypeError, KeyError, AttributeError, LauncherError):
+            if self._valid_copy(copy) is None:
                 continue
             kept = shutil.copyfile(self.path, self.backups / f"invalid-config-{time.strftime('%Y-%m-%d-%H%M%S')}.json")
             newer = rejected.get("preferences") if isinstance(rejected, dict) else None
             if isinstance(newer, dict):
                 self.data["preferences"].update({key: value for key, value in newer.items()
                                                  if isinstance(key, str) and (type(value) is bool or (
-                                                     key in CHOICES and isinstance(value, str)))})
+                                                     key in CHOICES and isinstance(value, str)) or (
+                                                     key == LIMIT_KEY and valid_limit(value)))})
             atomic_json(self.path, self.data)
-            for old in sorted(self.backups.glob("invalid-config-*.json"), reverse=True)[BACKUP_DAYS:]:
-                try:
-                    old.unlink()
-                except OSError:
-                    pass
+            self._prune_backups("invalid-config-*.json")
             self.recovered = (f"Configuração inválida ({error}); restaurada a cópia {copy.name} com as preferências "
                               f"atuais. O arquivo recusado ficou em {kept}.")
             return
@@ -115,15 +119,33 @@ class Store:
             "O arquivo foi preservado; corrija-o antes de continuar."
         ) from error
 
+    def _valid_copy(self, copy: Path) -> dict | None:
+        """Conteúdo da cópia se ela lê e passa na validação (e passa a ser self.data); senão None, com self.data como
+        estava."""
+        previous = self.data
+        try:
+            self.data = data = json.loads(read_text_retrying(copy))
+            self.validate()
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, LauncherError):
+            self.data = previous
+            return None
+        return data
+
+    def _prune_backups(self, pattern: str) -> None:
+        """Deixa só as BACKUP_DAYS cópias mais recentes de `pattern`. Cópia velha presa por antivírus fica: a gravação
+        que já deu certo não falha por isso."""
+        for old in sorted(self.backups.glob(pattern), reverse=True)[BACKUP_DAYS:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
     def _recover(self, legacy: list[Path]) -> None:
         copies = sorted(self.backups.glob("config-*.json"), reverse=True)
         previous = self.data
         for copy in copies:
-            try:
-                self.data = data = json.loads(read_text_retrying(copy))
-                self.validate()
-            except (OSError, ValueError, TypeError, KeyError, AttributeError, LauncherError):
-                self.data = previous
+            data = self._valid_copy(copy)
+            if data is None:
                 continue  # cópia corrompida: tenta a anterior
             if not data["projects"]:
                 self.data = previous  # a última cópia válida é de quando o usuário esvaziou a lista
@@ -209,11 +231,7 @@ class Store:
         atomic_json(self.path, self.data)
         if self.data["projects"] or backup:
             atomic_json(self.backups / f"config-{time.strftime('%Y-%m-%d')}.json", self.data)
-            for old in sorted(self.backups.glob("config-*.json"), reverse=True)[BACKUP_DAYS:]:
-                try:
-                    old.unlink()
-                except OSError:
-                    pass  # cópia velha presa por antivírus: a gravação que já deu certo não falha por isso
+            self._prune_backups("config-*.json")
 
     # Projetos
 
@@ -248,16 +266,22 @@ class Store:
                 del selections["projects"][project["id"]]
         atomic_json(self.home / SELECTIONS, selections)
 
+    def _project_label(self, value: str, own: dict | None = None) -> str:
+        """Nome de projeto válido: não vazio, até 100 caracteres e diferente do de qualquer outro projeto (`own`, o
+        projeto que está sendo renomeado, não conta)."""
+        label = clean_text(value, "Nome")
+        if len(label) > 100:
+            raise LauncherError("Use um nome de projeto com até 100 caracteres.")
+        if any(project is not own and project["name"].casefold() == label.casefold() for project in self.data["projects"]):
+            raise LauncherError("Já existe um projeto com esse nome. Escolha outro nome.")
+        return label
+
     def add(self, path: str, name: str | None = None, save: bool = True) -> dict:
         resolved = project_path(path)
         for project in self.projects:
             if path_key(project["path"]) == path_key(str(resolved)):
                 return project
-        label = clean_text(name or resolved.name or str(resolved), "Nome")
-        if len(label) > 100:
-            raise LauncherError("Use um nome de projeto com até 100 caracteres.")
-        if any(project["name"].casefold() == label.casefold() for project in self.projects):
-            raise LauncherError("Já existe um projeto com esse nome. Escolha outro nome.")
+        label = self._project_label(name or resolved.name or str(resolved))
         project = {"id": str(uuid.uuid4()), "name": label, "path": str(resolved), "last_cli": "claude",
                    "last_connection": None, "models": {}, "last_used": 0}
         self.data["projects"].append(project)
@@ -277,15 +301,11 @@ class Store:
     def update(self, reference: str, name: str | None = None, path: str | None = None) -> dict:
         """Renomeia o projeto e/ou aponta para outra pasta existente; modelos e histórico de uso continuam."""
         project = self.find(reference)
-        label = clean_text(name if name is not None else project["name"], "Nome")
-        if len(label) > 100:
-            raise LauncherError("Use um nome de projeto com até 100 caracteres.")
+        label = self._project_label(name if name is not None else project["name"], project)
         resolved = str(project_path(path)) if path is not None else project["path"]
         for other in self.data["projects"]:
             if other is project:
                 continue
-            if other["name"].casefold() == label.casefold():
-                raise LauncherError("Já existe um projeto com esse nome. Escolha outro nome.")
             if path_key(other["path"]) == path_key(resolved):
                 raise LauncherError(f"Essa pasta já está cadastrada como {other['name']}.")
         project.update(name=label, path=resolved)
@@ -342,6 +362,58 @@ class Store:
         data = read_json_state(self.home / SELECTIONS,
                                accept=lambda data: isinstance(data, dict) and isinstance(data.get("projects"), dict))
         return data or {"projects": {}}
+
+    def limit_notice(self, month: str, limit: float) -> int:
+        """Nível do teto (80 ou 100) já avisado na bandeja em `month` (AAAA-MM) para este `limit`; 0 se nenhum, e
+        também quando o aviso guardado foi dado para outro limite. Registro sem limite guardado vale para o limite atual.
+        Fica em selections.json: o config.json, validado por chaves exatas nas versões antigas, não muda."""
+        saved = self._selections().get(LIMIT_NOTICE_KEY)
+        if not (isinstance(saved, dict) and saved.get("month") == month and type(saved.get("level")) is int):
+            return 0
+        return saved["level"] if saved.get("limit", limit) == limit else 0
+
+    def set_limit_notice(self, month: str, level: int, limit: float) -> None:
+        """Guarda o nível avisado do mês para o limite vigente; o registro de outro mês ou limite é substituído, mas os
+        níveis por fonte do mesmo mês ficam."""
+        selections = self._selections()
+        record = {"month": month, "level": level, "limit": limit}
+        sources = self._notice_sources(selections.get(LIMIT_NOTICE_KEY), month)
+        if sources:
+            record["sources"] = sources
+        selections[LIMIT_NOTICE_KEY] = record
+        atomic_json(self.home / SELECTIONS, selections)
+
+    @staticmethod
+    def _notice_sources(saved, month: str) -> dict:
+        """Níveis por conexão e fonte do registro de `month` ({conexão: {fonte: {level, limit}}}); vazio se o registro é
+        de outro mês, e o que não tem esse formato (inclusive o antigo, só por fonte) é descartado."""
+        sources = saved.get("sources") if isinstance(saved, dict) and saved.get("month") == month else None
+        if not isinstance(sources, dict):
+            return {}
+        kept = {connection: {source: entry for source, entry in found.items() if isinstance(entry, dict)}
+                for connection, found in sources.items() if isinstance(found, dict)}
+        return {connection: found for connection, found in kept.items() if found}
+
+    def source_notice(self, month: str, connection_id: str, source: str, limit: float) -> int:
+        """Nível do limite (80 ou 100) já avisado na bandeja em `month` para a `source` desta conexão e este `limit`
+        dela; 0 se nenhum, e também quando o aviso guardado foi dado para outro limite."""
+        saved = self._notice_sources(self._selections().get(LIMIT_NOTICE_KEY), month)
+        entry = saved.get(connection_id, {}).get(source)
+        if not (isinstance(entry, dict) and type(entry.get("level")) is int):
+            return 0
+        return entry["level"] if entry.get("limit") == limit else 0
+
+    def set_source_notice(self, month: str, connection_id: str, source: str, level: int, limit: float) -> None:
+        """Guarda o nível avisado da fonte da conexão no registro do mês, sem tocar no nível do teto manual nem nos das
+        outras conexões; o registro de outro mês é substituído."""
+        selections = self._selections()
+        saved = selections.get(LIMIT_NOTICE_KEY)
+        record = dict(saved) if isinstance(saved, dict) and saved.get("month") == month else {"month": month}
+        sources = self._notice_sources(saved, month)
+        sources[connection_id] = {**sources.get(connection_id, {}), source: {"level": level, "limit": limit}}
+        record["sources"] = sources
+        selections[LIMIT_NOTICE_KEY] = record
+        atomic_json(self.home / SELECTIONS, selections)
 
     def last_cli(self, project: dict) -> str:
         """Destino da última abertura do projeto (inclusive os que não cabem no config.json da 1.0)."""
@@ -483,7 +555,8 @@ class Store:
                 try:
                     module.verify(options)
                 except QuotaExhausted as error:  # login e assinatura valem: grava, com o estado "cota esgotada"
-                    quota = {"state": "quota_exhausted", "message": quota_message(str(error), secret_values(module, options))}
+                    quota = {"state": "quota_exhausted", "message": quota_message(str(error), secret_values(module, options)),
+                             "at": time.time()}
         except ConnectorError as error:
             raise LauncherError(f"{module.LABEL}: {error}") from error
         if existing:
@@ -506,8 +579,10 @@ class Store:
         return connection
 
     def mark_quota_exhausted(self, reference: str, message: str, secrets: list[str]) -> None:
-        """Grava na conexão o estado "cota esgotada" com a mensagem do provedor (sem valor de campo secreto)."""
-        self.find_connection(reference)["status"] = {"state": "quota_exhausted", "message": quota_message(message, secrets)}
+        """Grava na conexão o estado "cota esgotada" com a mensagem do provedor (sem valor de campo secreto) e a hora da
+        marca (`at`, epoch em segundos): o endpoint local a usa para decidir até quando pula a conexão."""
+        self.find_connection(reference)["status"] = {"state": "quota_exhausted", "message": quota_message(message, secrets),
+                                                     "at": time.time()}
         self.save()
 
     def clear_connection_status(self, reference: str) -> None:
@@ -515,9 +590,73 @@ class Store:
         if connection.pop("status", None) is not None:
             self.save()
 
+    def fallback_of(self, connection: dict) -> dict | None:
+        """A conexão reserva gravada em `connection` (`fallback_connection`: id ou nome) ou None. Valor ausente, de tipo
+        errado, conexão inexistente, a própria conexão ou ciclo valem como sem reserva: o endpoint nunca salta em laço."""
+        reference = connection.get("fallback_connection")
+        if not isinstance(reference, str):
+            return None
+        try:
+            reserve = self.find_connection(reference)
+        except LauncherError:
+            return None
+        if reserve["id"] == connection["id"] or self._reaches(reserve, connection["id"]):
+            return None
+        return reserve
+
+    def _reaches(self, start: dict, target_id: str) -> bool:
+        """Se seguir as reservas a partir de `start` volta à conexão `target_id` (ou entra num ciclo)."""
+        seen = set()
+        current = start
+        while isinstance(current.get("fallback_connection"), str) and current["id"] not in seen:
+            seen.add(current["id"])
+            try:
+                current = self.find_connection(current["fallback_connection"])
+            except LauncherError:
+                return False
+            if current["id"] == target_id:
+                return True
+        return False
+
+    def set_fallback(self, reference: str, fallback_reference: str) -> None:
+        """Define a reserva de `reference`. LauncherError se a reserva não existe, é a própria conexão ou fecha um ciclo."""
+        connection = self.find_connection(reference)
+        reserve = self.find_connection(fallback_reference)
+        if reserve["id"] == connection["id"]:
+            raise LauncherError(f"A conexão reserva de {connection['name']} não pode ser a própria conexão.")
+        if self._reaches(reserve, connection["id"]):
+            raise LauncherError(f"Ciclo de reservas recusado: {reserve['name']} já tem {connection['name']} como reserva, "
+                                "direta ou encadeada.")
+        connection["fallback_connection"] = reserve["id"]
+        self.save()
+
+    def clear_fallback(self, reference: str) -> None:
+        connection = self.find_connection(reference)
+        if connection.pop("fallback_connection", None) is not None:
+            self.save()
+
+    @staticmethod
+    def endpoint_sessions_of(connection: dict) -> bool:
+        """A conexão abre as sessões de terminal (Claude Code e Codex) pelo endpoint local? Só `true` liga; ausente ou de
+        outro tipo vale como desligado (caminho direto ao host)."""
+        return connection.get("endpoint_sessions") is True
+
+    def set_endpoint_sessions(self, reference: str, enabled: bool) -> None:
+        """Liga ou desliga, na conexão `reference`, as sessões de terminal pelo endpoint local; desligar tira o campo."""
+        connection = self.find_connection(reference)
+        if enabled:
+            connection["endpoint_sessions"] = True
+        elif connection.pop("endpoint_sessions", None) is None:
+            return
+        self.save()
+
     def remove_connection(self, reference: str) -> None:
         connection = self.find_connection(reference)
         self.data["connections"].remove(connection)
+        for other in self.data["connections"]:
+            reference = other.get("fallback_connection")
+            if isinstance(reference, str) and reference.casefold() in (connection["id"], connection["name"].casefold()):
+                del other["fallback_connection"]
         for project in self.data["projects"]:
             project["models"].pop(connection["id"], None)
             if project["last_connection"] == connection["id"]:
@@ -539,6 +678,21 @@ class Store:
         if key not in PREFERENCES:
             raise LauncherError(f"Preferência desconhecida: {key}")
         self.data["preferences"][key] = bool(value)
+        self.save()
+
+    def monthly_limit(self) -> float | None:
+        """Teto de gasto do mês deste perfil, na moeda do relatório de uso; None quando desligado."""
+        value = self.data["preferences"].get(LIMIT_KEY)
+        return float(value) if valid_limit(value) else None
+
+    def set_monthly_limit(self, value: float | None) -> None:
+        """Grava o teto de gasto do mês; None desliga e tira o campo do config.json."""
+        if value is None:
+            self.data["preferences"].pop(LIMIT_KEY, None)
+        elif valid_limit(value):
+            self.data["preferences"][LIMIT_KEY] = float(value)
+        else:
+            raise LauncherError(f"Limite mensal inválido: {value!r}. Use um valor maior que zero.")
         self.save()
 
     def choice(self, key: str) -> str:

@@ -16,8 +16,8 @@ from agent_launcher.connectors._http import NO_KEY, is_local_host
 from agent_launcher.domain.catalog import Catalog, ModelInfo, generation, protocol_for, token_label
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.harnesses import installers
-from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines, is_exe,
-                                           native_wrapper, node_script, parse_time, same_folder, unrecognized)
+from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines,
+                                           npm_cli_command, parse_time, same_folder)
 from agent_launcher.session.plan import LaunchPlan
 
 PROVIDER_TYPES = {"messages": "anthropic", "responses": "openai", "chat_completions": "openai"}
@@ -46,6 +46,15 @@ def known_model_id(model: str) -> str:
 
 def copilot_home() -> Path:
     return Path(os.environ.get("COPILOT_HOME") or Path.home() / ".copilot")
+
+
+def _session_folders() -> list[Path]:
+    """Pastas de sessão do Copilot CLI, a mais recente primeiro (até 400); [] se a pasta de sessões não existe."""
+    try:
+        return sorted(copilot_home().joinpath("session-state").iterdir(), key=lambda path: path.stat().st_mtime,
+                      reverse=True)[:400]
+    except OSError:
+        return []
 
 
 def _workspace(folder: Path) -> dict:
@@ -124,12 +133,7 @@ class CopilotCli(Harness):
                 f"Protocolo: {names.get(protocol, '?')} • ID conhecido pelo Copilot: {known_model_id(record.id)}")
 
     def command_for(self, path: Path, repair: bool = True) -> list[str]:
-        if is_exe(path):
-            return [str(path)]
-        command = node_script(path, "@github/copilot/npm-loader.js") or native_wrapper(path)
-        if command is None:
-            raise unrecognized(path)
-        return command
+        return npm_cli_command(path, "@github/copilot/npm-loader.js")
 
     def protocol(self, gateway, selected: ModelInfo, catalog: Catalog) -> str:
         protocol = protocol_for(selected, gateway.protocols, gateway.any_model, self.CONSUMES)
@@ -185,33 +189,11 @@ class CopilotCli(Harness):
 
     def has_previous_conversation(self, directory: Path) -> bool:
         """Sessões em ~/.copilot/session-state/<id>/workspace.yaml com `cwd: <pasta>` (a mais recente primeiro)."""
-        target = os.path.normcase(os.path.normpath(str(directory)))
-        base = copilot_home() / "session-state"
-        try:
-            folders = sorted(base.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True)[:400]
-        except OSError:
-            return False
-        for folder in folders:
-            try:
-                with (folder / "workspace.yaml").open(encoding="utf-8", errors="replace") as stream:
-                    for _number, line in zip(range(20), stream):
-                        if line.startswith("cwd:"):
-                            value = line[4:].strip().strip("'\"")
-                            if value and os.path.normcase(os.path.normpath(value)) == target:
-                                return True
-                            break
-            except OSError:
-                continue
-        return False
+        return any(same_folder(_workspace(folder).get("cwd"), directory) for folder in _session_folders())
 
     def conversations(self, directory: Path) -> list[Conversation]:
-        try:
-            folders = sorted(copilot_home().joinpath("session-state").iterdir(), key=lambda path: path.stat().st_mtime,
-                             reverse=True)[:400]
-        except OSError:
-            return []
         found = []
-        for folder in folders:
+        for folder in _session_folders():
             fields = _workspace(folder)
             if same_folder(fields.get("cwd"), directory):
                 conversation = copilot_conversation(folder, fields)

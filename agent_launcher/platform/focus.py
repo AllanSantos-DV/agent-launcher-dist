@@ -28,6 +28,8 @@ STATE_FILE = Path.home() / ".cli-launcher" / "topmost.json"
 MUTEX_NAME = "Local\\agent-launcher-topmost"
 FRONT_SECONDS = 300
 POLL_SECONDS = 0.5
+RESCAN_SECONDS = 30  # sem janela à vista, a varredura completa de segurança do vigia (o gancho avisa das novas)
+STATE_RELOAD_SECONDS = 30  # o vigia relê o estado ao ser avisado da mudança e, por segurança, a cada tanto
 
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE, SWP_NOZORDER = 0x0001, 0x0002, 0x0010, 0x0004
 HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
@@ -37,7 +39,9 @@ TERMINAL_CLASS = "CASCADIA_HOSTING_WINDOW_CLASS"
 MIN_WIDTH, MIN_HEIGHT = 300, 150  # menor que isso (ou fora de todo monitor) o retângulo normal não serve para restaurar
 GWL_EXSTYLE, WS_EX_TOPMOST = -20, 0x0008
 VK_MENU, KEYEVENTF_KEYUP = 0x12, 0x0002
-MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_J, WM_HOTKEY = 0x1, 0x2, 0x4000, 0x4A, 0x0312
+MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_J, WM_HOTKEY, WM_QUIT = 0x1, 0x2, 0x4000, 0x4A, 0x0312, 0x0012
+WINEVENT_SKIPOWNPROCESS = 0x0002
+WAIT_TIMEOUT, MWMO_INPUTAVAILABLE, QS_ALLINPUT, FILE_NOTIFY_CHANGES = 258, 0x4, 0x4FF, 0x1 | 0x8 | 0x10
 
 if os.name == "nt":
     user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
@@ -50,6 +54,12 @@ if os.name == "nt":
     user32.SetWindowPlacement.argtypes = [wintypes.HWND, ctypes.c_void_p]
     kernel32_errors = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32_errors.CreateMutexW.restype = wintypes.HANDLE
+    kernel32_errors.CreateEventW.restype = wintypes.HANDLE
+    kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+    kernel32.FindFirstChangeNotificationW.restype = wintypes.HANDLE
+    kernel32.FindNextChangeNotification.argtypes = [wintypes.HANDLE]
+    kernel32.FindCloseChangeNotification.argtypes = [wintypes.HANDLE]
+    user32.MsgWaitForMultipleObjectsEx.restype = wintypes.DWORD
     ENUM_PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     MONITOR_PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(wintypes.RECT),
                                       wintypes.LPARAM)
@@ -71,16 +81,105 @@ def window_title(hwnd: int) -> str:
     return buffer.value
 
 
+def _visible_with_title(hwnd: int, title: str) -> bool:
+    return bool(user32.IsWindowVisible(hwnd)) and window_title(hwnd) == title
+
+
 def find_window(title: str) -> int | None:
-    """Janela visível de nível superior com exatamente esse título."""
+    """Janela visível de nível superior com exatamente esse título. A achada antes vale enquanto continua visível com o
+    título; senão procura entre todas, e o vigia (que ouve os eventos de janela) só repete a varredura a cada
+    RESCAN_SECONDS, porque a janela nova ou renomeada já chega pelo gancho."""
+    cached = _found_windows.get(title) if title else None
+    if cached and _visible_with_title(cached, title):
+        return cached
+    _found_windows.pop(title, None)
+    events = _window_events
+    if title and events and not events.scan_due(title):
+        return None
     hits = []
 
     def visit(hwnd, _):
-        if user32.IsWindowVisible(hwnd) and window_title(hwnd) == title:
+        if _visible_with_title(hwnd, title):
             hits.append(hwnd)
         return True
     user32.EnumWindows(ENUM_PROC(visit), 0)
-    return hits[0] if hits else None
+    found = hits[0] if hits else None
+    if title and found:
+        _found_windows[title] = found
+    if events and title:
+        events.scanned(title)
+    return found
+
+
+_found_windows: dict[str, int] = {}
+_window_events: "WindowEvents | None" = None
+
+
+class WindowEvents:
+    """Eventos de janela do vigia (primeiro plano, janela mostrada, destruída e renomeada), cada um num gancho próprio,
+    numa thread com laço GetMessage: é o laço que o sistema sempre acorda para entregar o evento. Uma janela que ganha
+    o título procurado entra em `_found_windows` na hora e o vigia acorda pelo `signal`."""
+    EVENTS = (0x0003, 0x8001, 0x8002, 0x800C)
+    PROC = ctypes.WINFUNCTYPE(None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND, wintypes.LONG, wintypes.LONG,
+                              wintypes.DWORD, wintypes.DWORD) if os.name == "nt" else None
+
+    def __init__(self):
+        import threading  # só o vigia: a janela da sessão importa este módulo e tem orçamento de imports
+        self.signal = kernel32_errors.CreateEventW(None, False, False, None)
+        self.title, self.scanned_at, self.thread_id, self.hooked = "", 0.0, 0, False
+        self._ready = threading.Event()
+        self._callback = self.PROC(self._on_event)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        self._ready.wait(5)
+
+    def scan_due(self, title: str) -> bool:
+        return title != self.title or time.monotonic() - self.scanned_at >= RESCAN_SECONDS
+
+    def scanned(self, title: str) -> None:
+        self.title, self.scanned_at = title, time.monotonic()
+
+    def force_scan(self) -> None:
+        self.scanned_at = 0.0
+
+    def _on_event(self, _hook, event, hwnd, object_id, child_id, _thread, _time) -> None:
+        try:
+            if object_id or child_id or not hwnd:
+                return
+            if event == self.EVENTS[0]:
+                kernel32.SetEvent(self.signal)
+            elif event == self.EVENTS[1]:
+                if _found_windows.get(self.title) == hwnd:
+                    _found_windows.pop(self.title, None)
+                    kernel32.SetEvent(self.signal)
+            elif self.title and _found_windows.get(self.title) != hwnd and user32.GetAncestor(hwnd, 2) == hwnd \
+                    and _visible_with_title(hwnd, self.title):
+                _found_windows[self.title] = hwnd
+                kernel32.SetEvent(self.signal)
+        except Exception:  # um callback nunca deixa a exceção subir ao sistema
+            pass
+
+    def _loop(self) -> None:
+        api = ctypes.WinDLL("user32")
+        api.SetWinEventHook.restype = wintypes.HANDLE
+        api.SetWinEventHook.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.HMODULE, self.PROC, wintypes.DWORD,
+                                        wintypes.DWORD, wintypes.DWORD]
+        self.thread_id = kernel32.GetCurrentThreadId()
+        hooks = [api.SetWinEventHook(event, event, None, self._callback, 0, 0, WINEVENT_SKIPOWNPROCESS)
+                 for event in self.EVENTS]
+        self.hooked = all(hooks)
+        self._ready.set()
+        message = wintypes.MSG()
+        while self.hooked and api.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+            pass
+        for hook in hooks:
+            if hook:
+                api.UnhookWinEvent(hook)
+
+    def close(self) -> None:
+        if self.thread_id:
+            ctypes.windll.user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
+        kernel32.CloseHandle(self.signal)
 
 
 def on_screen() -> set[int]:
@@ -132,16 +231,24 @@ def set_placement(hwnd: int, show_cmd: int, rect: tuple[int, int, int, int] | No
     user32.SetWindowPlacement(hwnd, ctypes.byref(placement))
 
 
+def _sane_normal_rect(placement) -> tuple[int, int, int, int] | None:
+    """Retângulo normal de substituição quando o do placement não cabe em nenhum monitor; None se ele presta."""
+    rect = placement.rcNormalPosition
+    available = monitors()
+    if rect_usable((rect.left, rect.top, rect.right, rect.bottom), available):
+        return None
+    return default_rect(available)
+
+
 def repair_placement(hwnd: int) -> bool:
     """Conserta a janela cujo retângulo "normal" virou o do estado minimizado (o Windows Terminal minimizado no meio
     da própria restauração fica em -32000 com 480x103: a janela não restaura nem maximiza e as abas nascem com 48x2).
     Grava um retângulo são sem mudar minimizada/normal/maximizada. Devolve se corrigiu."""
     placement = get_placement(hwnd)
-    rect = placement.rcNormalPosition
-    available = monitors()
-    if rect_usable((rect.left, rect.top, rect.right, rect.bottom), available):
+    rect = _sane_normal_rect(placement)
+    if rect is None:
         return False
-    set_placement(hwnd, placement.showCmd, default_rect(available))
+    set_placement(hwnd, placement.showCmd, rect)
     return True
 
 
@@ -163,11 +270,7 @@ def heal_terminal_windows() -> int:
 def minimize(hwnd: int) -> None:
     """Minimiza sem ativar (a janela fica na barra de tarefas). Pelo placement e com o retângulo normal conferido: um
     ShowWindow repetido enquanto o Windows Terminal se restaura gravava o retângulo de minimizada como o normal."""
-    placement = get_placement(hwnd)
-    rect = placement.rcNormalPosition
-    available = monitors()
-    usable = rect_usable((rect.left, rect.top, rect.right, rect.bottom), available)
-    set_placement(hwnd, SW_SHOWMINNOACTIVE, None if usable else default_rect(available))
+    set_placement(hwnd, SW_SHOWMINNOACTIVE, _sane_normal_rect(get_placement(hwnd)))
 
 
 def place_behind(hwnd: int, other: int) -> None:
@@ -341,8 +444,12 @@ def topmost_step(state: dict, path: Path | None = None, now: float | None = None
 
 
 def mutex_name(path: Path | None = None) -> str:
-    """Um vigia por arquivo de estado (os testes usam arquivos próprios e não esbarram no vigia de verdade)."""
-    return MUTEX_NAME if path is None else f"{MUTEX_NAME}-{hashlib.sha256(str(path).encode()).hexdigest()[:12]}"
+    """Um vigia por arquivo de estado (os testes usam arquivos próprios e não esbarram no vigia de verdade). O estado
+    padrão tem sempre o mesmo nome, sem sufixo, seja ele pedido por --state ou não: o vigia nativo (que recebe sempre
+    --state) e o Python nunca rodam juntos."""
+    if path is None or Path(path) == STATE_FILE:
+        return MUTEX_NAME
+    return f"{MUTEX_NAME}-{hashlib.sha256(str(path).encode()).hexdigest()[:12]}"
 
 
 def note_watch_error(error: Exception, log: Path | None = None) -> None:
@@ -354,36 +461,90 @@ def note_watch_error(error: Exception, log: Path | None = None) -> None:
         pass
 
 
+def _start_watching(path: Path | None) -> tuple["WindowEvents", int | None]:
+    """Liga os eventos de janela e o aviso de mudança da pasta do estado do vigia. O que não ligar vai ao topmost.log e
+    o vigia segue pelo caminho antigo (procura a janela e relê o estado a cada passo)."""
+    global _window_events
+    log = path.with_name("topmost.log") if path else None
+    events = WindowEvents()
+    if events.hooked:
+        _window_events = events
+    else:
+        note_watch_error(RuntimeError("SetWinEventHook recusado: o vigia procura a janela a cada passo"), log)
+    change = kernel32.FindFirstChangeNotificationW(str((path or STATE_FILE).parent), False, FILE_NOTIFY_CHANGES)
+    if change in (None, 0, ctypes.c_void_p(-1).value):
+        note_watch_error(RuntimeError("FindFirstChangeNotification recusado: o estado é relido a cada meio segundo"), log)
+        change = None
+    return events, change
+
+
+def wait_for_activity(change: int | None, events: "WindowEvents | None") -> bool:
+    """Dorme até a mudança do estado (devolve verdadeiro), um evento de janela que importa, uma mensagem (Ctrl+Alt+J) ou
+    o batimento de POLL_SECONDS (que reaplica o "sempre por cima" perdido, coisa que nenhum evento avisa). Resultado
+    inesperado da espera vale como mudança, para o estado ser relido."""
+    handles = [handle for handle in (change, events.signal if events else None) if handle]
+    array = (wintypes.HANDLE * max(len(handles), 1))(*handles)
+    result = user32.MsgWaitForMultipleObjectsEx(len(handles), array, int(POLL_SECONDS * 1000), QS_ALLINPUT,
+                                                MWMO_INPUTAVAILABLE)
+    if result == WAIT_TIMEOUT:
+        return False
+    if change and result == 0:
+        kernel32.FindNextChangeNotification(change)
+        return True
+    if result == len(handles) or (events and result == len(handles) - 1):
+        return False
+    time.sleep(POLL_SECONDS)
+    return True
+
+
 def topmost_watch(path: Path | None = None, hotkey: bool = True) -> int:
     """Laço do vigia (processo oculto). Instância única por mutex; sai quando o estado é desligado e tira o "sempre
-    por cima" da janela. Ctrl+Alt+J encerra o "abrir por cima" e devolve o foco à janela marcada."""
+    por cima" da janela. Ctrl+Alt+J encerra o "abrir por cima" e devolve o foco à janela marcada. Dorme até um evento
+    (estado mudou, janela marcada apareceu, Ctrl+Alt+J) com um batimento de POLL_SECONDS."""
+    global _window_events
     mutex = kernel32_errors.CreateMutexW(None, False, mutex_name(path))
     if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS: outro vigia já cuida
         kernel32.CloseHandle(mutex)
         return 0
     registered = hotkey and user32.RegisterHotKey(None, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_J)
     message = wintypes.MSG()
+    events = change = None
     try:
+        state = read_state(path)
+        if state.get("enabled"):
+            events, change = _start_watching(path)
+        loaded_at = time.monotonic()
         while True:
-            state = read_state(path)
             if not state.get("enabled"):
+                if _window_events:
+                    _window_events.force_scan()
                 marked = find_window(state.get("title") or "")
                 if marked:
                     set_topmost(marked, False)
                 return 0
             try:
+                resumed = False
                 while user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 1):  # PM_REMOVE
-                    if message.message == WM_HOTKEY:
-                        topmost_resume(path)
-                        marked = find_window(state.get("title") or "")
-                        if marked:
-                            user32.SetForegroundWindow(marked)  # quem recebeu a tecla pode trazer a janela para a frente
-                        state = read_state(path)
+                    resumed = resumed or message.message == WM_HOTKEY
+                if resumed:
+                    topmost_resume(path)
+                    if _window_events:
+                        _window_events.force_scan()
+                    marked = find_window(state.get("title") or "")
+                    if marked:
+                        user32.SetForegroundWindow(marked)  # quem recebeu a tecla pode trazer a janela para a frente
+                    state, loaded_at = read_state(path), time.monotonic()
                 topmost_step(state, path)
             except Exception as error:  # estado recusado mesmo com retry ou erro inesperado: registra e tenta no próximo ciclo
-                note_watch_error(error)
-            time.sleep(POLL_SECONDS)
+                note_watch_error(error, path.with_name("topmost.log") if path else None)
+            if wait_for_activity(change, events) or not change or time.monotonic() - loaded_at >= STATE_RELOAD_SECONDS:
+                state, loaded_at = read_state(path), time.monotonic()
     finally:
+        _window_events = None
+        if events:
+            events.close()
+        if change:
+            kernel32.FindCloseChangeNotification(change)
         if registered:
             user32.UnregisterHotKey(None, 1)
         kernel32.CloseHandle(mutex)
@@ -397,11 +558,17 @@ def topmost_on(title: str, path: Path | None = None, spawn: bool = True) -> None
     state.update(enabled=True, title=title)
     write_state(state, path)
     if spawn:
-        python = Path(sys.executable)
-        pythonw = python.with_name("pythonw.exe")
-        command = [str(pythonw if pythonw.is_file() else python), str(ROOT / "focus.py"), "--watch"]
-        if path:
-            command += ["--state", str(path)]
+        from agent_launcher.platform import native  # fora do topo: a janela da sessão importa este módulo e tem orçamento de imports
+        watcher = native.executable("vigia")
+        if watcher:
+            command = [str(watcher), "--state", str(path or STATE_FILE)]
+        else:
+            from agent_launcher.session.window import console_python  # fora do topo: window importa este módulo
+            python = console_python()
+            pythonw = python.with_name("pythonw.exe")
+            command = [str(pythonw if pythonw.is_file() else python), str(ROOT / "focus.py"), "--watch"]
+            if path:
+                command += ["--state", str(path)]
         subprocess.Popen(command, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL,
                          creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
@@ -442,4 +609,4 @@ def watch_main(argv: list[str]) -> int:
     if "--watch" not in argv:
         return 2
     state_path = Path(argv[argv.index("--state") + 1]) if "--state" in argv else None
-    return topmost_watch(state_path)
+    return topmost_watch(state_path, hotkey="--no-hotkey" not in argv)

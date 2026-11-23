@@ -17,11 +17,11 @@ from agent_launcher.domain.files import project_path
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
 from agent_launcher.harnesses import registry
-from agent_launcher.platform import elevated, focus, keys, terminal
+from agent_launcher.platform import elevated, keys, terminal
 from agent_launcher.session.close import consume_close_request
 from agent_launcher.session.controlled import without_parent_session
 from agent_launcher.session.conversations import record_session
-from agent_launcher.session.plan import build_plan
+from agent_launcher.session.plan import build_plan, quota_notice, session_command
 from agent_launcher.update import updater
 from version import APP_ID, APP_NAME
 
@@ -48,6 +48,14 @@ class _Labels(dict):
     def items(self):
         self._load()
         return dict.items(self)
+
+
+def __getattr__(name: str):
+    """`window.focus` só é carregado quando alguém o pede: abrir janelas (start_session) o usa, a janela que espera o CLI não."""
+    if name == "focus":
+        from agent_launcher.platform import focus
+        return focus
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 CLI_NAMES = _Labels()
@@ -113,6 +121,7 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
     if harness.KIND != "terminal":
         raise LauncherError(f"O {harness.LABEL} não abre em janela de terminal; use a interface.")
     from agent_launcher.harnesses import cli_update  # fora do topo: a janela da sessão tem orçamento de imports
+    from agent_launcher.platform import focus, native
     if cli_update.updating(cli):
         raise LauncherBusy(f"O {harness.LABEL} está sendo atualizado agora; abra a sessão quando terminar.")
     try:  # sessões abertas por outro programa (sem a interface) também mantêm a instalação atualizada
@@ -126,6 +135,7 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
     harness.ensure_resumable(plan)
     command = [str(console_python()), str(ROOT / "desktop.py"), "--home", str(store.home.resolve()),
                "--project", project["id"], "--connection", gateway.connection["id"], "--cli", cli, "--model", model]
+    native_window = native.executable("sessao")
     if resume:
         command.append("--resume")
     if resume and conversation:
@@ -134,6 +144,8 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
         command.append("--bypass")
     if controlled:
         command.append("--controlled")
+    if native_window:
+        command.insert(0, str(native_window))
     background = controlled if background is None else background
     minimized = background if minimized is None else minimized
     environment = without_parent_session(dict(os.environ))
@@ -166,6 +178,27 @@ def announce_wait(error: Exception, delay: float, attempt: int, attempts: int) -
     print(f"  O host ainda não respondeu (tentativa {attempt} de {attempts}); nova tentativa em {delay:g} s.")
 
 
+def prepare_session(store: Store, project: dict, title: str, cli: str, model: str, resume: bool,
+                    bypass_permissions: bool, controlled: bool, connection: str | None, conversation: str | None):
+    """Passo 1 da sessão: confere a conexão (com novas tentativas visíveis), monta e anuncia o plano, grava o registro
+    do perfil e prepara o destino. Devolve (adaptador, plano)."""
+    print(f"\n  {title}\n  {project['path']}\n")
+    gateway = Gateway.for_project(store, project, connection)
+    harness = registry.get(cli)
+    print(f"  Conexão: {gateway.name} • {harness.connection_url(gateway) or gateway.url}\n")
+    quota = gateway.verify(tolerate_quota=True, retry_delays=BOOT_RETRY_DELAYS, on_wait=announce_wait)
+    if quota:
+        print(f"  Aviso: {quota_notice(gateway, quota, cli)}\n")
+    plan = build_plan(gateway, cli, project["path"], model, resume, gateway.catalog(), preserve_terminal_title=True,
+                      bypass_permissions=bypass_permissions, controlled=controlled,
+                      admin_note=elevated.session_note(project), conversation=conversation)
+    for warning in plan.warnings:
+        print(f"  Aviso: {warning}")
+    record_session(store.home, project, gateway, plan)  # registro do perfil
+    harness.prepare(plan)
+    return harness, plan
+
+
 def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
                 bypass_permissions: bool = False, controlled: bool = False, connection: str | None = None,
                 conversation: str | None = None) -> int:
@@ -176,20 +209,8 @@ def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
         ctypes.windll.kernel32.SetConsoleTitleW(title)
     keys.register(os.getpid(), project["name"], project["id"], cli, title, controlled)  # para `launcher keys`
     try:
-        print(f"\n  {title}\n  {project['path']}\n")
-        gateway = Gateway.for_project(store, project, connection)
-        harness = registry.get(cli)
-        print(f"  Conexão: {gateway.name} • {harness.connection_url(gateway) or gateway.url}\n")
-        quota = gateway.verify(tolerate_quota=True, retry_delays=BOOT_RETRY_DELAYS, on_wait=announce_wait)
-        if quota:
-            print(f"  Aviso: {quota}\n")
-        plan = build_plan(gateway, cli, project["path"], model, resume, gateway.catalog(), preserve_terminal_title=True,
-                          bypass_permissions=bypass_permissions, controlled=controlled,
-                          admin_note=elevated.session_note(project), conversation=conversation)
-        for warning in plan.warnings:
-            print(f"  Aviso: {warning}")
-        record_session(store.home, project, gateway, plan)  # registro do perfil
-        harness.prepare(plan)
+        harness, plan = prepare_session(store, project, title, cli, model, resume, bypass_permissions, controlled,
+                                        connection, conversation)
         return harness.run(plan, project)
     finally:
         keys.unregister(os.getpid())
@@ -197,27 +218,81 @@ def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
             ctypes.windll.kernel32.SetConsoleTitleW(title)
 
 
+def hand_off_session(home: Path, reference: str, cli: str, model: str, resume: bool, handoff: int, host_pid: int,
+                     bypass_permissions: bool = False, controlled: bool = False, connection: str | None = None,
+                     conversation: str | None = None) -> int:
+    """Passo 1 para a janela nativa (sessao.exe): registra a sessão com o pid do host, planeja e entrega o plano pelo
+    pipe herdado (handle `handoff`) para o host rodar o CLI; o host também desfaz o registro. Os arquivos do plano ficam
+    na pasta estável do cache, compartilhada entre sessões, então `temp_dir` vai sempre nulo e o host não apaga nada.
+    Plano que precisa do Python vivo (adaptador.hosts_itself) roda aqui mesmo, sem escrever no pipe."""
+    import json
+    import msvcrt
+    store = Store(home)
+    project = store.find(reference)
+    title = session_title(project, cli, store.home)
+    ctypes.windll.kernel32.SetConsoleTitleW(title)
+    keys.register(host_pid, project["name"], project["id"], cli, title, controlled)  # para `launcher keys`
+    harness, plan = prepare_session(store, project, title, cli, model, resume, bypass_permissions, controlled,
+                                    connection, conversation)
+    if harness.hosts_itself(plan):
+        plan.window_pid = host_pid
+        return harness.run(plan, project)
+    command, warning = session_command(harness, plan)
+    if warning:
+        print(f"  Aviso: {warning}")
+    payload = json.dumps({"version": 1, "title": title, "command": command, "cwd": str(plan.directory),
+                          "environment": plan.environment, "temp_dir": None}).encode("utf-8")
+    pipe = msvcrt.open_osfhandle(handoff, os.O_WRONLY)
+    try:
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(pipe, view):]
+    finally:
+        os.close(pipe)
+    return 0
+
+
+def terminal_id(value: str) -> str:
+    """Valor de --cli: um destino de terminal. Confere só o pedido, sem carregar os adaptadores dos outros."""
+    harness = registry.find(value)
+    if harness is None or harness.KIND != "terminal":
+        raise argparse.ArgumentTypeError(f"invalid choice: {value!r} (choose from {', '.join(CLI_NAMES)})")
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=f"Janela de sessão do {APP_NAME}")
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--project", required=True)
     parser.add_argument("--connection", help="Nome ou ID; omitido usa a última do projeto ou a padrão")
-    parser.add_argument("--cli", choices=tuple(CLI_NAMES), required=True)
+    parser.add_argument("--cli", type=terminal_id, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--conversation", help="ID da conversa a retomar (com --resume); omitido retoma a última")
     parser.add_argument("--bypass", action="store_true", help="Ignora permissões; no Codex, também desativa o sandbox.")
     parser.add_argument("--controlled", action="store_true",
                         help="Sessão controlada por orquestrador (implica --bypass; Codex com app-server + TUI --remote).")
+    parser.add_argument("--handoff", type=int, help=argparse.SUPPRESS)  # handle do pipe do plano (sessao.exe)
+    parser.add_argument("--host-pid", type=int, help=argparse.SUPPRESS)  # pid do sessao.exe, dono do registro da sessão
     options = parser.parse_args()
+    if (options.handoff is None) != (options.host_pid is None):
+        parser.error("--handoff e --host-pid vão juntos.")
+    handoff = options.handoff is not None
     try:
-        result = run_session(options.home, options.project, options.cli, options.model, options.resume, options.bypass,
-                             options.controlled, options.connection, options.conversation)
+        if handoff:
+            result = hand_off_session(options.home, options.project, options.cli, options.model, options.resume,
+                                      options.handoff, options.host_pid, options.bypass, options.controlled,
+                                      options.connection, options.conversation)
+        else:
+            result = run_session(options.home, options.project, options.cli, options.model, options.resume,
+                                 options.bypass, options.controlled, options.connection, options.conversation)
     except (LauncherError, OSError, ValueError) as error:
         print(f"\n  Não foi possível iniciar a sessão: {error}")
         result = 1
     except KeyboardInterrupt:
         result = 130
+    if handoff:
+        return result  # fechamento e espera de ENTER são do host
     if consume_close_request(os.getpid()):
         return 0  # fechamento pedido pelo orquestrador: código 0 faz o Windows Terminal fechar a aba
     if result not in (0, 130):

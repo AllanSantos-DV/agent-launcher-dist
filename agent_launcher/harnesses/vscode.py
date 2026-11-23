@@ -189,10 +189,7 @@ class VsCode(Harness):
                 f"Pelo endpoint local da conexão ({API_TYPES.get(protocol, '?')}); o VS Code não recebe chave nem host.")
 
     def command(self) -> list[str]:
-        code = find_code()
-        if not code:
-            raise LauncherError(f"{self.LABEL} não encontrado. {self.MISSING_HINT}")
-        return [code]
+        return [self.require_executable()]
 
     def plan(self, context):
         raise LauncherError("O VS Code abre pela interface ou por 'launch --cli vscode', não numa janela de terminal.")
@@ -217,9 +214,7 @@ class VsCode(Harness):
     def open(self, store, project: dict, gateway, model: str, catalog: Catalog, confirm=lambda question: True,
              wait: float = 30) -> str:
         from agent_launcher.endpoint import registry as endpoints
-        code = find_code()
-        if not code:
-            raise LauncherError(f"{self.LABEL} não encontrado. {self.MISSING_HINT}")
+        code = self.require_executable()
         directory = project_path(project["path"])
         selected = catalog.find(model) or ModelInfo(model)
         port = endpoints.ensure_running(store.home, gateway.connection["id"])

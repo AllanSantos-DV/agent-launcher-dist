@@ -10,9 +10,9 @@ import sys
 from ctypes import wintypes
 
 import shiboken6
-from PySide6.QtCore import QAbstractNativeEventFilter, QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer
+from PySide6.QtCore import QAbstractNativeEventFilter, QEvent, QMargins, QObject, QPoint, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QApplication, QDialog, QMenu, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QFrame, QMenu, QScrollArea, QVBoxLayout, QWidget
 
 PREFERRED_MINIMUM = QSize(800, 600)
 TITLE_GRIP = 48
@@ -199,19 +199,126 @@ class PopupKeeper(QObject):
             self.fixing.discard(key)
 
 
-def _clamp_dialog(dialog: QDialog) -> None:
-    """Fits a dialog into the work area of its screen; its minimum size never exceeds that area."""
+def _clamp_dialog(dialog: QDialog, whole: bool = False) -> None:
+    """Fits a dialog into the work area of its screen; its minimum size never exceeds that area. A dialog that is only
+    reachable stays where it is, unless `whole` asks for the entire frame inside the area."""
     if not shiboken6.isValid(dialog) or not dialog.isVisible():
         return
     frame = dialog.frameGeometry()
     available = work_area(screen_for(frame))
     border = frame.size() - dialog.geometry().size()
     dialog.setMinimumSize(dialog.minimumSize().boundedTo(available.size() - border))
-    if reachable(frame, available):
+    if available.contains(frame) if whole else reachable(frame, available):
         return
     target = fitted(frame, available)
     dialog.resize(target.size() - border)
     dialog.move(target.topLeft())
+
+
+def reveal(widget: QWidget) -> None:
+    """Scrolls the body of the dialog holding `widget` to it, once the layout has placed it (a banner that just appeared)."""
+    dialog = widget.window()
+    if isinstance(dialog, GrowingDialog):
+        QTimer.singleShot(0, lambda: shiboken6.isValid(widget) and widget.isVisible()
+                          and dialog.body_scroll.ensureWidgetVisible(widget, 0, dialog.SPACING))
+
+
+class GrowingDialog(QDialog):
+    """Dialog whose minimum size follows its layout and never drops below `floor`: a panel, banner or message that
+    appears makes it grow instead of squeezing buttons and tables.
+
+    The content goes in `body_layout`, inside a frameless area that scrolls vertically only, and the closing row in
+    `footer_layout`, which never scrolls. While the body fits the work area of the screen the minimum size follows it
+    and there is no scroll bar; when it does not, the dialog takes the whole area and the body scrolls, so no button
+    ends up smaller than its text and the footer stays in view."""
+
+    MARGINS = QMargins(24, 22, 24, 20)
+    SPACING = 12
+
+    def __init__(self, parent=None, floor: QSize = QSize(0, 0)):
+        super().__init__(parent)
+        self.floor = floor
+        self.setMinimumSize(floor)
+        margins = self.MARGINS
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.body_scroll = QScrollArea()
+        self.body_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.body_scroll.setWidgetResizable(True)
+        self.body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.body_host = QWidget()
+        self.body_layout = QVBoxLayout(self.body_host)
+        self.body_layout.setContentsMargins(margins.left(), margins.top(), margins.right(), 0)
+        self.body_layout.setSpacing(self.SPACING)
+        self.body_scroll.setWidget(self.body_host)
+        self.body_host.setAutoFillBackground(False)
+        self.body_scroll.viewport().setAutoFillBackground(False)
+        self.body_host.installEventFilter(self)
+        outer.addWidget(self.body_scroll, 1)
+        self.footer_host = QWidget()
+        self.footer_layout = QVBoxLayout(self.footer_host)
+        self.footer_layout.setContentsMargins(margins.left(), self.SPACING, margins.right(), margins.bottom())
+        self.footer_layout.setSpacing(self.SPACING)
+        outer.addWidget(self.footer_host)
+
+    def content_floor(self) -> QSize:
+        """Minimum size the dialog keeps regardless of content; subclasses whose floor depends on fonts override it."""
+        return self.floor
+
+    def required_size(self) -> QSize:
+        """Smallest size the content needs at the current width (`content_floor` is applied by the caller)."""
+        return self._minimum_of(self.layout(), self.width())
+
+    @staticmethod
+    def _minimum_of(layout, width: int) -> QSize:
+        """Minimum size of a layout, with the height it needs at `width` when its content wraps."""
+        need = layout.totalMinimumSize()
+        if layout.hasHeightForWidth():
+            need.setHeight(max(need.height(), layout.totalMinimumHeightForWidth(width)))
+        return need
+
+    def fit_body(self, limit: QSize) -> None:
+        """Gives the scroll area the minimum the body needs; when body and footer together exceed `limit`, only what the
+        footer leaves, and the bar takes its width from the body."""
+        width = self.body_scroll.viewport().width() or self.width()
+        body = self._minimum_of(self.body_host.layout(), width)
+        footer = self._minimum_of(self.footer_host.layout(), self.width())
+        room = max(limit.height() - footer.height(), 0)
+        scrolls = body.height() > room
+        bar = self.body_scroll.verticalScrollBar().sizeHint().width() if scrolls else 0
+        wanted = QSize(min(body.width() + bar, limit.width()), room if scrolls else body.height())
+        if self.body_scroll.minimumSize() != wanted:
+            self.body_scroll.setMinimumSize(wanted)
+
+    def keep_room(self) -> None:
+        """Raises (or lowers) the minimum size to what the content needs; a window smaller than that grows, and is moved
+        back inside the work area when the growth pushed it out."""
+        if not self.isVisible():
+            return
+        frame = self.frameGeometry()
+        border = frame.size() - self.geometry().size()
+        limit = work_area(screen_for(frame)).size() - border
+        self.fit_body(limit)
+        wanted = self.content_floor().expandedTo(self.required_size()).boundedTo(limit)
+        if self.minimumSize() != wanted:
+            self.setMinimumSize(wanted)
+            QTimer.singleShot(0, lambda: _clamp_dialog(self, whole=True))
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.body_host and event.type() == QEvent.Type.LayoutRequest:
+            self.keep_room()
+        return super().eventFilter(watched, event)
+
+    def event(self, event) -> bool:
+        handled = super().event(event)
+        if event.type() == QEvent.Type.LayoutRequest:
+            self.keep_room()
+        return handled
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.keep_room()
 
 
 class DpiMessages(QAbstractNativeEventFilter):

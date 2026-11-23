@@ -5,7 +5,8 @@ import hashlib
 import json
 import time
 
-from agent_launcher.connectors import PROTOCOLS, ConnectorError, QuotaExhausted, normalize_targets
+from agent_launcher.connectors import (PROTOCOLS, ConnectorError, QuotaExhausted, declares_sources, normalize_costs,
+                                       normalize_targets, offers_costs)
 from agent_launcher.connectors._http import NO_KEY
 from agent_launcher.domain.catalog import Catalog, ModelInfo
 from agent_launcher.domain.errors import LauncherError
@@ -94,13 +95,53 @@ class Gateway:
                 self.store.clear_connection_status(self.connection["id"])  # a cota voltou: o aviso gravado deixa de valer
                 return ""
 
-    def empty_catalog(self, records=(), status="Catálogo indisponível; capacidades não confirmadas.", verified=False) -> Catalog:
-        return Catalog(list(records), status, verified, self.clis, self.any_model, frozenset(self.protocols))
+    @property
+    def segregates_sources(self) -> bool:
+        """O conector desta conexão se declara com segregação por fonte?"""
+        return declares_sources(self.module)
 
-    def _save(self, records, fetched_at: float, metadata: bool) -> None:
-        atomic_json(self.cache_path, {"schema": CACHE_SCHEMA, "fingerprint": self.fingerprint, "fetched_at": fetched_at,
-                                      "metadata_available": metadata,
-                                      "records": [record.to_cache() for record in records]})
+    @property
+    def offers_costs(self) -> bool:
+        """O conector desta conexão declara fontes e oferece a rota `costs(options, month)`?"""
+        return self.segregates_sources and offers_costs(self.module)
+
+    def costs(self, month: str) -> dict:
+        """Custo do mês (AAAA-MM) por fonte, como o conector da conexão o dá, já conferido contra o contrato (ver
+        `connectors.normalize_costs`). É a única chamada de rede do custo por fonte. LauncherError sem a rota, com a falha
+        do conector ou com resposta malformada."""
+        if not self.offers_costs:
+            raise LauncherError(f"{self.name}: o conector desta conexão não oferece a rota de custo por fonte.")
+        try:
+            return normalize_costs(self.module.costs(self.options, month))
+        except ConnectorError as error:
+            raise LauncherError(f"{self.name}: {error}") from error
+
+    def empty_catalog(self, records=(), status="Catálogo indisponível; capacidades não confirmadas.", verified=False,
+                      segregates_sources: bool | None = None) -> Catalog:
+        declared = self.segregates_sources if segregates_sources is None else segregates_sources
+        return Catalog(list(records), status, verified, self.clis, self.any_model, frozenset(self.protocols), declared)
+
+    def _save(self, records, fetched_at: float, metadata: bool, segregates_sources: bool | None = None,
+              seen: list[str] | None = None) -> None:
+        """Grava o cache da conexão; `seen` são os ids da última lista que o usuário viu (ausente = sem base)."""
+        declared = self.segregates_sources if segregates_sources is None else segregates_sources
+        shaped = records if declared else [record.without_source() for record in records]
+        payload = {"schema": CACHE_SCHEMA, "fingerprint": self.fingerprint, "fetched_at": fetched_at,
+                   "metadata_available": metadata, "segregates_sources": declared,
+                   "records": [record.to_cache() for record in shaped]}
+        if seen is not None:
+            payload["seen"] = seen
+        atomic_json(self.cache_path, payload)
+
+    def mark_news_seen(self, catalog: Catalog) -> None:
+        """Guarda no cache a lista de `catalog` como a última que o usuário viu: a próxima novidade é a diferença contra
+        ela. Sem cache legível não há o que marcar; a próxima busca ao host cria a base."""
+        try:
+            data = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            data["seen"] = [record.id for record in catalog.records]
+            atomic_json(self.cache_path, data)
+        except (OSError, ValueError):
+            return
 
     def _models(self) -> tuple[list[ModelInfo], bool]:
         """models() do conector conferido contra o contrato (list[ModelInfo], bool)."""
@@ -109,23 +150,50 @@ class Gateway:
         if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], list) and isinstance(result[1], bool):
             wrong = next((item for item in result[0] if not isinstance(item, ModelInfo)), None)
             if wrong is None:
+                if self.segregates_sources:
+                    self._one_source_per_model(result[0])
                 return result
             received = f"uma lista com {type(wrong).__name__}"
         raise LauncherError(f"{self.name}: o conector {self.connection['connector']!r} devolveu {received} em models(); "
                             "o esperado é (lista de ModelInfo, contexto confirmado como bool).")
 
+    def _one_source_per_model(self, records: list[ModelInfo]) -> None:
+        """Um modelo, uma fonte: ConnectorError se algum id traz implantações de 2+ fontes distintas."""
+        for record in records:
+            sources = sorted({found for found in (record.source, *(item.source for item in record.deployments)) if found},
+                             key=str.casefold)
+            if len(sources) > 1:
+                raise ConnectorError(
+                    f"o modelo {record.id!r} vem de {len(sources)} fontes ({', '.join(sources)}); um modelo pertence a uma "
+                    "só fonte, então cada fonte precisa expor o seu id (por exemplo com um prefixo por fonte).")
+
+    @staticmethod
+    def _news(seen: list[str] | None, records) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Ids que entraram e saíram de `records` contra a lista vista; sem base não há diferença."""
+        if seen is None:
+            return (), ()
+        before, now = set(seen), {record.id for record in records}
+        return tuple(sorted(now - before, key=str.casefold)), tuple(sorted(before - now, key=str.casefold))
+
     def catalog(self, refresh: bool = False, offline: bool = False, save_cache: bool = True) -> Catalog:
-        cached = self.empty_catalog()
+        """Catálogo da conexão, do cache ou do host. `added` e `removed` comparam com a última lista que o usuário viu
+        (`mark_news_seen`), não com o cache anterior: outra rotina que atualize o cache não apaga a novidade."""
+        cached = self.empty_catalog(segregates_sources=False)
         fetched_at = 0
         metadata_available = False
+        seen = None
         try:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
             if data.get("schema") == CACHE_SCHEMA and data.get("fingerprint") == self.fingerprint:
                 fetched_at = float(data["fetched_at"])
-                cached.records = [ModelInfo.from_cache(record) for record in data["records"]]
+                if isinstance(data.get("seen"), list):
+                    seen = [item for item in data["seen"] if isinstance(item, str)]
+                cached.segregates_sources = data.get("segregates_sources") is True
+                cached.records = [ModelInfo.from_cache(record) if cached.segregates_sources
+                                  else ModelInfo.from_cache(record).without_source() for record in data["records"]]
                 metadata_available = data.get("metadata_available") is True
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
-            cached = self.empty_catalog()
+            cached, seen = self.empty_catalog(segregates_sources=False), None
         age = time.time() - fetched_at
         fresh = 0 <= age < CACHE_TTL
         cached.verified = bool(cached.records and metadata_available and fresh)
@@ -137,6 +205,7 @@ class Gateway:
         if offline:
             return cached
         if cached.records and not refresh and fresh and (metadata_available or age < 60):
+            cached.added, cached.removed = self._news(seen, cached.records)
             return cached
         try:
             records, metadata_available = self._models()
@@ -148,7 +217,7 @@ class Gateway:
                 cached.status = f"AVISO: catálogo em cache sem confirmação; contexto não será configurado. {error}"
                 if save_cache:
                     try:
-                        self._save(cached.records, fetched_at, False)
+                        self._save(cached.records, fetched_at, False, cached.segregates_sources, seen)
                     except OSError:
                         pass
                 if not refresh:
@@ -157,9 +226,13 @@ class Gateway:
         status = ("Catálogo ao vivo • limites de contexto informados pelo host" if metadata_available else
                   "Catálogo ao vivo • o host não informa contexto; os CLIs usam seus próprios limites")
         catalog = self.empty_catalog(records, status, metadata_available)
+        catalog.added, catalog.removed = self._news(seen, records)
+        if not catalog.segregates_sources:
+            catalog.records = [record.without_source() for record in records]
         if save_cache:
             try:
-                self._save(records, time.time(), metadata_available)
+                self._save(records, time.time(), metadata_available,
+                           seen=[record.id for record in records] if seen is None else seen)
             except OSError:
                 catalog.status += " • não foi possível salvar o cache"
         return catalog

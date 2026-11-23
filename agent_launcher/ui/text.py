@@ -10,8 +10,9 @@ from pathlib import Path
 
 from agent_launcher import ROOT
 from agent_launcher.domain import profiles, usage
+from agent_launcher.domain.cache import prune_old_versions
 from agent_launcher.domain.conversation_usage import conversation_usage
-from agent_launcher.domain.catalog import CLAUDE_FAMILIES, base_model, token_label
+from agent_launcher.domain.catalog import CLAUDE_FAMILIES, ModelInfo, base_model, token_label
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
@@ -20,8 +21,10 @@ from agent_launcher.harnesses import installers as clis
 from agent_launcher.harnesses.installers import CliInstallError
 from agent_launcher.harnesses import registry
 from agent_launcher.platform import elevated, focus, keys, terminal
+from agent_launcher.session import reopen
 from agent_launcher.session.conversations import conversations_for, record_session
-from agent_launcher.session.preview import plan_report, planned
+from agent_launcher.session.plan import quota_notice
+from agent_launcher.session.preview import RESUME_SHELLS, plan_command, plan_report, planned, resume_command
 from agent_launcher.update import updater
 from version import APP_NAME, VERSION
 
@@ -82,11 +85,42 @@ def show_connections(store: Store) -> None:
         marker = " • padrão" if connection["id"] == store.data["default_connection"] else ""
         label = module.LABEL if module else f"{connection['connector']} (conector indisponível)"
         quota = " • cota esgotada" if (connection.get("status") or {}).get("state") == "quota_exhausted" else ""
-        print(f"  {index:>2}. {connection['name']}{marker}\n      {label} • {connection['options'].get('base_url', '')}{quota}")
+        reserve = store.fallback_of(connection)
+        reserve_text = f" • reserva: {reserve['name']}" if reserve else ""
+        sessions_text = " • sessões pelo endpoint" if store.endpoint_sessions_of(connection) else ""
+        print(f"  {index:>2}. {connection['name']}{marker}\n      {label} • {connection['options'].get('base_url', '')}"
+              f"{quota}{reserve_text}{sessions_text}")
     if not store.connections:
         print("  Nenhuma conexão. Adicione um provedor (LiteLLM, 9router, OmniRoute, OpenRouter, Anthropic, OpenAI...).")
     for error in errors:
         print(f"  [AVISO] conector do usuário não carregado: {error}")
+
+
+def set_fallback_command(store: Store, options) -> None:
+    """`launcher connections --set-fallback NOME --to RESERVA` ou `--clear-fallback NOME`. LauncherError para
+    combinação inválida de opções ou reserva recusada pelo cadastro (inexistente, a própria conexão, ciclo)."""
+    if options.clear_fallback and (options.set_fallback or options.to):
+        raise LauncherError("--clear-fallback não se combina com --set-fallback nem com --to.")
+    if options.clear_fallback:
+        store.clear_fallback(options.clear_fallback)
+        print(f"Conexão reserva de {store.find_connection(options.clear_fallback)['name']} removida.")
+        return
+    if not (options.set_fallback and options.to):
+        raise LauncherError("--set-fallback NOME e --to RESERVA andam juntos: informe os dois.")
+    store.set_fallback(options.set_fallback, options.to)
+    print(f"Conexão reserva de {store.find_connection(options.set_fallback)['name']}: "
+          f"{store.find_connection(options.to)['name']}.")
+
+
+def endpoint_sessions_command(store: Store, options) -> None:
+    """`launcher connections --endpoint-sessions on|off --connection NOME`: liga ou desliga as sessões de terminal pelo
+    endpoint local da conexão. LauncherError sem --connection ou com conexão inexistente."""
+    if not options.connection:
+        raise LauncherError("--endpoint-sessions precisa de --connection NOME.")
+    store.set_endpoint_sessions(options.connection, options.endpoint_sessions == "on")
+    name = store.find_connection(options.connection)["name"]
+    print(f"Sessões de terminal da conexão {name} pelo endpoint local: "
+          f"{'ligadas' if options.endpoint_sessions == 'on' else 'desligadas (direto ao host)'}.")
 
 
 def add_project(store: Store) -> dict | None:
@@ -306,11 +340,14 @@ def choose_model(gateway: Gateway, cli: str, previous: str = "") -> str | None:
 
 
 def launch(store: Store, project: dict, gateway: Gateway, cli: str, model: str, resume: bool = False,
-           dry_run: bool = False, controlled: bool = False, conversation: str | None = None) -> int:
+           dry_run: bool = False, controlled: bool = False, conversation: str | None = None,
+           command_shell: str | None = None) -> int:
+    """Abre a sessão no terminal atual. Com `dry_run`, só imprime o plano (JSON); com `command_shell` (cmd ou powershell),
+    imprime em vez disso o comando que o reproduz fora do launcher."""
     if not dry_run:
         quota = gateway.verify(tolerate_quota=True)
         if quota:
-            print(f"  [AVISO] {quota}")
+            print(f"  [AVISO] {quota_notice(gateway, quota, cli)}")
     try:
         catalog = gateway.catalog(offline=dry_run)
     except LauncherError as error:
@@ -319,6 +356,9 @@ def launch(store: Store, project: dict, gateway: Gateway, cli: str, model: str, 
     if not dry_run and clis.locate(cli) is None and harness.install_steps():
         offer_install(cli)
     if harness.KIND != "terminal":
+        if command_shell:
+            raise LauncherError(f"{harness.LABEL} não abre por comando de terminal: --command só vale para as sessões "
+                                "de terminal (Claude Code, Codex, Copilot CLI).")
         if dry_run:
             print(json.dumps(harness.preview(store, project, gateway, model, catalog), ensure_ascii=False, indent=2))
             return 0
@@ -327,7 +367,8 @@ def launch(store: Store, project: dict, gateway: Gateway, cli: str, model: str, 
         return 0
     plan = planned(store.home, gateway, project["path"], cli, model, resume, catalog, controlled, conversation)
     if dry_run:
-        print(json.dumps(plan_report(plan, gateway, resume, catalog), ensure_ascii=False, indent=2))
+        print(plan_command(plan, gateway, resume, catalog, command_shell) if command_shell else
+              json.dumps(plan_report(plan, gateway, resume, catalog), ensure_ascii=False, indent=2))
         return 0
     heading(f"{'RETOMAR' if resume else 'INICIAR'} / {cli.upper()}")
     print(f"  Projeto: {project['name']}\n  Pasta:   {plan.directory}\n  Modelo:  {plan.model}")
@@ -351,21 +392,109 @@ def launch(store: Store, project: dict, gateway: Gateway, cli: str, model: str, 
     return exit_code
 
 
-def list_conversations(store: Store, project: dict, cli: str | None = None) -> list[dict]:
-    """Conversas da pasta do projeto nos CLIs de terminal (as deste perfil, se a pasta é compartilhada)."""
+def found_conversations(store: Store, project: dict, cli: str | None = None) -> list:
+    """Conversas da pasta do projeto nos CLIs de terminal (as deste perfil, se a pasta é compartilhada), mais recente
+    primeiro."""
     directory = Path(project["path"]).expanduser().resolve()
     found = []
     for harness in registry.terminals():
         if cli is None or harness.ID == cli:
             found += conversations_for(store.home, harness, directory)
-    cache, tables = usage.FileCache(store.home), usage.price_table(store.home)
-    items = []
-    for item in sorted(found, key=lambda item: item.updated, reverse=True):
-        used = conversation_usage(store.home, item.cli, item.id, tables, cache)
-        items.append({**item.as_json(), "context_tokens": used.context,
-                      "cost_usd": None if used.cost is None else round(used.cost, 6)})
+    return sorted(found, key=lambda item: item.updated, reverse=True)
+
+
+def conversation_usages(home: Path, conversations: list) -> dict:
+    """Custo e contexto de cada conversa da lista (por id), lidos dos transcripts (cache por arquivo)."""
+    cache, tables = usage.FileCache(home), usage.price_table(home)
+    found = {item.id: conversation_usage(home, item.cli, item.id, tables, cache) for item in conversations}
     cache.save()
-    return items
+    return found
+
+
+def list_conversations(store: Store, project: dict, cli: str | None = None) -> list[dict]:
+    """As conversas de found_conversations com o contexto e o custo estimado de cada uma."""
+    found = found_conversations(store, project, cli)
+    used = conversation_usages(store.home, found)
+    return [{**item.as_json(), "context_tokens": used[item.id].context,
+             "cost_usd": None if used[item.id].cost is None else round(used[item.id].cost, 6)} for item in found]
+
+
+def conversation_command(store: Store, project: dict, reference: str, cli: str | None = None,
+                         connection: str | None = None, model: str | None = None, shell: str = "cmd") -> str:
+    """O comando que retoma fora do launcher a conversa `reference` (ID, ou posição de 1 em diante na lista de
+    `conversations`, já filtrada por `cli`), para colar no `shell` (cmd ou powershell): o mesmo plano do
+    `launch --resume --conversation --dry-run`."""
+    found = found_conversations(store, project, cli)
+    chosen = next((item for item in found if item.id == reference), None)
+    if chosen is None:
+        position = number_choice(reference, len(found))
+        if position is None:
+            options = f"use o ID ou uma posição de 1 a {len(found)}" if found else "não há o que retomar"
+            raise LauncherError(f"Conversa {reference} não encontrada: a pasta tem {len(found)} conversa(s); {options} "
+                                "(veja 'conversations').")
+        chosen = found[position]
+    gateway = Gateway.for_project(store, project, connection)
+    model = model or store.last_model(project, gateway.connection, chosen.cli)
+    if not model:
+        raise LauncherError("Informe --model com um ID completo, ou escolha um modelo pela interface primeiro.")
+    return resume_command(store.home, gateway, project["path"], chosen.cli, model, gateway.catalog(offline=True),
+                          chosen.id, shell)
+
+
+def sessions_command(store: Store, options) -> int:
+    """`launcher sessions --reopen`: reabre as sessões das últimas --hours horas que não estão abertas, cada uma na
+    conversa exata, como abas da janela única em segundo plano. Com --dry-run só lista (JSON). Devolve 1 se alguma aba
+    não abriu; as linhas desabilitadas (conversa não identificada) aparecem com o motivo e nunca abrem."""
+    if not options.reopen:
+        raise LauncherError("Use --reopen para reabrir as sessões das últimas horas (com --dry-run só lista).")
+    if options.hours is not None and options.hours <= 0:
+        raise LauncherError("--hours precisa ser maior que zero.")
+    hours = reopen.RECENT_HOURS if options.hours is None else options.hours
+    rows = reopen.candidates(store, hours)
+    if options.dry_run:
+        print(json.dumps({"hours": hours, "sessions": [row.as_json() for row in rows]}, ensure_ascii=False, indent=2))
+        return 0
+    results = reopen.open_all(store, [row for row in rows if row.selectable])
+    failed = [result for result in results if not result["ok"]]
+    skipped = [row.as_json() for row in rows if not row.selectable]
+    print(json.dumps({"hours": hours, "opened": len(results) - len(failed), "failed": len(failed),
+                      "skipped": skipped, "results": results}, ensure_ascii=False, indent=2))
+    return 1 if failed else 0
+
+
+def keys_command(store: Store, options) -> int:
+    """`launcher keys`: lista as sessões abertas, ou lê a tela e envia teclas a uma delas. Com --wait, espera o texto
+    aparecer (até --timeout) antes de ler e de enviar; prazo estourado é erro e nenhuma tecla vai."""
+    if options.list:
+        print(json.dumps(keys.sessions(), ensure_ascii=False))
+        return 0
+    if options.pid is None and not options.project:
+        raise LauncherError("Informe --project (e --cli se preciso) ou --pid; veja --list.")
+    if options.timeout is not None and not options.wait:
+        raise LauncherError("--timeout só vale com --wait.")
+    if not options.keys and not options.screen and not options.wait:
+        raise LauncherError("Informe as teclas a enviar, --screen ou --wait.")
+    try:
+        ids = {store.find(options.project)["id"]} if options.project else set()
+        session = keys.resolve(ids, options.cli, options.pid)
+        if options.wait:
+            screen = keys.wait_for_text(session["pid"], options.wait,
+                                        keys.WAIT_TIMEOUT if options.timeout is None else options.timeout)
+        elif options.screen:
+            screen = keys.read_screen(session["pid"])
+        if options.screen:
+            print(screen)
+        done = {"ok": True, "pid": session["pid"], "title": session["title"]}
+        if options.keys:
+            keys.send(session["pid"], options.keys)
+            done["sent"] = options.keys
+        if options.wait:
+            done["waited"] = options.wait
+        if options.keys or (options.wait and not options.screen):
+            print(json.dumps(done, ensure_ascii=False))
+    except keys.KeysError as error:
+        raise LauncherError(str(error)) from error
+    return 0
 
 
 def confirm_in_console(question: str) -> bool:
@@ -405,69 +534,191 @@ def ask_package(kind: str, *args):
     return None
 
 
-def doctor(store: Store, reference: str | None = None) -> int:
-    heading("DIAGNÓSTICO / SOMENTE LEITURA")
-    print(f"  {APP_NAME} {VERSION}\n  Dados: {store.home}")
-    failed = False
+def ask_connection_file(kind: str, *args):
+    """Importação de uma conexão no console: só o conector diferente do instalado é perguntado; a chave nunca (fica por
+    preencher)."""
+    return None if kind == "secret" else ask_package(kind, *args)
+
+
+DOCTOR_NOTE ="O diagnóstico só lista modelos: não gera tokens. Catálogo acessível não garante inferência."
+MARKERS = {"ok": "[OK]", "aviso": "[AVISO]", "erro": "[ERRO]"}
+
+
+def check(name: str, state: str, message: str, marker: str | None = None, indent: int = 2) -> dict:
+    """Uma verificação do diagnóstico. `marker` e `indent` só mudam como o texto a mostra ("" não leva marcador)."""
+    return {"name": name, "state": state, "message": message,
+            "marker": MARKERS[state] if marker is None else marker, "indent": indent}
+
+
+def doctor_data(store: Store, reference: str | None = None) -> dict:
+    """Coleta o diagnóstico (somente leitura): CLIs, Windows Terminal, conexões com o catálogo ao vivo e endpoints.
+    `ok` cai só com verificação em erro (aviso não derruba). LauncherError se `reference` não for uma conexão."""
+    checks = []
     installed = 0
     for harness in registry.all():
         found = clis.locate(harness.ID)
         if not found:
-            print(f"  [--] {harness.LABEL} não instalado" + (f" (instale pelo cartão ou 'cli --install {harness.ID}')."
-                                                            if harness.install_steps() else "."))
+            hint = f" (instale pelo cartão ou 'cli --install {harness.ID}')." if harness.install_steps() else "."
+            checks.append(check(harness.ID, "aviso", f"{harness.LABEL} não instalado{hint}", "[--]"))
             continue
         if harness.KIND == "terminal":
             try:
                 found = harness.command()[-1]
             except LauncherError as error:
-                print(f"  [AVISO] {error}")
+                checks.append(check(harness.ID, "aviso", str(error)))
                 continue
         installed += 1
-        print(f"  [OK] {harness.ID}: {found}")
+        checks.append(check(harness.ID, "ok", f"{harness.ID}: {found}"))
     for error in registry.errors():
-        print(f"  [AVISO] adaptador do usuário não carregado: {error}")
+        checks.append(check("adaptador", "aviso", f"adaptador do usuário não carregado: {error}"))
     if not installed:
-        print("  [--] Nenhuma ferramenta instalada ainda: normal numa instalação nova. Cada uma se instala pelo cartão "
-              "dela na interface.")
+        checks.append(check("ferramentas", "aviso", "Nenhuma ferramenta instalada ainda: normal numa instalação nova. "
+                                                    "Cada uma se instala pelo cartão dela na interface.", "[--]"))
     wt = terminal.find(ROOT)
-    print(f"  [OK] Windows Terminal: {wt}" if wt else
-          "  [AVISO] Windows Terminal ausente: sessões em consoles separados. Use 'terminal --install'.")
+    checks.append(check("windows-terminal", "ok", f"Windows Terminal: {wt}") if wt else
+                  check("windows-terminal", "aviso",
+                        "Windows Terminal ausente: sessões em consoles separados. Use 'terminal --install'."))
     connections = [store.find_connection(reference)] if reference else store.connections
     if not connections:
-        failed = True
-        print("  [ERRO] Nenhuma conexão cadastrada. Use 'connections add'.")
+        checks.append(check("conexoes", "erro", "Nenhuma conexão cadastrada. Use 'connections add'."))
     for connection in connections:
+        name = connection["name"]
         try:
             gateway = Gateway(store, connection)
             catalog = gateway.catalog(refresh=True, save_cache=False)
-            print(f"  [OK] {gateway.name} ({gateway.module.LABEL}) • {gateway.url}")
+            checks.append(check(name, "ok", f"{gateway.name} ({gateway.module.LABEL}) • {gateway.url}"))
             for cli in [cli for cli in destinations() if cli in gateway.clis]:
                 records = catalog.for_cli(cli)
                 large = sum(record.one_million for record in records) if catalog.verified else 0
-                print(f"       {label_of(cli)}: {len(records)} modelos; {large} com entrada >= 1M informada")
+                checks.append(check(f"{name}: {cli}", "ok", f"{label_of(cli)}: {len(records)} modelos; "
+                                                            f"{large} com entrada >= 1M informada", "", 7))
             if not catalog.verified:
-                print(f"       [AVISO] {catalog.status}")
+                checks.append(check(f"{name}: catálogo", "aviso", catalog.status, indent=7))
             mark = connection.get("status") or {}
             if mark.get("state") == "quota_exhausted":
-                print(f"       [AVISO] cota esgotada na última verificação: {mark.get('message', '')}")
+                checks.append(check(f"{name}: cota", "aviso",
+                                    f"cota esgotada na última verificação: {mark.get('message', '')}", indent=7))
         except LauncherError as error:
-            failed = True
-            print(f"  [ERRO] {connection['name']}: {error}")
+            checks.append(check(name, "erro", f"{name}: {error}"))
     from agent_launcher.endpoint import registry as endpoints
     for item in endpoints.status(store.home, connections):
         if item["port"]:
             state = f"rodando, {item['requests']} requisições" if item["running"] else "parado (sobe ao abrir o destino)"
-            print(f"  [OK] Endpoint local de {item['connection']}: {item['url']} • {state}"
-                  + (" • inicia com o Windows" if item["autostart"] else "")
-                  + (f" • AVISO: {item['autostart_stale']} (abrir o destino pelo launcher regrava)"
-                     if item.get("autostart_stale") else ""))
-    print("\n  O diagnóstico só lista modelos: não gera tokens. Catálogo acessível não garante inferência.")
-    return 1 if failed else 0
+            stale = item.get("autostart_stale")
+            checks.append(check(f"endpoint: {item['connection']}", "aviso" if stale else "ok", (
+                f"Endpoint local de {item['connection']}: {item['url']} • {state}"
+                + (" • inicia com o Windows" if item["autostart"] else "")
+                + (f" • AVISO: {stale} (abrir o destino pelo launcher regrava)" if stale else "")), "[OK]"))
+    return {"version": VERSION, "data_dir": str(store.home), "ok": all(item["state"] != "erro" for item in checks),
+            "checks": checks}
+
+
+def doctor(store: Store, reference: str | None = None, as_json: bool = False) -> int:
+    """`launcher doctor [--connection NOME] [--json]`: imprime `doctor_data` em texto (o de sempre) ou em JSON, só com
+    nome, estado e mensagem de cada verificação; o código de saída é 1 quando alguma está em erro."""
+    data = doctor_data(store, reference)
+    if as_json:
+        print(json.dumps({**data, "checks": [{key: item[key] for key in ("name", "state", "message")}
+                                             for item in data["checks"]]}, ensure_ascii=False, indent=2))
+        return 0 if data["ok"] else 1
+    heading("DIAGNÓSTICO / SOMENTE LEITURA")
+    print(f"  {APP_NAME} {data['version']}\n  Dados: {data['data_dir']}")
+    for item in data["checks"]:
+        print(" " * item["indent"] + (item["marker"] + " " if item["marker"] else "") + item["message"])
+    print(f"\n  {DOCTOR_NOTE}")
+    return 0 if data["ok"] else 1
+
+
+def has_source(record: ModelInfo, name: str) -> bool:
+    """O modelo é da fonte `name` (sem diferença de maiúscula)? Modelo sem fonte não casa com nenhuma."""
+    return record.source is not None and record.source.casefold() == name.casefold()
+
+
+def listed_models(gateway, catalog, options, fields: list[str]) -> list[tuple[ModelInfo, dict]]:
+    """Modelos do catálogo que passam pelos filtros de `models` (destino, família, trecho do ID, fonte e as capacidades
+    `fields`), cada um com o item do `/v1/models` que o endpoint local daria. `--source` só vale quando o conector da
+    conexão declara fontes; LauncherError caso contrário."""
+    from agent_launcher.endpoint.server import model_entry, with_capabilities
+    if options.source and not catalog.segregates_sources:
+        raise LauncherError("--source: o conector desta conexão não declara fontes (SEGREGATES_SOURCES); "
+                            "sem declaração, os modelos não têm fonte.")
+    wanted = [options.cli] if options.cli else sorted(gateway.clis)
+    listed = [record for record in catalog.records
+              if any(catalog.allows(record, cli) for cli in wanted)
+              and (not options.family or record.family == options.family)
+              and options.search.casefold() in record.id.casefold()
+              and (not options.source or has_source(record, options.source))]
+    entries = {record.id: model_entry(record, record.provider or gateway.name) for record in listed}
+    kept = {entry["id"] for entry in with_capabilities(list(entries.values()), fields)}
+    return [(record, entries[record.id]) for record in listed if record.id in kept]
+
+
+def model_test_command(store: Store, options) -> int:
+    """`launcher models test MODELO [--connection X] [--yes]`: mostra o custo em tokens do teste e só faz a chamada real
+    de 1 token com --yes ou com o "sim" no console. Sem confirmação nada é enviado (código 2); chamada com erro do host
+    ou do endpoint imprime a causa no stderr (código 1). LauncherError para uso inválido."""
+    from agent_launcher.domain import model_probe
+    if options.words[:1] != ["test"]:
+        raise LauncherError(f"Ação desconhecida de models: {' '.join(options.words) or '--yes'!r}. "
+                            "Use 'models test MODELO [--yes]'; --yes só vale com 'test'.")
+    if len(options.words) != 2:
+        raise LauncherError("Informe o modelo: models test MODELO [--connection NOME] [--yes].")
+    gateway = Gateway.for_project(store, reference=options.connection)
+    record = model_probe.find_model(gateway, options.words[1])
+    protocol = model_probe.protocol_of(gateway, record)
+    print(model_probe.cost_text(model_probe.estimate_cost(record, protocol)))
+    interactive = sys.stdin is not None and sys.stdin.isatty()
+    if not options.yes and not (interactive and confirm_in_console("Fazer a chamada real agora?")):
+        print("\nNada foi enviado. Confirme com --yes para fazer a chamada real.")
+        return 2
+    result = model_probe.probe(store.home, gateway.connection["id"], record.id, protocol)
+    print(model_probe.result_text(result), file=sys.stdout if result.ok else sys.stderr)
+    return 0 if result.ok else 1
+
+
+def models_command(store: Store, options) -> int:
+    """`launcher models`: os modelos da conexão que o destino aceita, filtrados por trecho do ID, família, fonte e
+    capacidade. Em texto, uma linha por modelo; com --json, os itens do `/v1/models` do endpoint local, que decidem a
+    capacidade (`capabilities_wanted`, `with_capabilities`). `models test MODELO` testa o modelo (ver
+    `model_test_command`).
+    LauncherError para opção inválida."""
+    from agent_launcher.endpoint.server import capabilities_wanted
+    if options.words or options.yes:
+        return model_test_command(store, options)
+    gateway = Gateway.for_project(store, reference=options.connection)
+    if options.family and options.cli and options.cli != "claude":
+        raise LauncherError(f"--family é um filtro do Claude; não se aplica ao {label_of(options.cli)}.")
+    try:
+        fields = capabilities_wanted(options.capability)
+    except ValueError as error:
+        raise LauncherError(str(error)) from error
+    catalog = gateway.catalog(options.refresh)
+    pairs = listed_models(gateway, catalog, options, fields)
+    listed = [record for record, _entry in pairs]
+    entries = {record.id: entry for record, entry in pairs}
+    if options.json:
+        print(catalog.status, file=sys.stderr)
+        if catalog.news():
+            print(catalog.news(), file=sys.stderr)
+        print(json.dumps([entries[record.id] for record in listed], ensure_ascii=False, indent=2))
+        if catalog.news():
+            gateway.mark_news_seen(catalog)
+        return 0
+    print(catalog.status)
+    if catalog.news():
+        print(catalog.news())
+    for record in listed:
+        print(catalog.describe(record))
+    if catalog.news():
+        gateway.mark_news_seen(catalog)
+    return 0
 
 
 def endpoint_command(store: Store, options) -> int:
     """Endpoint local: o VS Code e o Copilot app só conhecem esta URL; chave e host ficam no launcher."""
     from agent_launcher.endpoint import registry as endpoints
+    if options.endpoint_action == "logs":
+        return endpoint_log(store, options)
     if options.endpoint_action == "status":
         connections = [store.find_connection(options.connection)] if options.connection else store.connections
         print(json.dumps(endpoints.status(store.home, connections), ensure_ascii=False, indent=2))
@@ -625,14 +876,102 @@ def parse_values(module, pairs: list[str], secret_env: list[str]) -> dict:
     return values
 
 
-def usage_command(store, options) -> int:
-    """`launcher usage [--month AAAA-MM]`: estimativa local de uso do perfil."""
-    from agent_launcher.domain.usage import usage_report
+def usage_by_source_command(store, options) -> int:
+    """`launcher usage --by-source [--connection X] [--month AAAA-MM] [--tsv]`: o custo do mês por fonte que o conector da
+    conexão devolve pela rota `costs`, sem cálculo do launcher; JSON por padrão, `--tsv` em tabela. LauncherError sem a
+    rota, com `--all` ou com falha do conector."""
+    if options.all:
+        raise LauncherError("--by-source lê o custo de uma conexão (--connection); não se combina com --all.")
     try:
-        report = usage_report(store.home, options.month)
+        month = usage.month_bounds(options.month)[0]
     except ValueError as error:
         raise LauncherError(str(error)) from error
-    print(json.dumps(report, ensure_ascii=False, indent=1))
+    costs = Gateway.for_project(store, reference=options.connection).costs(month)
+    print(usage.source_costs_text(month, costs) if options.tsv else json.dumps({"month": month, **costs},
+                                                                                ensure_ascii=False, indent=1))
+    return 0
+
+
+def usage_command(store, options) -> int:
+    """`launcher usage [--month AAAA-MM] [--all] [--tsv]`: estimativa local de uso do perfil (ou de todos), em JSON ou
+    no texto separado por tabulação que o "Copiar relatório" da interface copia. Com o teto mensal ligado, o JSON do
+    perfil traz também `limit`. `--limit VALOR|off` só grava ou desliga o teto, sem calcular o relatório."""
+    if options.limit is not None:
+        if options.month or options.all or options.tsv or options.by_source:
+            raise LauncherError("--limit só grava ou desliga o teto mensal; rode 'usage' sem ele para ver o relatório.")
+        value = usage.parse_limit(options.limit)
+        store.set_monthly_limit(value)
+        print("Limite mensal desligado." if value is None else f"Limite mensal: {usage.money(value)}.")
+        return 0
+    if options.by_source:
+        return usage_by_source_command(store, options)
+    try:
+        report = (usage.usage_report_all if options.all else usage.usage_report)(store.home, options.month)
+    except ValueError as error:
+        raise LauncherError(str(error)) from error
+    if options.tsv:
+        print(usage.usage_text(report))
+        return 0
+    status = None if options.all else usage.limit_status(report, store.monthly_limit())
+    print(json.dumps({**report, "limit": status} if status else report, ensure_ascii=False, indent=1))
+    return 0
+
+
+def status_report(store: Store, month: str | None = None) -> dict:
+    """Retrato único e sem segredos: CLIs, conexões, endpoint de cada uma, sessões abertas, projetos e o uso do mês.
+    Cada parte vem da função por trás do `doctor`, do `endpoint status`, do `keys --list`, do `projects list` e do `usage`."""
+    from agent_launcher.endpoint import registry as endpoints
+    tools = []
+    for harness in registry.all():
+        found = clis.locate(harness.ID)
+        tools.append({"id": harness.ID, "label": harness.LABEL, "installed": bool(found), "path": found,
+                      "version": cli_update.installed_version(harness.ID, found) if found and harness.ID in clis.NAMES
+                      else None})
+    report = usage.usage_report(store.home, month)
+    status = usage.limit_status(report, store.monthly_limit())
+    return {
+        "version": VERSION,
+        "clis": tools,
+        "connections": [{"id": connection["id"], "name": connection["name"], "connector": connection["connector"],
+                         "base_url": connection["options"].get("base_url", ""),
+                         "default": connection["id"] == store.data["default_connection"],
+                         "quota_exhausted": (connection.get("status") or {}).get("state") == "quota_exhausted"}
+                        for connection in store.connections],
+        "endpoints": endpoints.status(store.home, store.connections),
+        "sessions": keys.sessions(),
+        "projects": json.loads(projects_json(store)),
+        "usage": {**{key: report[key] for key in ("month", "currency", "destinations", "total")},
+                  **({"limit": status} if status else {})},
+    }
+
+
+def status_command(store: Store, options) -> int:
+    """`launcher status [--month AAAA-MM]`: o retrato de `status_report` em JSON."""
+    try:
+        report = status_report(store, options.month)
+    except ValueError as error:
+        raise LauncherError(str(error)) from error
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+def endpoint_log(store: Store, options) -> int:
+    """`launcher endpoint logs`: as últimas linhas do endpoint.log do perfil (o log é um só por perfil, sem chave nem corpo)."""
+    if options.lines < 1:
+        raise LauncherError("--lines precisa ser 1 ou mais.")
+    if options.connection:
+        store.find_connection(options.connection)
+    path = store.home / "endpoint.log"
+    if not path.is_file():
+        print(f"{path} ainda não existe: o endpoint local não registrou nenhum pedido neste perfil.")
+        return 0
+    from agent_launcher.endpoint import registry as endpoints
+    lines = [endpoints.read_log(store.home, options.lines)]
+    if options.summary:
+        lines = [endpoints.summary_text(endpoints.summarize_log(lines[0]))]
+    if options.connection:  # as linhas não trazem a conexão (só os 8 primeiros do id nas de pedido): não dá para filtrar
+        print("o log é único por perfil; mostrando todas as linhas", file=sys.stderr)
+    print("\n".join(lines))
     return 0
 
 
@@ -666,8 +1005,16 @@ def parser() -> argparse.ArgumentParser:
     profile_export.add_argument("file", metavar="ARQUIVO")
     check = commands.add_parser("doctor", help="Verificar CLIs e conexões (somente leitura)")
     check.add_argument("--connection")
+    check.add_argument("--json", action="store_true",
+                       help="as verificações em JSON (nome, estado ok/aviso/erro e mensagem de cada uma, mais o campo ok)")
     commands.add_parser("connectors", help="Listar os tipos de conector e seus campos")
     connections = commands.add_parser("connections", help="Gerenciar conexões com provedores")
+    connections.add_argument("--set-fallback", metavar="NOME", help="Define a conexão reserva de NOME (use com --to)")
+    connections.add_argument("--to", metavar="RESERVA", help="Conexão reserva usada por --set-fallback")
+    connections.add_argument("--clear-fallback", metavar="NOME", help="Tira a conexão reserva de NOME")
+    connections.add_argument("--endpoint-sessions", choices=("on", "off"),
+                             help="Liga ou desliga as sessões de terminal pelo endpoint local da conexão (use com --connection)")
+    connections.add_argument("--connection", metavar="NOME", help="Conexão de --endpoint-sessions")
     connection_actions = connections.add_subparsers(dest="connection_action")
     add_connection = connection_actions.add_parser("add", help="Adicionar ou atualizar uma conexão (testa antes de salvar)")
     add_connection.add_argument("--name", required=True)
@@ -681,12 +1028,30 @@ def parser() -> argparse.ArgumentParser:
         if name == "remove":
             sub.add_argument("--clean-destinations", action="store_true",
                              help="remove também o provider no Copilot app e no VS Code e para/libera o endpoint local")
+    export_connection = connection_actions.add_parser(
+        "export", help="Exportar uma conexão para um arquivo .alprofile, sem a chave (para passar a um colega)")
+    export_connection.add_argument("reference", metavar="CONEXAO", help="Id ou nome da conexão")
+    export_connection.add_argument("file", metavar="ARQUIVO")
+    connection_actions.add_parser(
+        "import", help="Importar a conexão de um arquivo .alprofile; a chave fica por preencher").add_argument(
+        "file", metavar="ARQUIVO")
     models = commands.add_parser("models", help="Listar IDs completos de modelos de uma conexão")
     models.add_argument("--connection")
     models.add_argument("--cli", choices=destinations())
     models.add_argument("--search", default="", help="Filtrar por trecho do ID")
     models.add_argument("--family", choices=CLAUDE_FAMILIES, help="Filtrar uma família Claude")
     models.add_argument("--refresh", action="store_true", help="Ignorar cache e exigir catálogo ao vivo")
+    models.add_argument("--source", metavar="NOME",
+                        help="Só modelos desta fonte, com o nome que o conector declarou; só vale em conexão cujo conector "
+                             "declara fontes")
+    models.add_argument("--capability", action="append", default=[], metavar="vision|audio|video|tools",
+                        help="Só modelos com a capacidade confirmada (repetida ou separada por vírgula: todas)")
+    models.add_argument("--json", action="store_true",
+                        help="Os modelos em JSON, os mesmos itens do /v1/models do endpoint local")
+    models.add_argument("words", nargs="*", metavar="test MODELO",
+                        help="'test MODELO': testa o modelo com uma chamada real de 1 token; mostra o custo em tokens "
+                             "antes e só chama com --yes ou com a confirmação no console")
+    models.add_argument("--yes", action="store_true", help="Confirma a chamada real de 'models test'")
     projects = commands.add_parser("projects", help="Gerenciar os projetos cadastrados")
     actions = projects.add_subparsers(dest="project_action")
     add = actions.add_parser("add", help="Cadastrar uma pasta existente")
@@ -712,9 +1077,13 @@ def parser() -> argparse.ArgumentParser:
                              help="atualiza o CLI instalado (o `update` da própria CLI, npm ou winget; adia com sessão aberta)")
     endpoint = commands.add_parser("endpoint", help="Endpoint local das conexões (VS Code e Copilot app): situação, "
                                                     "subir, parar, iniciar com o Windows")
-    endpoint.add_argument("endpoint_action", nargs="?", choices=("status", "start", "stop", "autostart"), default="status")
-    endpoint.add_argument("--connection", help="Nome ou ID da conexão (padrão: todas no status, obrigatório nas outras)")
+    endpoint.add_argument("endpoint_action", nargs="?", choices=("status", "start", "stop", "autostart", "logs"),
+                          default="status")
+    endpoint.add_argument("--connection", help="Nome ou ID da conexão (padrão: todas no status, obrigatório nas outras; "
+                                               "em logs só confere o nome: o log é um por perfil)")
     endpoint.add_argument("--off", action="store_true", help="com autostart: desliga")
+    endpoint.add_argument("--lines", type=int, default=50, metavar="N", help="com logs: quantas linhas finais (padrão 50)")
+    endpoint.add_argument("--summary", action="store_true", help="com logs: resume (pedidos, erros por modelo, failovers, latência) em vez de listar")
     term = commands.add_parser("terminal", help="Windows Terminal: situação, bloqueios corporativos e instalação sem admin")
     term.add_argument("--install", action="store_true", help="instala o Terminal portátil (ou via winget) se faltar")
     term.add_argument("--zip", type=Path, help="ZIP do Windows Terminal entregue pela TI; força a cópia portátil")
@@ -761,14 +1130,48 @@ def parser() -> argparse.ArgumentParser:
     send.add_argument("--pid", type=int, help="pid da janela da sessão (ver --list); dispensa --project")
     send.add_argument("--list", action="store_true", help="Listar as sessões abertas (JSON) e sair")
     send.add_argument("--screen", action="store_true", help="Mostrar o que a sessão exibe agora (antes das teclas)")
-    usage = commands.add_parser("usage", help="Uso do mês do perfil: tokens e custo estimado por destino e modelo (JSON)")
-    usage.add_argument("--month", metavar="AAAA-MM", help="Mês (padrão: o atual)")
+    send.add_argument("--wait", metavar="TEXTO",
+                      help="Esperar este texto aparecer na tela da sessão antes de ler a tela e enviar as teclas; "
+                           "passado o prazo sem o texto, erro e nenhuma tecla vai")
+    send.add_argument("--timeout", type=float, metavar="SEGUNDOS",
+                      help=f"Com --wait: prazo da espera (padrão {keys.WAIT_TIMEOUT:g} s)")
+    usage_parser = commands.add_parser("usage", help="Uso do mês do perfil: tokens e custo estimado por destino e modelo "
+                                                     "(JSON; --all soma os perfis, --tsv imprime o texto do 'Copiar relatório')")
+    usage_parser.add_argument("--month", metavar="AAAA-MM", help="Mês (padrão: o atual)")
+    usage_parser.add_argument("--all", action="store_true", help="soma de todos os perfis, no mesmo formato")
+    usage_parser.add_argument("--tsv", action="store_true",
+                              help="o relatório em texto separado por tabulação, o mesmo que a interface copia")
+    usage_parser.add_argument("--by-source", action="store_true",
+                              help="o custo do mês por fonte, como o conector da conexão o informa (JSON; --tsv em tabela); "
+                                   "só vale em conexão cujo conector declara fontes e oferece a rota de custo")
+    usage_parser.add_argument("--connection", help="Com --by-source: nome ou ID da conexão (padrão: a do projeto ou a padrão)")
+    usage_parser.add_argument("--limit", metavar="VALOR|off",
+                              help="teto de gasto do mês deste perfil, na moeda do relatório (100 ou 100,50); off desliga. "
+                                   "A janela avisa a 80%% e a 100%% e nada é bloqueado")
+    state = commands.add_parser("status", help="Retrato único em JSON: CLIs, conexões (cota), endpoint, sessões abertas, "
+                                               "projetos e uso do mês; sem chaves")
+    state.add_argument("--month", metavar="AAAA-MM", help="Mês do uso (padrão: o atual)")
     update = commands.add_parser("update", help="Atualizar agora pela última versão publicada no registry")
     update.add_argument("--check", action="store_true", help="só mostra se há versão nova, sem instalar")
     talks = commands.add_parser("conversations", help="Conversas dos CLIs de terminal na pasta do projeto (JSON, mais "
                                 "recente primeiro; pasta em outro perfil: só as deste perfil)")
     talks.add_argument("--project", required=True, help="Nome, ID ou caminho de projeto cadastrado")
     talks.add_argument("--cli", choices=terminal_destinations())
+    talks.add_argument("--command", metavar="ID_OU_POSIÇÃO",
+                       help="Em vez da lista, imprimir o comando que retoma esta conversa fora do launcher, com a "
+                            "pasta, o ambiente e o modelo da conexão; a chave nunca vai no texto. Posição: 1 é a mais "
+                            "recente (depois do filtro --cli)")
+    talks.add_argument("--shell", choices=RESUME_SHELLS,
+                       help="Com --command: o shell em que o texto será colado (padrão: cmd)")
+    talks.add_argument("--connection", help="Com --command: nome ou ID; omitido usa a última do projeto ou a padrão")
+    talks.add_argument("--model", help="Com --command: ID completo; omitido usa o último modelo desse CLI/projeto/conexão")
+    recent = commands.add_parser("sessions", help="Sessões das últimas horas: --reopen reabre as que não estão abertas, "
+                                                  "cada uma na conversa exata, como abas da janela única")
+    recent.add_argument("--reopen", action="store_true", help="Reabrir as sessões das últimas horas que não estão abertas")
+    recent.add_argument("--hours", type=float, metavar="N",
+                        help=f"Com --reopen: quantas horas atrás contar as aberturas (padrão {reopen.RECENT_HOURS})")
+    recent.add_argument("--dry-run", action="store_true",
+                        help="Com --reopen: só listar o que abriria, em JSON (linhas sem conversa identificada vêm com o motivo)")
     session = commands.add_parser("launch", help="Iniciar um CLI no terminal atual (ou abrir VS Code / Copilot app)")
     session.add_argument("--project", required=True, help="Nome, ID ou caminho de projeto cadastrado")
     session.add_argument("--connection", help="Nome ou ID; omitido usa a última do projeto ou a padrão")
@@ -777,6 +1180,11 @@ def parser() -> argparse.ArgumentParser:
     session.add_argument("--resume", action="store_true", help="Retomar a última sessão do CLI no projeto")
     session.add_argument("--conversation", metavar="ID", help="Com --resume: retomar esta conversa (veja 'conversations')")
     session.add_argument("--dry-run", action="store_true", help="Exibir argumentos sem rede, sem salvar e sem iniciar CLI")
+    session.add_argument("--command", action="store_true",
+                         help="Com --dry-run: em vez do JSON, imprimir o comando que abre esta sessão fora do launcher, "
+                              "com a pasta, o ambiente e o modelo da conexão; a chave nunca vai no texto")
+    session.add_argument("--shell", choices=RESUME_SHELLS,
+                         help="Com --command: o shell em que o texto será colado (padrão: cmd)")
     session.add_argument("--controlled", action="store_true", help="Sessão controlada por orquestrador (implica bypass)")
     return result
 
@@ -820,6 +1228,7 @@ def main(arguments: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     options = parser().parse_args(arguments)
+    prune_old_versions()
     cleanup_status = 0  # 1 quando a remoção de conexão funcionou mas um passo da limpeza falhou
     try:
         if options.action == "profiles":
@@ -835,11 +1244,13 @@ def main(arguments: list[str] | None = None) -> int:
         if options.action is None:
             return menu(store)
         if options.action == "doctor":
-            return doctor(store, options.connection)
+            return doctor(store, options.connection, options.json)
         if options.action == "endpoint":
             return endpoint_command(store, options)
         if options.action == "usage":
             return usage_command(store, options)
+        if options.action == "status":
+            return status_command(store, options)
         if options.action == "connectors":
             modules, errors = store.connectors()
             for module in modules.values():
@@ -849,7 +1260,11 @@ def main(arguments: list[str] | None = None) -> int:
                 print(f"[AVISO] {error}", file=sys.stderr)
         elif options.action == "connections":
             action = options.connection_action
-            if action == "add":
+            if options.set_fallback or options.clear_fallback or options.to:
+                set_fallback_command(store, options)
+            elif options.endpoint_sessions or options.connection:
+                endpoint_sessions_command(store, options)
+            elif action == "add":
                 modules, _errors = store.connectors()
                 if options.connector not in modules:
                     raise LauncherError(f"Conector desconhecido: {options.connector}. Veja 'connectors'.")
@@ -875,20 +1290,19 @@ def main(arguments: list[str] | None = None) -> int:
             elif action == "default":
                 store.set_default_connection(options.reference)
                 print("Conexão padrão definida.")
+            elif action == "export":
+                from agent_launcher.domain import profile_package
+                result = profile_package.export_connection(store, options.reference, Path(options.file))
+                print(f"Conexão {result['connection']} exportada sem a chave em {result['path']}" +
+                      (f", com o conector {', '.join(result['connectors'])}" if result["connectors"] else "") + ".")
+            elif action == "import":
+                from agent_launcher.domain import profile_package
+                print(profile_package.describe_connection(
+                    profile_package.import_connection(store, Path(options.file), ask=ask_connection_file)))
             else:
                 show_connections(store)
         elif options.action == "models":
-            gateway = Gateway.for_project(store, reference=options.connection)
-            if options.family and options.cli and options.cli != "claude":
-                raise LauncherError(f"--family é um filtro do Claude; não se aplica ao {label_of(options.cli)}.")
-            catalog = gateway.catalog(options.refresh)
-            print(catalog.status)
-            wanted = [options.cli] if options.cli else sorted(gateway.clis)
-            for record in catalog.records:
-                if (any(catalog.allows(record, cli) for cli in wanted)
-                        and (not options.family or record.family == options.family)
-                        and options.search.casefold() in record.id.casefold()):
-                    print(catalog.describe(record))
+            return models_command(store, options)
         elif options.action == "projects":
             if options.project_action == "add":
                 project = store.add(options.path, options.name)
@@ -983,24 +1397,7 @@ def main(arguments: list[str] | None = None) -> int:
             focus.open_front(options.target, options.seconds)
             print(f"Aberto por cima: {options.target}")
         elif options.action == "keys":
-            if options.list:
-                print(json.dumps(keys.sessions(), ensure_ascii=False))
-                return 0
-            if options.pid is None and not options.project:
-                raise LauncherError("Informe --project (e --cli se preciso) ou --pid; veja --list.")
-            if not options.keys and not options.screen:
-                raise LauncherError("Informe as teclas a enviar ou --screen.")
-            try:
-                ids = {store.find(options.project)["id"]} if options.project else set()
-                session = keys.resolve(ids, options.cli, options.pid)
-                if options.screen:
-                    print(keys.read_screen(session["pid"]))
-                if options.keys:
-                    keys.send(session["pid"], options.keys)
-                    print(json.dumps({"ok": True, "pid": session["pid"], "title": session["title"],
-                                      "sent": options.keys}, ensure_ascii=False))
-            except keys.KeysError as error:
-                raise LauncherError(str(error)) from error
+            return keys_command(store, options)
         elif options.action == "update":
             try:
                 if options.check:
@@ -1022,13 +1419,25 @@ def main(arguments: list[str] | None = None) -> int:
                 raise LauncherError("Informe --model com um ID completo, ou escolha um modelo pela interface primeiro.")
             if options.conversation and not options.resume:
                 raise LauncherError("--conversation só vale com --resume.")
+            if options.command and not options.dry_run:
+                raise LauncherError("--command só vale com --dry-run: o launcher só imprime o comando, não abre a sessão.")
+            if options.shell and not options.command:
+                raise LauncherError("--shell só vale com --command.")
             if options.resume:
                 warn_shared(store, project, resume=True)
             return launch(store, project, gateway, cli, model, options.resume, options.dry_run, options.controlled,
-                          options.conversation)
+                          options.conversation, (options.shell or "cmd") if options.command else None)
+        elif options.action == "sessions":
+            return sessions_command(store, options)
         elif options.action == "conversations":
-            print(json.dumps(list_conversations(store, store.find(options.project), options.cli), ensure_ascii=False,
-                             indent=2))
+            project = store.find(options.project)
+            if options.command:
+                print(conversation_command(store, project, options.command, options.cli, options.connection,
+                                           options.model, options.shell or "cmd"))
+            elif options.connection or options.model or options.shell:
+                raise LauncherError("--connection, --model e --shell só valem com --command.")
+            else:
+                print(json.dumps(list_conversations(store, project, options.cli), ensure_ascii=False, indent=2))
         return cleanup_status
     except (LauncherError, OSError) as error:
         print(f"Erro: {error}", file=sys.stderr)
@@ -1036,6 +1445,9 @@ def main(arguments: list[str] | None = None) -> int:
     except (KeyboardInterrupt, EOFError):
         print("\nLauncher encerrado.")
         return 130
+
+
+AUTOMATION_ACTIONS = ("keys",)
 
 
 def console_of_its_own() -> bool:
@@ -1053,9 +1465,10 @@ def console_of_its_own() -> bool:
 
 
 def script_main() -> int:
-    """launcher.py da raiz: espera ENTER só quando o console foi aberto para esta execução."""
+    """launcher.py da raiz: espera ENTER só quando o console foi aberto para esta execução. Os comandos de AUTOMATION_ACTIONS
+    são chamados por script: o erro deles sai direto, sem pausa."""
     exit_code = main()
-    if exit_code not in (0, 130) and console_of_its_own():
+    if exit_code not in (0, 130) and parser().parse_args().action not in AUTOMATION_ACTIONS and console_of_its_own():
         try:
             input("\nPressione ENTER para fechar...")
         except (EOFError, KeyboardInterrupt):

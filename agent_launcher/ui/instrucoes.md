@@ -39,7 +39,9 @@ confere uma conexão já salva.
 
 **Cota esgotada.** Quando o provedor avisa que a cota ou o crédito acabou, a conexão é salva com a marca
 **cota esgotada** em vez de ser recusada. A marca não impede nada: abrir uma sessão nela só mostra um aviso, porque a
-cota pode ter voltado. Um teste bem-sucedido tira a marca. Diagnóstico e a importação de perfil também a mencionam.
+cota pode ter voltado. Um teste bem-sucedido tira a marca. Se a conexão tem **Conexão reserva**, o endpoint local manda os
+pedidos direto à reserva por 10 minutos e depois tenta a primeira de novo. Diagnóstico e a importação de perfil também a
+mencionam.
 
 No modo texto:
 
@@ -58,7 +60,8 @@ pergunta de forma oculta.
 Escolha o projeto, a conexão, o CLI e o modelo; depois **Nova sessão** ou **Retomar última**.
 
 - **Retomar última** só fica habilitado quando há conversa daquele CLI na pasta. A seta ao lado abre **Escolher
-  conversa…**, com a lista das conversas do projeto. Sem conversa anterior, a retomada vira sessão nova, com aviso.
+  conversa…**, com a lista das conversas do projeto; **Copiar comando de retomada** copia o comando para o cmd e **Copiar
+  para PowerShell** o mesmo para o PowerShell. Sem conversa anterior, a retomada vira sessão nova, com aviso.
 - Cada sessão vira uma aba da janela **agent-launcher** (laranja para Claude Code, verde para Codex). Fechar o launcher
   não encerra as sessões.
 - A sessão recebe a configuração só no próprio processo: `~/.claude/settings.json` e `~/.codex/config.toml` não são
