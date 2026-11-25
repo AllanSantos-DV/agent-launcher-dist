@@ -63,6 +63,19 @@ def plural(count: int, singular: str, several: str) -> str:
     return f"{count} {singular if count == 1 else several}"
 
 
+def save_text_file(parent, title: str, suggested: str, text: str, path: str | None = None) -> Path | None:
+    """Grava `text` num arquivo UTF-8 que o usuário escolhe (`path` pula a escolha); None se ele cancelou. Falha ao
+    gravar vira OSError com o caminho, para o chamador mostrar."""
+    from PySide6.QtWidgets import QFileDialog
+    from agent_launcher.domain.files import atomic_text
+    if not path:
+        path, _filter = QFileDialog.getSaveFileName(parent, title, str(Path.home() / suggested), "Texto (*.txt)")
+        if not path:
+            return None
+    atomic_text(Path(path), text)
+    return Path(path)
+
+
 def icon(name: str, color: str = INK, size: int = 20, fill: str = "none", struck: bool = False,
          fixed: bool = False) -> QIcon:
     """Ícone de traço da biblioteca PATHS; `fill` preenche as formas e `struck` cruza o ícone com uma barra. As cores

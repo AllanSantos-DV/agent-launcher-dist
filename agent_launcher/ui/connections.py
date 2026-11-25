@@ -23,7 +23,7 @@ from agent_launcher.domain.store import Store
 from agent_launcher.endpoint import registry as endpoint_registry
 from agent_launcher.ui.background import BackgroundTask, run_task
 from agent_launcher.ui.placement import GrowingDialog, reveal
-from agent_launcher.ui.theme import ReadableCombo, StatusLine, bind_style, label, plural
+from agent_launcher.ui.theme import ReadableCombo, StatusLine, bind_style, label, plural, save_text_file
 
 
 _label = functools.partial(label, wrap=True)
@@ -435,6 +435,10 @@ class EndpointPanel(QWidget):
     chave (o endpoint acrescenta a credencial); Ver log abre o fim do endpoint.log do perfil."""
 
     copied = Signal(str)
+    COPY_ADDRESS_TIP = "Copia o endereço do endpoint para colar no campo de endereço de outra ferramenta"
+    COPY_CONFIG_TIP = ("Copia as variáveis de ambiente do endpoint (endereço certo por protocolo e uma chave sem valor) "
+                       "para o PowerShell ou o cmd")
+    STOPPED_TIP = "Inicie o endpoint para copiar. O botão Iniciar e copiar faz as duas coisas de uma vez."
 
     def __init__(self, home: Path, parent=None):
         super().__init__(parent)
@@ -464,12 +468,11 @@ class EndpointPanel(QWidget):
         layout.addLayout(row)
         tools = QHBoxLayout()
         self.copy_address_button = QPushButton("Copiar endereço")
-        self.copy_address_button.setToolTip("Copia o endereço do endpoint para colar no campo de endereço de outra ferramenta")
+        self.copy_address_button.setToolTip(self.COPY_ADDRESS_TIP)
         self.copy_address_button.clicked.connect(self.copy_address)
         tools.addWidget(self.copy_address_button)
         self.copy_config_button = QPushButton("Copiar configuração")
-        self.copy_config_button.setToolTip("Copia as variáveis de ambiente do endpoint (endereço certo por protocolo e uma "
-                                           "chave sem valor) para o PowerShell ou o cmd")
+        self.copy_config_button.setToolTip(self.COPY_CONFIG_TIP)
         config_menu = QMenu(self.copy_config_button)
         for title, shell in (("PowerShell", "powershell"), ("cmd", "cmd")):
             config_menu.addAction(title, lambda shell=shell: self.copy_config(shell))
@@ -478,6 +481,14 @@ class EndpointPanel(QWidget):
         self.log_button = QPushButton("Ver log")
         self.log_button.clicked.connect(self.show_log)
         tools.addWidget(self.log_button)
+        self.start_copy_button = QPushButton("Iniciar e copiar")
+        self.start_copy_button.setToolTip("Inicia o endpoint se ele estiver parado e copia a configuração dele para o "
+                                          "PowerShell ou o cmd")
+        start_copy_menu = QMenu(self.start_copy_button)
+        for title, shell in (("PowerShell", "powershell"), ("cmd", "cmd")):
+            start_copy_menu.addAction(title, lambda shell=shell: self.start_and_copy(shell))
+        self.start_copy_button.setMenu(start_copy_menu)
+        tools.addWidget(self.start_copy_button)
         tools.addStretch()
         layout.addLayout(tools)
         self.notice = _label("", "notice")
@@ -502,16 +513,17 @@ class EndpointPanel(QWidget):
         task.signals.completed.connect(lambda *_args, task=task: self.tasks.discard(task))
         run_task(task, slot)
 
-    def _act(self, connection_id: str, job, busy_text: str = ""):
-        """Dispara a ação do usuário sobre a conexão: apaga o erro da ação anterior dela, trava os botões e roda `job`."""
+    def _act(self, connection_id: str, job, busy_text: str = "", then=None):
+        """Dispara a ação do usuário sobre a conexão: apaga o erro da ação anterior dela, trava os botões e roda `job`;
+        `then(resultado, erro)` roda ao fim, antes de reler o estado."""
         self.action_errors.pop(connection_id, None)
         self.render_notice()
         self._set_busy(True, busy_text)
-        self._start(job, self._acted_for(connection_id))
+        self._start(job, self._acted_for(connection_id, then))
 
     def _set_busy(self, busy: bool, text: str = ""):
         self.busy = busy
-        for widget in (self.toggle_button, self.autostart_box, self.refresh_button):
+        for widget in (self.toggle_button, self.autostart_box, self.refresh_button, self.start_copy_button):
             widget.setEnabled(not busy)
         if busy and text:
             self.summary.setText(text)
@@ -550,8 +562,11 @@ class EndpointPanel(QWidget):
         if not self.busy:
             self.summary.setText(" • ".join(parts) + (f"\n{state['url']}" if state.get("url") else ""))
         self.toggle_button.setText("Parar" if running else "Iniciar")
-        self.copy_address_button.setEnabled(running and bool(state.get("url")))
-        self.copy_config_button.setEnabled(running and bool(state.get("url")))
+        ready = running and bool(state.get("url"))
+        self.copy_address_button.setEnabled(ready)
+        self.copy_config_button.setEnabled(ready)
+        self.copy_address_button.setToolTip(self.COPY_ADDRESS_TIP if ready else self.STOPPED_TIP)
+        self.copy_config_button.setToolTip(self.COPY_CONFIG_TIP if ready else self.STOPPED_TIP)
         self.autostart_box.setChecked(bool(state.get("autostart")))
         self.show()
 
@@ -583,6 +598,31 @@ class EndpointPanel(QWidget):
         self.copied.emit(f"Configuração copiada ({'PowerShell' if shell == 'powershell' else 'cmd'}): cole no terminal da "
                          "outra ferramenta. Vai sem chave real, o endpoint acrescenta a credencial.")
 
+    def start_and_copy(self, shell: str):
+        """Copia a configuração do endpoint da conexão selecionada para o `shell`; se ele estiver parado, sobe o
+        endpoint antes. Falha ao subir ou ao montar aparece na faixa do painel e não copia nada."""
+        connection_id = self.connection_id or ""
+        state = self.states.get(connection_id) or {}
+        if state.get("running") and state.get("port"):
+            self.copy_config(shell)
+            return
+        home = self.home
+
+        def job():
+            port = endpoint_registry.ensure_running(home, connection_id)
+            return endpoint_registry.connection_config(home, connection_id, port, shell)
+        self._act(connection_id, job, "Iniciando o endpoint…", self._copied_after_start(shell))
+
+    def _copied_after_start(self, shell: str):
+        """Quando o endpoint sobe e a configuração é montada, vai para a área de transferência; a confirmação diz que
+        o endpoint foi iniciado."""
+        def done(text, _error):
+            if text:
+                QApplication.clipboard().setText(text)
+                self.copied.emit(f"Endpoint iniciado e configuração copiada ({'PowerShell' if shell == 'powershell' else 'cmd'}): "
+                                 "cole no terminal da outra ferramenta. Vai sem chave real, o endpoint acrescenta a credencial.")
+        return done
+
     def show_log(self):
         EndpointLogDialog(self.home, self.window()).exec()
 
@@ -604,9 +644,13 @@ class EndpointPanel(QWidget):
         home = self.home
         self._act(connection_id, lambda: endpoint_registry.autostart(home, connection_id, bool(enabled)))
 
-    def _acted_for(self, connection_id):
+    def _acted_for(self, connection_id, then=None):
         """A resposta chega depois: o erro é da conexão que disparou a ação, não da que está selecionada agora."""
-        return lambda result, error: self.acted(result, error, connection_id)
+        def arrived(result, error):
+            if then:
+                then(result, error)
+            self.acted(result, error, connection_id)
+        return arrived
 
     @Slot(object, str)
     def acted(self, _result, error, connection_id=None):
@@ -655,6 +699,9 @@ class EndpointLogDialog(GrowingDialog):
         self.copy_button = QPushButton("Copiar")
         self.copy_button.clicked.connect(self.copy)
         row.addWidget(self.copy_button)
+        self.save_button = QPushButton("Salvar em arquivo…")
+        self.save_button.clicked.connect(lambda: self.save())
+        row.addWidget(self.save_button)
         row.addStretch()
         self.close_button = QPushButton("Fechar")
         self.close_button.setObjectName("primary")
@@ -677,6 +724,17 @@ class EndpointLogDialog(GrowingDialog):
         self.view.setPlainText(shown)
         self.view.moveCursor(self.view.textCursor().MoveOperation.End)
         self.copy_button.setEnabled(bool(self.text))
+        self.save_button.setEnabled(bool(self.text))
+
+    def save(self, path: str | None = None):
+        """Grava as linhas mostradas no arquivo escolhido (`path` pula a escolha); o resultado vai para a linha de estado."""
+        try:
+            saved = save_text_file(self, "Salvar log do endpoint", "endpoint-log.txt", self.text, path)
+        except OSError as error:
+            self.status.setText(f"Não foi possível salvar: {error}")
+            return
+        if saved is not None:
+            self.status.setText(f"{plural(len(self.text.splitlines()), 'linha salva', 'linhas salvas')} em {saved}.")
 
     def showEvent(self, event):
         """Abre já na altura que o corpo e o rodapé pedem: a medida da área rolável é limitada a umas 24 linhas de texto,
@@ -918,7 +976,7 @@ class ConnectionsDialog(GrowingDialog):
         self.statuses: dict[str, str] = {}  # origem ("lista", "teste", "limpeza") -> linha; convivem, a mesma substitui a sua
         self.status = _label("", "muted")
         self.status.setWordWrap(True)
-        layout.addWidget(self.status)
+        self.footer_layout.addWidget(self.status)  # no rodapé: a confirmação de uma ação nunca fica abaixo da rolagem
         self.close_button = QPushButton("Fechar")
         self.close_button.clicked.connect(self.accept)
         row = QHBoxLayout()

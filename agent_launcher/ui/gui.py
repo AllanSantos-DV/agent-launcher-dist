@@ -44,7 +44,7 @@ from agent_launcher.ui.instructions import InstructionsDialog, release_notes_ava
 from agent_launcher.ui.text import conversation_usages, label_of
 from agent_launcher.ui.theme import (
     ACCENT_NAMES, DANGER, GREEN, INFO, MENU_SELECTED, MUTED, THEME_NAMES, WARN, CardGrid, CliButton, DangerMenu, ElidedLabel,
-    FlowRow, InfoStrip, NoticeStrip, ReadableCombo, RowsTable, StatusLine, bind_icon, bind_style, icon, label, plural, tone, tone_item,
+    FlowRow, InfoStrip, NoticeStrip, ReadableCombo, RowsTable, StatusLine, bind_icon, bind_style, icon, label, plural, save_text_file, tone, tone_item,
 )
 from agent_launcher.update import updater
 from version import APP_NAME, APP_USER_MODEL_ID, VERSION
@@ -245,11 +245,14 @@ class ThemeDialog(QDialog):
 class TextDialog(QDialog):
     """Texto selecionável só para leitura, com o botão que o copia inteiro (como o Copiar erro da faixa de avisos)."""
 
-    def __init__(self, title: str, text: str, copy_label: str, copied_message: str, parent=None, on_copy=None):
+    def __init__(self, title: str, text: str, copy_label: str, copied_message: str, parent=None, on_copy=None,
+                 save_name: str | None = None, save_note: str = ""):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(640, 520)
         self.copied_message = copied_message
+        self.save_name = save_name
+        self.save_note = save_note
         layout = QVBoxLayout(self)
         self.box = QPlainTextEdit(text)
         self.box.setReadOnly(True)
@@ -262,6 +265,10 @@ class TextDialog(QDialog):
         self.copy_button = QPushButton(copy_label)
         self.copy_button.clicked.connect(lambda: self.copy(on_copy))
         self.actions.addWidget(self.copy_button)
+        self.save_button = QPushButton("Salvar em arquivo…")
+        self.save_button.clicked.connect(lambda: self.save())
+        self.save_button.setVisible(save_name is not None)
+        self.actions.addWidget(self.save_button)
         self.copied = QLabel("")
         self.copied.setObjectName("muted")
         self.actions.addWidget(self.copied)
@@ -278,12 +285,24 @@ class TextDialog(QDialog):
         if on_copy:
             on_copy()
 
+    def save(self, path: str | None = None) -> None:
+        """Grava o texto inteiro no arquivo escolhido (`path` pula a escolha); o resultado aparece na linha ao lado."""
+        try:
+            saved = save_text_file(self, self.windowTitle(), self.save_name, self.box.toPlainText(), path)
+        except OSError as error:
+            self.copied.setText(f"Não foi possível salvar: {error}")
+            return
+        if saved is not None:
+            self.copied.setText(f"Salvo em {saved}. {self.save_note}".strip())
+
 
 class DiagnosticsDialog(TextDialog):
     """O diagnóstico como texto selecionável, com o botão que o copia inteiro."""
 
     def __init__(self, text: str, parent=None, on_copy=None):
-        super().__init__("Diagnóstico", text, "Copiar diagnóstico", "Diagnóstico copiado.", parent, on_copy)
+        super().__init__("Diagnóstico", text, "Copiar diagnóstico", "Diagnóstico copiado.", parent, on_copy,
+                         save_name="diagnostico-agent-launcher.txt",
+                         save_note="O diagnóstico traz o caminho da pasta de dados: confira antes de enviar a alguém.")
 
 
 class PlanDialog(TextDialog):
@@ -1038,6 +1057,10 @@ class UsageDialog(QDialog):
         self.copy_button.setEnabled(False)
         self.copy_button.clicked.connect(self.copy)
         actions.addWidget(self.copy_button)
+        self.save_button = QPushButton("Salvar em arquivo…")
+        self.save_button.setEnabled(False)
+        self.save_button.clicked.connect(lambda: self.save())
+        actions.addWidget(self.save_button)
         self.copied = QLabel("")
         self.copied.setObjectName("muted")
         actions.addWidget(self.copied)
@@ -1123,6 +1146,7 @@ class UsageDialog(QDialog):
         self.report = self.limit_basis = None
         self.show_limit_note()
         self.copy_button.setEnabled(False)
+        self.save_button.setEnabled(False)
         self.table.setRowCount(0)
         task = self.task = UsageTask(self.home, self.month_choice.currentData(), self.everyone_check.isChecked())
         run_task(task, lambda report, text="": task is self.task and self.show_report(report, text))
@@ -1140,6 +1164,7 @@ class UsageDialog(QDialog):
         self.note.setText(self.NOTE.replace("deste perfil", "de cada perfil") if report.get("profile") == "todos" else self.NOTE)
         self.report = report if rows else None
         self.copy_button.setEnabled(self.report is not None)
+        self.save_button.setEnabled(self.report is not None)
         self.status.setText("" if rows else f"Nenhum uso encontrado em {report['month']}.")
         self.table.setRowCount(len(rows))
         for number, row in enumerate(rows):
@@ -1159,6 +1184,16 @@ class UsageDialog(QDialog):
     def copy(self) -> None:
         QApplication.clipboard().setText(usage_text(self.report))
         self.copied.setText("Relatório copiado: cole numa planilha, cada valor vai para a sua coluna.")
+
+    def save(self, path: str | None = None) -> None:
+        """Grava o texto do relatório (o mesmo do Copiar, separado por tabulação) no arquivo escolhido."""
+        try:
+            saved = save_text_file(self, "Salvar relatório de uso", f"uso-{self.report['month']}.tsv", usage_text(self.report), path)
+        except OSError as error:
+            self.copied.setText(f"Não foi possível salvar: {error}")
+            return
+        if saved is not None:
+            self.copied.setText(f"Relatório salvo em {saved}.")
 
     def show_limit_note(self, saved: bool = False) -> None:
         """O gasto do mês frente ao limite do perfil (ou o estado do limite, sem relatório ou na soma de perfis)."""
@@ -1615,6 +1650,8 @@ class LauncherWindow(QMainWindow):
         menu.addAction(self.cli_update_preference)
         menu.addAction("Tema da interface…", self.choose_theme)
         menu.addAction("Instruções e comandos…", self.show_instructions)
+        if release_notes_available():
+            menu.addAction("O que mudou nesta versão…", self.show_release_notes)
         self.options.setMenu(menu)
         status_row.addWidget(self.options)
         top.add(status_box, 0, Qt.AlignmentFlag.AlignLeft)
@@ -3378,8 +3415,15 @@ class LauncherWindow(QMainWindow):
         except OSError as error:
             self.show_warning(f"Não foi possível guardar a versão vista em {RELEASE_SEEN}: {error}", origin="novidades")
             return
-        self.release_notes_dialog = InstructionsDialog(self, notes=True)
+        self.show_release_notes()
+
+    def show_release_notes(self):
+        """A nota da versão instalada ("O que mudou"): uma janela só, o clique seguinte traz a que já existe para a frente."""
+        if getattr(self, "release_notes_dialog", None) is None:
+            self.release_notes_dialog = InstructionsDialog(self, notes=True)
         self.release_notes_dialog.show()
+        self.release_notes_dialog.raise_()
+        self.release_notes_dialog.activateWindow()
 
     def show_usage(self):
         current = profiles.profile_of_home(self.store.home, self.profile_base)

@@ -245,7 +245,7 @@ o resultado de cada uma (ok, chave recusada, host fora do ar, cota esgotada, agu
 as outras. **Copiar lista** copia nome, conector, endereço, padrão e estado de cada conexão, separados por tabulação; a chave
 nunca vai junto.
 Conexão usada pelo VS Code ou pelo Copilot app mostra o endpoint local dela: porta, rodando ou parado, requisições,
-**Iniciar/Parar** e **Iniciar com o Windows**; **Copiar endereço** copia o endereço base do endpoint (sem chave: o endpoint acrescenta a credencial) para colar no campo de endereço de outra ferramenta, e fica desabilitado com o endpoint parado; **Copiar configuração** (menu **PowerShell** ou **cmd**, também desabilitado com o endpoint parado) copia as variáveis de ambiente para outra ferramenta usar o endpoint, só dos protocolos que a conexão serve: `ANTHROPIC_BASE_URL` com o endereço sem `/v1` e `ANTHROPIC_API_KEY` (Messages), `OPENAI_BASE_URL` com o endereço terminado em `/v1` e `OPENAI_API_KEY` (Responses e Chat Completions); a chave é um texto fixo sem valor (o endpoint descarta a do cliente e acrescenta a da conexão), e o endereço copiado antes continua igual; **Ver log** abre o fim do `endpoint.log` do perfil, sem corpo nem chave, com Atualizar e Copiar, e um **resumo** acima do log (pedidos, erros 4xx e 5xx, failovers feitos e não feitos, latência média e maior, e os cinco modelos mais usados com pedidos, erros e latência), calculado só sobre as linhas mostradas: o log tem teto de tamanho e guarda só o fim, então o resumo não cobre o que já saiu dele; o texto do log e o Copiar não mudam. Abaixo da lista, **Conexão reserva** escolhe a conexão que o endpoint local
+**Iniciar/Parar** e **Iniciar com o Windows**; **Copiar endereço** copia o endereço base do endpoint (sem chave: o endpoint acrescenta a credencial) para colar no campo de endereço de outra ferramenta, e fica desabilitado com o endpoint parado; **Copiar configuração** (menu **PowerShell** ou **cmd**, também desabilitado com o endpoint parado) copia as variáveis de ambiente para outra ferramenta usar o endpoint, só dos protocolos que a conexão serve: `ANTHROPIC_BASE_URL` com o endereço sem `/v1` e `ANTHROPIC_API_KEY` (Messages), `OPENAI_BASE_URL` com o endereço terminado em `/v1` e `OPENAI_API_KEY` (Responses e Chat Completions); a chave é um texto fixo sem valor (o endpoint descarta a do cliente e acrescenta a da conexão), e o endereço copiado antes continua igual; os dois botões desabilitados dizem na dica "Inicie o endpoint"; **Iniciar e copiar** (menu **PowerShell** ou **cmd**, sempre habilitado fora de uma ação em andamento) sobe o endpoint se ele estiver parado e copia a mesma configuração, e com o endpoint rodando só copia; se o endpoint não subir, a faixa do painel mostra o motivo e nada é copiado; **Ver log** abre o fim do `endpoint.log` do perfil, sem corpo nem chave, com Atualizar e Copiar, e um **resumo** acima do log (pedidos, erros 4xx e 5xx, failovers feitos e não feitos, latência média e maior, e os cinco modelos mais usados com pedidos, erros e latência), calculado só sobre as linhas mostradas: o log tem teto de tamanho e guarda só o fim, então o resumo não cobre o que já saiu dele; o texto do log e o Copiar não mudam. Abaixo da lista, **Conexão reserva** escolhe a conexão que o endpoint local
 usa quando a selecionada fica sem cota; salvar grava na hora, e ao reabrir a tela o seletor mostra o valor gravado.
 
 | Conector | Claude Code | Codex | Modelos | Contexto |
@@ -295,6 +295,7 @@ launcher connections add --name "Meu proxy" --connector litellm --set base_url=h
 $env:OR_KEY = "sk-or-..."; launcher connections add --name OpenRouter --connector openrouter --secret-env api_key=OR_KEY
 launcher connections default "Meu proxy"
 launcher connections test OpenRouter
+launcher connections test   # sem o nome, testa todas as conexões, uma a uma, e diz o resultado de cada; código 1 se alguma falhou
 launcher connections --set-fallback "Meu proxy" --to OpenRouter   # reserva usada pelo endpoint local se a cota acabar
 launcher connections --clear-fallback "Meu proxy"
 launcher connections --endpoint-sessions on --connection "Meu proxy"   # Claude Code e Codex pelo endpoint local (off volta ao direto)
@@ -572,6 +573,8 @@ launcher models test openai/gpt-6 --connection OpenRouter [--yes]   # chamada re
 launcher launch --project "Meu app" --connection OpenRouter --cli codex --model "openai/gpt-6" --dry-run
 launcher launch --project "Meu app" --resume
 launcher conversations --project "Meu app" --cli claude                        # JSON das conversas, mais recente primeiro
+cd "C:\caminho\do\projeto"; launcher conversations   # sem --project (em conversations e launch) vale o projeto cadastrado da pasta atual
+launcher conversations --search janela   # só as conversas com o texto no título, no CLI ou na data (sem distinguir maiúsculas)
 launcher sessions --reopen --dry-run [--hours 48]   # JSON do que reabriria (padrão 24 h): projeto, CLI, conversa, e o motivo da linha que não abre
 launcher sessions --reopen [--hours 48]   # reabre todas as que têm conversa identificada, como abas em segundo plano; código 1 se alguma aba falhar
 launcher conversations --project "Meu app" --command 1 --model "vertex_ai.anthropic.claude-opus-5-5"   # comando do cmd que retoma a conversa 1 (ou o ID), sem a chave
@@ -580,9 +583,11 @@ launcher launch --project "Meu app" --cli vscode --model "azure.gpt-5.4-mini"   
 launcher endpoint                # endpoint local de cada conexão (start, stop, autostart [--off])
 launcher endpoint logs --connection OpenRouter --lines 100   # fim do endpoint.log (padrão 50 linhas; o log é único por perfil, --connection só confere o nome e não filtra)
 launcher usage --all --tsv --month 2026-11   # uso do mês de todos os perfis, texto de planilha
+launcher usage --months 6   # o total de cada um dos 6 últimos meses (1 a 24), do corrente para trás (JSON; com --all soma os perfis)
 launcher usage --by-source --connection Central --month 2026-11 --tsv   # custo do mês por fonte, como o conector informa (JSON sem --tsv); só em conector com a rota costs
 launcher usage --limit 100,50    # teto de gasto do mês deste perfil (US$); off desliga; a janela só avisa a 80% e 100%
 launcher status                # um JSON: CLIs, conexões (cota), endpoint, sessões abertas, projetos e uso do mês; sem chaves
+launcher completion powershell >> $PROFILE   # Tab completa comandos, opções, CLIs, projetos e conexões no PowerShell
 launcher cli --install vscode    # qualquer ferramenta por usuário: claude, codex, copilot, vscode, copilot_app
 launcher cli --update all        # atualiza as CLIs instaladas (adia com sessão aberta)
 launcher update                # atualiza agora pelo engine-registry (--check só consulta)

@@ -197,12 +197,21 @@ def atomic_json(path: Path, data: dict) -> None:
 
 def atomic_text(path: Path, text: str, encoding: str = "utf-8") -> None:
     """Grava por temporário de nome próprio (vários processos escrevem o mesmo arquivo) e rename com retry."""
+    _atomic_write(path, text, "w", encoding=encoding)
+
+
+def atomic_bytes(path: Path, data: bytes) -> None:
+    """Como `atomic_text`, para conteúdo binário (sem tradução de quebra de linha)."""
+    _atomic_write(path, data, "wb")
+
+
+def _atomic_write(path: Path, content, mode: str, **options) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     import tempfile
     descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(descriptor, "w", encoding=encoding) as stream:
-            stream.write(text)
+        with os.fdopen(descriptor, mode, **options) as stream:
+            stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
         replace_retrying(temporary, path)

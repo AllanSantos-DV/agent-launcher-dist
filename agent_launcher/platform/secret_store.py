@@ -15,14 +15,17 @@ barreira contra código rodando *como o próprio usuário*: esse código chama
 A garantia vale por arquivo, não pelo segredo: enquanto o mesmo valor existir em outro
 arquivo desprotegido, quem copia a pasta pega a cópia mais fácil.
 
-Formato gravado: texto com o PREFIX seguido do base64 do blob, entropia nula, escopo do usuário.
-Na leitura também vale o blob cru (o arquivo inteiro é o blob, como grava o `WindowsDpapi` do
-native-java e o `ProtectedData` do .NET com a mesma entropia nula): o blob é o mesmo, só muda o
-invólucro.
+Formato do arquivo do cofre: o blob DPAPI cru é o arquivo inteiro (entropia nula, escopo do usuário), o mesmo
+dos produtos que o compartilham (native-java, .NET). `write_file` grava assim. Na leitura vale também o texto com o
+PREFIX seguido do base64 do mesmo blob, forma dos cofres antigos e a que cabe dentro de um JSON como o `secrets.json`;
+`migrate_file` regrava um arquivo antigo como blob cru.
 """
 import base64
+import binascii
 import os
 from pathlib import Path
+
+from agent_launcher.domain.files import atomic_bytes, file_lock
 
 PREFIX = "dpapi:v1:"
 _PREFIX_BYTES = PREFIX.encode("ascii")
@@ -94,6 +97,26 @@ def is_protected(stored):
     return isinstance(stored, str) and stored.startswith(PREFIX)
 
 
+def text_to_blob(text):
+    """Blob cru de um valor em texto `PREFIX` + base64; recusa prefixo ausente, base64 inválido e blob vazio."""
+    if not isinstance(text, str) or not text.startswith(PREFIX):
+        raise SecretProtectionError(f"O texto do cofre precisa começar por {PREFIX}.")
+    try:
+        blob = base64.b64decode(text[len(PREFIX):], validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise SecretProtectionError(f"Segredo protegido com base64 inválido ({exc}).")
+    if not blob:
+        raise SecretProtectionError("O segredo protegido não traz nenhum blob DPAPI.")
+    return blob
+
+
+def blob_to_text(blob):
+    """Valor em texto `PREFIX` + base64 de um blob cru; recusa blob vazio."""
+    if not blob:
+        raise SecretProtectionError("O blob DPAPI está vazio.")
+    return PREFIX + base64.b64encode(bytes(blob)).decode("ascii")
+
+
 def protect(plaintext):
     """Forma de armazenamento do segredo. Idempotente: um valor já protegido volta como
     está, pra regravar a config não cifrar duas vezes."""
@@ -103,8 +126,7 @@ def protect(plaintext):
         return plaintext
     if not available():
         raise SecretProtectionError("DPAPI indisponível nesta plataforma; segredos só podem ser gravados no Windows.")
-    blob = _crypt("CryptProtectData", plaintext.encode("utf-8"))
-    stored = PREFIX + base64.b64encode(blob).decode("ascii")
+    stored = blob_to_text(_crypt("CryptProtectData", plaintext.encode("utf-8")))
     # Invariante: nunca devolver uma forma de armazenamento que não volte a ser o segredo
     # original — quem chama grava isto em lugar do texto puro.
     if unprotect(stored) != plaintext:
@@ -123,11 +145,7 @@ def unprotect(stored):
         return stored
     if not available():
         raise SecretProtectionError("O segredo está protegido por DPAPI, indisponível nesta plataforma.")
-    try:
-        blob = base64.b64decode(stored[len(PREFIX):], validate=True)
-    except (ValueError, TypeError) as exc:
-        raise SecretProtectionError(f"Segredo protegido com base64 inválido ({exc}).")
-    return _crypt("CryptUnprotectData", blob).decode("utf-8", "replace")
+    return _crypt("CryptUnprotectData", text_to_blob(stored)).decode("utf-8", "replace")
 
 
 def is_raw_blob(data):
@@ -144,9 +162,47 @@ def unprotect_raw(blob):
     return _crypt("CryptUnprotectData", bytes(blob)).decode("utf-8", "replace")
 
 
+def write_file(path, plaintext):
+    """Grava o segredo como arquivo do cofre: o blob DPAPI cru, por troca atômica."""
+    if not plaintext:
+        raise SecretProtectionError("Não há segredo para gravar no cofre.")
+    if is_protected(plaintext):
+        raise SecretProtectionError("O segredo já está na forma de texto protegido; grave o valor em claro.")
+    if not available():
+        raise SecretProtectionError("DPAPI indisponível nesta plataforma; segredos só podem ser gravados no Windows.")
+    blob = _crypt("CryptProtectData", plaintext.encode("utf-8"))
+    if unprotect_raw(blob) != plaintext:
+        raise SecretProtectionError("DPAPI não devolveu o mesmo valor ao decifrar o que acabou de cifrar.")
+    atomic_bytes(Path(path), blob)
+
+
+def migrate_file(path):
+    """Regrava como blob cru um arquivo do cofre em texto `PREFIX` + base64 (o mesmo blob, sem decifrar).
+    Devolve se regravou: blob cru, texto em claro de antes da proteção e arquivo ausente ficam como estão."""
+    path = Path(path)
+    with file_lock(path):
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            return False
+        if is_raw_blob(data):
+            return False
+        try:
+            text = data.decode("utf-8-sig").strip()
+        except UnicodeDecodeError:
+            raise SecretProtectionError(f"{path}: nem texto UTF-8 nem blob DPAPI.")
+        if not is_protected(text):
+            return False
+        blob = text_to_blob(text)
+        if not is_raw_blob(blob):
+            raise SecretProtectionError(f"{path}: o texto protegido não traz um blob DPAPI.")
+        atomic_bytes(path, blob)
+        return True
+
+
 def read_file(path):
-    """Segredo de um arquivo do cofre em qualquer dos dois formatos: o texto PREFIX + base64 que o
-    Launcher grava ou o blob cru que o native-java grava. Texto sem prefixo volta como está (legado em claro)."""
+    """Segredo de um arquivo do cofre em qualquer dos dois formatos: o blob cru que os produtos gravam ou o texto
+    PREFIX + base64 dos cofres antigos. Texto sem prefixo volta como está (legado em claro)."""
     data = Path(path).read_bytes()
     if is_raw_blob(data):
         return unprotect_raw(data)

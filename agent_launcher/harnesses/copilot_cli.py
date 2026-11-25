@@ -133,7 +133,8 @@ class CopilotCli(Harness):
                 f"Protocolo: {names.get(protocol, '?')} • ID conhecido pelo Copilot: {known_model_id(record.id)}")
 
     def command_for(self, path: Path, repair: bool = True) -> list[str]:
-        return npm_cli_command(path, "@github/copilot/npm-loader.js")
+        native = installers.copilot_platform_binary(path)
+        return [str(native)] if native else npm_cli_command(path, "@github/copilot/npm-loader.js")
 
     def protocol(self, gateway, selected: ModelInfo, catalog: Catalog) -> str:
         protocol = protocol_for(selected, gateway.protocols, gateway.any_model, self.CONSUMES)

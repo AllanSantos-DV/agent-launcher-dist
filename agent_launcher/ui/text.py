@@ -25,8 +25,12 @@ from agent_launcher.session import reopen
 from agent_launcher.session.conversations import conversations_for, record_session
 from agent_launcher.session.plan import quota_notice
 from agent_launcher.session.preview import RESUME_SHELLS, plan_command, plan_report, planned, resume_command
+from agent_launcher.ui import completion
 from agent_launcher.update import updater
 from version import APP_NAME, VERSION
+
+
+MAX_USAGE_MONTHS = 24
 
 
 def destinations() -> tuple[str, ...]:
@@ -143,6 +147,20 @@ def warn_shared(store: Store, project: dict, resume: bool = False) -> None:
     if warning:
         extra = " Retomar usa só as conversas abertas neste perfil." if resume else ""
         print(f"Aviso: {warning}{extra}", file=sys.stderr)
+
+
+def test_all_connections(store: Store) -> int:
+    """Testa uma a uma, sem parar na primeira que falha, e diz o resultado de cada. Devolve 1 se alguma falhou."""
+    failed = 0
+    for connection in store.connections:
+        try:
+            Gateway(store, connection).verify()
+        except LauncherError as error:
+            print(f"{connection['name']}: falhou: {' '.join(str(error).split())}")
+            failed = 1
+        else:
+            print(f"{connection['name']}: respondeu")
+    return failed
 
 
 def report_cleanup(messages) -> int:
@@ -411,9 +429,14 @@ def conversation_usages(home: Path, conversations: list) -> dict:
     return found
 
 
-def list_conversations(store: Store, project: dict, cli: str | None = None) -> list[dict]:
-    """As conversas de found_conversations com o contexto e o custo estimado de cada uma."""
+def list_conversations(store: Store, project: dict, cli: str | None = None, search: str = "") -> list[dict]:
+    """As conversas de found_conversations com o contexto e o custo estimado de cada uma; `search` fica só com as que
+    têm o texto no título, no CLI ou na data (a mesma regra do filtro da janela de conversas)."""
     found = found_conversations(store, project, cli)
+    query = search.strip().casefold()
+    if query:
+        found = [item for item in found if query in " ".join(
+            (item.as_json()["updated"], item.cli, item.title)).casefold()]
     used = conversation_usages(store.home, found)
     return [{**item.as_json(), "context_tokens": used[item.id].context,
              "cost_usd": None if used[item.id].cost is None else round(used[item.id].cost, 6)} for item in found]
@@ -726,7 +749,13 @@ def endpoint_command(store: Store, options) -> int:
     if not options.connection:
         raise LauncherError("Informe --connection.")
     connection = store.find_connection(options.connection)
-    if options.endpoint_action == "start":
+    if options.endpoint_action == "config":
+        state = endpoints.status(store.home, [connection])[0]
+        if not state["running"]:
+            raise LauncherError(f"O endpoint de {connection['name']} está parado: suba com "
+                                f"'endpoint start --connection \"{connection['name']}\"' e peça de novo.")
+        print(endpoints.connection_config(store.home, connection["id"], state["port"], options.shell))
+    elif options.endpoint_action == "start":
         port = endpoints.ensure_running(store.home, connection["id"])
         print(f"Endpoint local de {connection['name']}: http://127.0.0.1:{port}/v1")
     elif options.endpoint_action == "stop":
@@ -852,8 +881,9 @@ def menu(store: Store) -> int:
             print(f"\nNão foi possível concluir: {error}")
 
 
-def parse_values(module, pairs: list[str], secret_env: list[str]) -> dict:
-    """--set campo=valor para campos comuns; --secret-env campo=VARIAVEL lê o segredo do ambiente (fora do histórico)."""
+def parse_values(module, pairs: list[str], secret_env: list[str], prompt: bool = True) -> dict:
+    """--set campo=valor para campos comuns; --secret-env campo=VARIAVEL lê o segredo do ambiente (fora do histórico). Com
+    prompt, o segredo obrigatório que faltou é pedido no terminal."""
     fields = {item["name"]: item for item in module.FIELDS}
     values = {}
     for pair, secret in [(pair, False) for pair in pairs] + [(pair, True) for pair in secret_env]:
@@ -871,7 +901,7 @@ def parse_values(module, pairs: list[str], secret_env: list[str]) -> dict:
         else:
             values[key] = value
     for key, item in fields.items():
-        if item.get("secret") and item.get("required") and key not in values and sys.stdin.isatty():
+        if item.get("secret") and item.get("required") and key not in values and prompt and sys.stdin.isatty():
             values[key] = getpass.getpass(f"{item['label']} (oculto): ")
     return values
 
@@ -892,6 +922,21 @@ def usage_by_source_command(store, options) -> int:
     return 0
 
 
+def usage_months_command(store, options) -> int:
+    """`usage --months N`: uma linha com mês, moeda e total por mês, do corrente para trás, do perfil (ou de todos)."""
+    if not 1 <= options.months <= MAX_USAGE_MONTHS:
+        raise LauncherError(f"--months aceita de 1 a {MAX_USAGE_MONTHS}.")
+    if options.month or options.tsv or options.by_source:
+        raise LauncherError("--months lista os totais por mês; não combina com --month, --tsv nem --by-source.")
+    build = usage.usage_report_all if options.all else usage.usage_report
+    rows = []
+    for month in usage.recent_months(options.months):
+        report = build(store.home, month)
+        rows.append({"month": month, "currency": report["currency"], "total": report["total"]})
+    print(json.dumps(rows, ensure_ascii=False, indent=1))
+    return 0
+
+
 def usage_command(store, options) -> int:
     """`launcher usage [--month AAAA-MM] [--all] [--tsv]`: estimativa local de uso do perfil (ou de todos), em JSON ou
     no texto separado por tabulação que o "Copiar relatório" da interface copia. Com o teto mensal ligado, o JSON do
@@ -903,6 +948,8 @@ def usage_command(store, options) -> int:
         store.set_monthly_limit(value)
         print("Limite mensal desligado." if value is None else f"Limite mensal: {usage.money(value)}.")
         return 0
+    if options.months is not None:
+        return usage_months_command(store, options)
     if options.by_source:
         return usage_by_source_command(store, options)
     try:
@@ -961,14 +1008,20 @@ def endpoint_log(store: Store, options) -> int:
         raise LauncherError("--lines precisa ser 1 ou mais.")
     if options.connection:
         store.find_connection(options.connection)
+    if options.json and not options.summary:
+        raise LauncherError("--json em logs só vale com --summary.")
+    from agent_launcher.endpoint import registry as endpoints
     path = store.home / "endpoint.log"
     if not path.is_file():
+        if options.json:
+            print(json.dumps(endpoints.summarize_log(""), ensure_ascii=False, indent=2))
+            return 0
         print(f"{path} ainda não existe: o endpoint local não registrou nenhum pedido neste perfil.")
         return 0
-    from agent_launcher.endpoint import registry as endpoints
     lines = [endpoints.read_log(store.home, options.lines)]
     if options.summary:
-        lines = [endpoints.summary_text(endpoints.summarize_log(lines[0]))]
+        summary = endpoints.summarize_log(lines[0])
+        lines = [json.dumps(summary, ensure_ascii=False, indent=2) if options.json else endpoints.summary_text(summary)]
     if options.connection:  # as linhas não trazem a conexão (só os 8 primeiros do id nas de pedido): não dá para filtrar
         print("o log é único por perfil; mostrando todas as linhas", file=sys.stderr)
     print("\n".join(lines))
@@ -1024,10 +1077,19 @@ def parser() -> argparse.ArgumentParser:
     for name, help_text in (("test", "Testar a conexão"), ("remove", "Remover a conexão e sua chave"),
                             ("default", "Tornar a conexão padrão")):
         sub = connection_actions.add_parser(name, help=help_text)
-        sub.add_argument("reference")
+        if name == "test":
+            sub.add_argument("reference", nargs="?", help="Nome ou ID; omitido testa todas as conexões")
+        else:
+            sub.add_argument("reference")
         if name == "remove":
             sub.add_argument("--clean-destinations", action="store_true",
                              help="remove também o provider no Copilot app e no VS Code e para/libera o endpoint local")
+    duplicate_connection = connection_actions.add_parser(
+        "duplicate", help="Criar uma conexão nova com os campos de outra (a chave não é copiada: informe a da segunda conta)")
+    duplicate_connection.add_argument("reference", metavar="CONEXAO", help="Id ou nome da conexão de origem")
+    duplicate_connection.add_argument("--name", required=True, help="Nome da conexão nova")
+    duplicate_connection.add_argument("--secret-env", action="append", default=[], metavar="CAMPO=VARIAVEL",
+                                      help="a chave da conta nova, lida da variável de ambiente")
     export_connection = connection_actions.add_parser(
         "export", help="Exportar uma conexão para um arquivo .alprofile, sem a chave (para passar a um colega)")
     export_connection.add_argument("reference", metavar="CONEXAO", help="Id ou nome da conexão")
@@ -1061,6 +1123,8 @@ def parser() -> argparse.ArgumentParser:
     edit.add_argument("reference", help="Nome, ID ou caminho")
     edit.add_argument("--name")
     edit.add_argument("--path")
+    edit.add_argument("--pin", action="store_true", help="Fixar o projeto no topo da lista")
+    edit.add_argument("--unpin", action="store_true", help="Tirar o projeto do topo da lista")
     remove = actions.add_parser("remove", help="Remover cadastro, sem excluir a pasta")
     remove.add_argument("reference", help="Nome, ID ou caminho")
     actions.add_parser("list", help="Listar os projetos (JSON)")
@@ -1077,8 +1141,11 @@ def parser() -> argparse.ArgumentParser:
                              help="atualiza o CLI instalado (o `update` da própria CLI, npm ou winget; adia com sessão aberta)")
     endpoint = commands.add_parser("endpoint", help="Endpoint local das conexões (VS Code e Copilot app): situação, "
                                                     "subir, parar, iniciar com o Windows")
-    endpoint.add_argument("endpoint_action", nargs="?", choices=("status", "start", "stop", "autostart", "logs"),
+    endpoint.add_argument("endpoint_action", nargs="?", choices=("status", "start", "stop", "autostart", "logs", "config"),
                           default="status")
+    endpoint.add_argument("--shell", choices=("powershell", "cmd"), default="powershell",
+                          help="com config: o shell das variáveis de ambiente (padrão powershell)")
+    endpoint.add_argument("--json", action="store_true", help="com logs --summary: o resumo em JSON")
     endpoint.add_argument("--connection", help="Nome ou ID da conexão (padrão: todas no status, obrigatório nas outras; "
                                                "em logs só confere o nome: o log é um por perfil)")
     endpoint.add_argument("--off", action="store_true", help="com autostart: desliga")
@@ -1139,6 +1206,8 @@ def parser() -> argparse.ArgumentParser:
                                                      "(JSON; --all soma os perfis, --tsv imprime o texto do 'Copiar relatório')")
     usage_parser.add_argument("--month", metavar="AAAA-MM", help="Mês (padrão: o atual)")
     usage_parser.add_argument("--all", action="store_true", help="soma de todos os perfis, no mesmo formato")
+    usage_parser.add_argument("--months", type=int, metavar="N",
+                              help="o total de cada um dos N últimos meses (1 a 24), do corrente para trás (JSON)")
     usage_parser.add_argument("--tsv", action="store_true",
                               help="o relatório em texto separado por tabulação, o mesmo que a interface copia")
     usage_parser.add_argument("--by-source", action="store_true",
@@ -1155,8 +1224,10 @@ def parser() -> argparse.ArgumentParser:
     update.add_argument("--check", action="store_true", help="só mostra se há versão nova, sem instalar")
     talks = commands.add_parser("conversations", help="Conversas dos CLIs de terminal na pasta do projeto (JSON, mais "
                                 "recente primeiro; pasta em outro perfil: só as deste perfil)")
-    talks.add_argument("--project", required=True, help="Nome, ID ou caminho de projeto cadastrado")
+    talks.add_argument("--project", help="Nome, ID ou caminho de projeto cadastrado; omitido usa a pasta atual")
     talks.add_argument("--cli", choices=terminal_destinations())
+    talks.add_argument("--search", metavar="TEXTO", default="",
+                       help="Só as conversas com o texto no título, no CLI ou na data (sem distinguir maiúsculas)")
     talks.add_argument("--command", metavar="ID_OU_POSIÇÃO",
                        help="Em vez da lista, imprimir o comando que retoma esta conversa fora do launcher, com a "
                             "pasta, o ambiente e o modelo da conexão; a chave nunca vai no texto. Posição: 1 é a mais "
@@ -1165,6 +1236,9 @@ def parser() -> argparse.ArgumentParser:
                        help="Com --command: o shell em que o texto será colado (padrão: cmd)")
     talks.add_argument("--connection", help="Com --command: nome ou ID; omitido usa a última do projeto ou a padrão")
     talks.add_argument("--model", help="Com --command: ID completo; omitido usa o último modelo desse CLI/projeto/conexão")
+    complete = commands.add_parser("completion", help="Completar com Tab: 'powershell' imprime o script para o perfil; "
+                                   "'projects' e 'connections' listam os nomes, um por linha")
+    complete.add_argument("kind", choices=("powershell", "projects", "connections"))
     recent = commands.add_parser("sessions", help="Sessões das últimas horas: --reopen reabre as que não estão abertas, "
                                                   "cada uma na conversa exata, como abas da janela única")
     recent.add_argument("--reopen", action="store_true", help="Reabrir as sessões das últimas horas que não estão abertas")
@@ -1173,7 +1247,7 @@ def parser() -> argparse.ArgumentParser:
     recent.add_argument("--dry-run", action="store_true",
                         help="Com --reopen: só listar o que abriria, em JSON (linhas sem conversa identificada vêm com o motivo)")
     session = commands.add_parser("launch", help="Iniciar um CLI no terminal atual (ou abrir VS Code / Copilot app)")
-    session.add_argument("--project", required=True, help="Nome, ID ou caminho de projeto cadastrado")
+    session.add_argument("--project", help="Nome, ID ou caminho de projeto cadastrado; omitido usa a pasta atual")
     session.add_argument("--connection", help="Nome ou ID; omitido usa a última do projeto ou a padrão")
     session.add_argument("--cli", choices=destinations())
     session.add_argument("--model", help="ID completo; omitido usa o último modelo desse CLI/projeto/conexão")
@@ -1275,9 +1349,20 @@ def main(arguments: list[str] | None = None) -> int:
                 status = connection.get("status") or {}
                 if status.get("state") == "quota_exhausted":
                     print(f"AVISO: cota esgotada, a conexão não está funcionando agora. {status.get('message', '')}")
+            elif action == "duplicate":
+                source = store.find_connection(options.reference)
+                modules, _errors = store.connectors()
+                if source["connector"] not in modules:
+                    raise LauncherError(f"Conector desconhecido: {source['connector']}. Veja 'connectors'.")
+                values = {**source.get("options", {}), **parse_values(modules[source["connector"]], [], options.secret_env, prompt=False)}
+                connection = store.save_connection(options.name, source["connector"], values)
+                print(f"Conexão criada a partir de {source['name']}: {connection['name']}")
             elif action == "test":
-                Gateway(store, store.find_connection(options.reference)).verify()
-                print("Conexão respondeu.")
+                if options.reference:
+                    Gateway(store, store.find_connection(options.reference)).verify()
+                    print("Conexão respondeu.")
+                else:
+                    cleanup_status |= test_all_connections(store)
             elif action == "remove":
                 if options.clean_destinations:
                     from agent_launcher.harnesses.cleanup import cleanup_destinations
@@ -1309,10 +1394,18 @@ def main(arguments: list[str] | None = None) -> int:
                 print(f"Projeto cadastrado: {project['name']}\n{project['path']}")
                 warn_shared(store, project)
             elif options.project_action == "edit":
+                if options.pin and options.unpin:
+                    raise LauncherError("Use --pin ou --unpin, não os dois.")
+                if options.name is None and options.path is None and not (options.pin or options.unpin):
+                    raise LauncherError("Informe --name, --path, --pin e/ou --unpin.")
                 if options.name is None and options.path is None:
-                    raise LauncherError("Informe --name e/ou --path.")
-                project = store.update(options.reference, options.name, options.path)
-                print(f"Projeto atualizado: {project['name']}\n{project['path']}")
+                    project = store.find(options.reference)
+                else:
+                    project = store.update(options.reference, options.name, options.path)
+                if options.pin or options.unpin:
+                    store.set_pinned(project, options.pin)
+                print(f"Projeto atualizado: {project['name']}\n{project['path']}"
+                      + ("\nFixado no topo da lista." if options.pin else "\nFora do topo da lista." if options.unpin else ""))
             elif options.project_action == "remove":
                 store.remove(options.reference)
                 print("Cadastro removido. A pasta do projeto foi preservada.")
@@ -1410,7 +1503,7 @@ def main(arguments: list[str] | None = None) -> int:
                 print(f"Atualização falhou: {error}")
                 return 1
         elif options.action == "launch":
-            project = store.find(options.project)
+            project = store.find(options.project or os.getcwd())
             gateway = Gateway.for_project(store, project, options.connection)
             last = store.last_cli(project)
             cli = options.cli or (last if last in gateway.clis else sorted(gateway.clis)[0])
@@ -1429,15 +1522,22 @@ def main(arguments: list[str] | None = None) -> int:
                           options.conversation, (options.shell or "cmd") if options.command else None)
         elif options.action == "sessions":
             return sessions_command(store, options)
+        elif options.action == "completion":
+            if options.kind == "powershell":
+                print(completion.powershell_script(parser()), end="")
+            else:
+                items = store.projects if options.kind == "projects" else store.connections
+                print("\n".join(item["name"] for item in items))
         elif options.action == "conversations":
-            project = store.find(options.project)
+            project = store.find(options.project or os.getcwd())
             if options.command:
                 print(conversation_command(store, project, options.command, options.cli, options.connection,
                                            options.model, options.shell or "cmd"))
             elif options.connection or options.model or options.shell:
                 raise LauncherError("--connection, --model e --shell só valem com --command.")
             else:
-                print(json.dumps(list_conversations(store, project, options.cli), ensure_ascii=False, indent=2))
+                print(json.dumps(list_conversations(store, project, options.cli, options.search), ensure_ascii=False,
+                                 indent=2))
         return cleanup_status
     except (LauncherError, OSError) as error:
         print(f"Erro: {error}", file=sys.stderr)

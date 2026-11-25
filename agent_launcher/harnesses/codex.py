@@ -36,6 +36,14 @@ def codex_options(plan: LaunchPlan) -> list[str]:
     return options
 
 
+def npm_managed_environment(executable: str) -> dict[str, str]:
+    """Variáveis que o `codex.js` do npm define antes de rodar o executável nativo (o Codex as usa na dica de
+    atualização); vazio quando o executável não está dentro do pacote do npm."""
+    for parent in Path(executable).parents:
+        if parent.name == "codex" and parent.parent.name == "@openai" and (parent / "bin" / "codex.js").is_file():
+            return {"CODEX_MANAGED_PACKAGE_ROOT": os.path.realpath(parent), "CODEX_MANAGED_BY_NPM": "1"}
+    return {}
+
 
 INTERACTIVE_SOURCES = ("cli", "vscode")  # sessões que o `codex resume --last` lista; exec e subagentes não
 CONTEXT_PREFIXES = ("<environment_context", "<user_instructions", "<permissions", "# AGENTS.md")  # injetadas pelo Codex
@@ -194,7 +202,8 @@ class Codex(Harness):
         return f"Entrada declarada: {budget} tokens", "Contexto informado pelo host. O Codex mantém sua margem interna."
 
     def command_for(self, path: Path, repair: bool = True) -> list[str]:
-        return npm_cli_command(path, "@openai/codex/bin/codex.js")
+        native = installers.codex_platform_binary(path)
+        return [str(native)] if native else npm_cli_command(path, "@openai/codex/bin/codex.js")
 
     def connection_url(self, gateway) -> str:
         return gateway.targets["codex"] or ""
@@ -244,7 +253,8 @@ class Codex(Harness):
             # pasta só para esta pasta cadastrada e só neste processo (tabela inline TOML; nada é gravado em disco).
             # Os hooks não usam bypass: approve_codex_hooks grava a confiança deles antes de abrir.
             command += ["-c", f"projects={{{json.dumps(str(context.directory), ensure_ascii=True)}={{trust_level=\"trusted\"}}}}"]
-        return LaunchPlan(self.ID, model, context.directory, command, context.environment, overrides, context.input_limit,
+        environment = {**context.environment, **npm_managed_environment(command[0])}
+        return LaunchPlan(self.ID, model, context.directory, command, environment, overrides, context.input_limit,
                           context_window, auto_compact_limit, {}, warnings, context.controlled, gateway.name,
                           () if context.endpoint else (CODEX_KEY_VARIABLE,), vision=selected.vision)
 

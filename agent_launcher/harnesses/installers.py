@@ -280,6 +280,17 @@ def codex_platform_binary(path: Path) -> Path | None:
                  if is_native(root / CODEX_PLATFORM)), None)
 
 
+def copilot_platform_binary(path: Path) -> Path | None:
+    """Copilot.exe do pacote da plataforma instalado pelo npm, dentro do pacote do CLI ou na pasta do escopo ao lado
+    dele (None se o pacote opcional não veio)."""
+    for root in _package_roots(path, "@github/copilot"):
+        for candidate in (root / "node_modules" / "@github" / "copilot-win32-x64" / "copilot.exe",
+                          root.parent / "copilot-win32-x64" / "copilot.exe"):
+            if is_native(candidate):
+                return candidate
+    return None
+
+
 class SignatureUnchecked(Exception):
     """O PowerShell não conseguiu conferir a assinatura (travou, não iniciou ou falhou): diferente de "sem assinatura"."""
 
