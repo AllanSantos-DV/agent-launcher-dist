@@ -27,7 +27,13 @@ UPDATE_TIMEOUT = 900
 
 
 class UpdateDeferred(CliInstallError):
-    """A tentativa de atualizar bateu num arquivo preso (sessão aberta no npm, por exemplo). Não é erro: tenta de novo depois."""
+    """A tentativa de atualizar bateu num arquivo preso (sessão aberta no npm, por exemplo). Não é erro: tenta de novo depois.
+    `reason` diz a causa para a tela: "sessions" (processo da CLI segura o arquivo), "locked" (arquivo da CLI preso por
+    outro processo) ou "other_window" (outra janela do launcher já atualiza)."""
+
+    def __init__(self, message: str, reason: str = "sessions"):
+        super().__init__(message)
+        self.reason = reason
 
 
 def disabled_by_env() -> bool:
@@ -212,7 +218,8 @@ def _executables(cli: str, path: str) -> list[Path]:
     found = [Path(path)] if Path(path).suffix.lower() == ".exe" else []
     try:
         extra = (installers.claude_binary(Path(path)) if cli == "claude"
-                 else installers.codex_platform_binary(Path(path)) if cli == "codex" else None)
+                 else installers.codex_platform_binary(Path(path)) if cli == "codex"
+                 else installers.copilot_platform_binary(Path(path)) if cli == "copilot" else None)
     except CliInstallError:
         extra = None
     if cli == "copilot":
@@ -230,23 +237,77 @@ def describe_running(found: list[tuple[int, str]]) -> str:
     return ", ".join(f"{Path(image).name} (PID {pid})" for pid, image in found[:3]) + (", …" if len(found) > 3 else "")
 
 
-# Sinais inequívocos de arquivo preso; "acesso negado" sozinho (prefixo do npm sem permissão, por exemplo) só adia quando
-# há processo da CLI de verdade rodando, senão é falha e vai para o log.
+# Falha de arquivo preso ou sem permissão. Só adia quando o texto da falha cita arquivo da própria instalação da CLI
+# (`_cites_own_files`): o mesmo texto sobre o cache do npm ou outro prefixo, ou um processo da CLI vivo que nada tem com
+# a falha, é falha de verdade e vai para o log.
 LOCKED = re.compile(r"EBUSY|being used by another process|WinError 32\b|resource busy|text file busy|em uso por outro processo",
                     re.IGNORECASE)
 DENIED = re.compile(r"EPERM|EACCES|Access is denied|WinError 5\b|acesso negado", re.IGNORECASE)
+CLEANUP_WARNING = re.compile(r"^[ \t]*npm[ \t]+warn[ \t]+cleanup\b.*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _cites_own_files(cli: str, path: str, text: str) -> bool:
+    """O texto da falha cita o executável da CLI ou algo dentro da pasta do pacote dela (inclusive a `.<pacote>-XXXX` que
+    o npm cria ao renomear). `text` vem sem as linhas `npm warn cleanup`: elas relatam sobras de outra tentativa, não
+    esta falha."""
+    def norm(value) -> str:
+        return str(value).replace("\\\\", "\\").replace("/", "\\").lower()
+    haystack = norm(text)
+    if re.search(rf"(?<![\w-]){re.escape(cli)}(-runtime)?\.exe", haystack):
+        return True
+    scope, name = NPM_PACKAGES[cli].split("/")
+    roots = {*installers._package_roots(Path(path), NPM_PACKAGES[cli]), Path(path).parent / "node_modules" / scope / name}
+    fragments = [norm(root) for root in roots] + [norm(root.parent / f".{name}-") for root in roots]
+    if cli == "copilot":
+        fragments.append(norm(Path.home() / ".copilot" / "pkg"))
+    return any(fragment in haystack for fragment in fragments)
 
 
 def lock_path(cli: str) -> Path:
     return data_home() / f"cli-update-{cli}.lock"
 
 
-def updating(cli: str) -> bool:
-    """Há atualização desta CLI em andamento (por esta ou outra janela do launcher): nenhuma sessão dela deve abrir agora."""
+def _stamp_lock(lock: Path) -> None:
+    """Grava na trava recém-adquirida o PID e a hora de início de quem atualiza, para `updating` saber se ele morreu."""
     try:
-        return time.time() - lock_path(cli).stat().st_mtime <= updater.LOCK_STALE_S
+        lock.write_text(json.dumps({"pid": os.getpid(), "started": time.time()}), encoding="utf-8")
+    except OSError as error:
+        installers.record(f"trava {lock} sem o PID de quem atualiza ({error}); vale pela idade, como as antigas.")
+
+
+def _lock_holder(lock: Path) -> tuple[int, float] | None:
+    """(pid, início) gravados na trava, ou None na trava sem eles (vazia, antiga ou ilegível)."""
+    try:
+        data = json.loads(lock.read_text(encoding="utf-8"))
+        pid, started = data["pid"], data["started"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return (pid, float(started)) if isinstance(pid, int) and isinstance(started, (int, float)) else None
+
+
+def _holder_died(lock: Path) -> bool:
+    """A trava tem PID gravado e esse processo já não roda (a vazia ou legada nunca é abandonada: vale pela idade)."""
+    holder = _lock_holder(lock)
+    if holder is None:
+        return False
+    from agent_launcher.platform import keys
+    return not keys.alive(*holder)
+
+
+def updating(cli: str) -> bool:
+    """Há atualização desta CLI em andamento (por esta ou outra janela do launcher): nenhuma sessão dela deve abrir agora.
+    A trava vale até `LOCK_STALE_S`, e antes disso só enquanto o processo que a gravou vive; sem PID gravado, só a idade."""
+    lock = lock_path(cli)
+    try:
+        if time.time() - lock.stat().st_mtime > updater.LOCK_STALE_S:
+            return False
     except OSError:
         return False
+    holder = _lock_holder(lock)
+    if holder is None:
+        return True
+    from agent_launcher.platform import keys
+    return keys.alive(*holder)
 
 
 def check(cli: str, latest=latest_version) -> dict | None:
@@ -298,8 +359,10 @@ def update(cli: str, latest=latest_version) -> dict:
     if before and updater.parts(target) <= updater.parts(before):
         return {"cli": cli, "before": before, "after": before, "updated": False}
     lock = lock_path(cli)
-    if not updater._lock(lock):
-        raise UpdateDeferred(f"Atualização do {NAMES[cli]} adiada: outra janela do launcher já está atualizando.")
+    if not updater._lock(lock, abandoned=_holder_died):
+        raise UpdateDeferred(f"Atualização do {NAMES[cli]} adiada: outra janela do launcher já está atualizando.",
+                             "other_window")
+    _stamp_lock(lock)
     taken = lock.stat().st_mtime_ns
     try:
         return _apply(cli, path, before, target, len(running(cli, path)))
@@ -352,13 +415,13 @@ def _apply(cli: str, path: str, before: str | None, target: str, sessions: int =
     result = _run_logged(cli, command(cli, path, origin, target))
     if origin == "npm" and cli != "copilot" and not result.returncode:
         clean_staging(cli, path)
-    output = result.stdout + "\n" + result.stderr
-    holders = running(cli, path) if result.returncode and (LOCKED.search(output) or DENIED.search(output)) else []
-    if result.returncode and (holders or LOCKED.search(output)):
+    output = CLEANUP_WARNING.sub("", result.stdout + "\n" + result.stderr)
+    if result.returncode and (LOCKED.search(output) or DENIED.search(output)) and _cites_own_files(cli, path, output):
+        holders = running(cli, path)
         raise UpdateDeferred(f"Atualização do {NAMES[cli]} adiada: "
                              + (f"{describe_running(holders)} está rodando e o arquivo está preso" if holders else
                                 "um arquivo da CLI está preso por outro processo")
-                             + ". Tento de novo na próxima verificação.")
+                             + ". Tento de novo na próxima verificação.", "sessions" if holders else "locked")
     if result.returncode:
         installers._fail(cli, "atualização", f"atualização do {NAMES[cli]} ({origin}) falhou: {installers._tail(result)}")
     path = installers.find(cli) or path

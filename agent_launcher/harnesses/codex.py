@@ -14,8 +14,9 @@ from agent_launcher.domain.catalog import Catalog, ModelInfo, base_model, codex_
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import atomic_json, path_key
 from agent_launcher.harnesses import installers
-from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines,
-                                           key_mcp_urls, npm_cli_command, parse_time, same_folder)
+from agent_launcher.harnesses.base import (Conversation, Harness, HistoryItem, conversation_title, count_lines,
+                                           head_lines, key_mcp_urls, npm_cli_command, parse_time, recorded_branch,
+                                           same_folder)
 from agent_launcher.platform.jobs import close_job, free_port, kill_with_parent, stop_tree
 from agent_launcher.session import controlled as controlled_state
 from agent_launcher.session.plan import LaunchPlan
@@ -142,12 +143,12 @@ def _counted_codex_line(line: bytes) -> bool:
             and not any(b'"text":"' + prefix.encode() in line for prefix in CONTEXT_PREFIXES))
 
 
-def codex_conversation(rollout: Path, payload: dict) -> Conversation | None:
+def codex_conversation(rollout: Path, payload: dict, detail: bool = True) -> Conversation | None:
     identifier = payload.get("id") or payload.get("session_id")
     if not isinstance(identifier, str) or not identifier:
         return None
     title = None
-    for line in head_lines(rollout)[1:]:
+    for line in head_lines(rollout)[1:] if detail else ():
         try:
             title = _codex_user_text(json.loads(line))
         except ValueError:
@@ -159,15 +160,18 @@ def codex_conversation(rollout: Path, payload: dict) -> Conversation | None:
     except OSError:
         return None
     started = parse_time(payload.get("timestamp") or payload.get("_timestamp"), status.st_ctime)
+    git = payload.get("git")
     return Conversation(identifier, "codex", started, max(status.st_mtime, started), conversation_title(title),
-                        count_lines(rollout, _counted_codex_line, b'"role":"user"'))
+                        count_lines(rollout, _counted_codex_line, b'"role":"user"') if detail else None,
+                        recorded_branch(git.get("branch") if isinstance(git, dict) else None))
+
 
 class Codex(Harness):
     ID = "codex"
     LABEL = "Codex"
     KIND = "terminal"
     CONSUMES = ("responses",)
-    CAPABILITIES = frozenset({"resume", "controlled", "keys", "bypass", "context_window"})
+    CAPABILITIES = frozenset({"resume", "fork", "controlled", "keys", "bypass", "context_window"})
     SUBTITLE = "OpenAI Responses"
     SYMBOL = "code"
     TAB_COLOR = "#10A37F"
@@ -238,7 +242,7 @@ class Codex(Harness):
             warnings.append("O catálogo não confirma suporte à API Responses; a compatibilidade precisa ser validada na sessão.")
         command += ["--no-daemon"]
         if context.resume:
-            command += ["resume", context.conversation or "--last"]
+            command += ["fork" if context.fork else "resume", context.conversation or "--last"]
         command += ["--model", model]
         command += (["--dangerously-bypass-approvals-and-sandbox"] if context.bypass_permissions else
                     ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"])
@@ -270,7 +274,7 @@ class Codex(Harness):
         return prepare_codex_command(plan, directory, self.command)
 
     def ensure_resumable(self, plan) -> None:
-        if plan.resume and plan.session_id:
+        if plan.resume and plan.session_id and not plan.fork:
             free_conversation(plan.session_id)
 
     def prepare(self, plan) -> None:
@@ -299,15 +303,26 @@ class Codex(Harness):
                 return True
         return False
 
-    def conversations(self, directory: Path) -> list[Conversation]:
+    def conversations(self, directory: Path, detail: bool = True) -> list[Conversation]:
         found = []
         for rollout in codex_sessions().glob("*/*/*/rollout-*.jsonl"):
             payload = _rollout_meta(rollout)
             if payload and same_folder(payload.get("cwd"), directory):
-                conversation = codex_conversation(rollout, payload)
+                conversation = codex_conversation(rollout, payload, detail)
                 if conversation:
                     found.append(conversation)
         return sorted(found, key=lambda item: item.updated, reverse=True)
+
+    def history(self) -> list[HistoryItem]:
+        """As conversas que `conversations` lista, de qualquer pasta: a pasta é o `cwd` da `session_meta`."""
+        items = []
+        for rollout in codex_sessions().glob("*/*/*/rollout-*.jsonl"):
+            payload = _rollout_meta(rollout)
+            cwd = payload.get("cwd") if payload else None
+            conversation = codex_conversation(rollout, payload, False) if isinstance(cwd, str) and cwd else None
+            if conversation:
+                items.append(HistoryItem(cwd, cwd, conversation))
+        return items
 
 
 HARNESS = Codex()

@@ -212,11 +212,12 @@ def _stale(path: Path) -> bool:
     return time.time() - path.stat().st_mtime > LOCK_STALE_S
 
 
-def _take_over(path: Path) -> bool:
+def _take_over(path: Path, abandoned=None) -> bool:
     """Remove a trava velha sem corrida: só quem segura a guarda apaga, e confere a idade de novo sob a guarda, senão dois
     processos veriam a mesma trava velha e o segundo apagaria a trava nova do primeiro. A guarda é um bloqueio do Windows
     no arquivo (o sistema o solta se o processo morrer), então nunca fica velha e ninguém precisa apagar guarda alheia:
-    apagar a de outro era a janela em que dois processos achavam que a seguravam."""
+    apagar a de outro era a janela em que dois processos achavam que a seguravam. `abandoned(path)` marca como velha, além
+    da idade, a trava cujo dono já morreu; é conferido também sob a guarda."""
     import msvcrt
     guard = path.with_name(path.name + ".takeover")
     try:
@@ -229,7 +230,7 @@ def _take_over(path: Path) -> bool:
         except OSError:
             return False  # outro processo segura a guarda
         try:
-            if _stale(path):
+            if _stale(path) or (abandoned is not None and abandoned(path)):
                 path.unlink()  # atualização anterior morreu no meio
             return True
         except FileNotFoundError:
@@ -246,15 +247,16 @@ def _take_over(path: Path) -> bool:
             pass
 
 
-def _lock(path: Path):
+def _lock(path: Path, abandoned=None):
+    """Adquire a trava `path`; a velha (ou, com `abandoned`, a de dono morto) é assumida. False quando outro a segura."""
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        stale = _stale(path)
+        stale = _stale(path) or (abandoned is not None and abandoned(path))
     except FileNotFoundError:
         stale = False
     except PermissionError:
         return False
-    if stale and not _take_over(path):
+    if stale and not _take_over(path, abandoned):
         return False
     try:
         os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))

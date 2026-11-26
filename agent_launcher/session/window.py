@@ -110,11 +110,13 @@ def terminal_tab(terminal_exe: str, title: str, color: str, window_command: list
 def start_session(store: Store, project: dict, cli: str, model: str, resume: bool = False,
                   bypass_permissions: bool = False, controlled: bool = False,
                   connection: str | None = None, background: bool | None = None,
-                  minimized: bool | None = None, conversation: str | None = None) -> subprocess.Popen | None:
+                  minimized: bool | None = None, conversation: str | None = None,
+                  worktree: str | None = None, fork: bool = False) -> subprocess.Popen | None:
     """Abre a janela da sessão. background (padrão: só nas sessões controladas) abre sem tirar o foco do teclado de
     quem está na frente e, com minimized (padrão: o mesmo que background), minimizada, sem cobrir nada na tela (o
     usuário a abre pela barra de tarefas); com a preferência sessions_secondary_monitor, a janela vai para outro
-    monitor, se houver."""
+    monitor, se houver. Com `worktree` (nome; vazio gera um), a sessão abre no worktree do projeto, criado aqui se
+    ainda não existe (session/worktree.py); a janela recebe o nome já resolvido."""
     if os.name != "nt":
         raise LauncherError("A abertura de janelas de sessão requer Windows.")
     harness = registry.get(cli)
@@ -130,8 +132,13 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
         print(f"Aviso: verificação de atualização não iniciou ({error}).", file=sys.stderr)
     directory = project_path(project["path"])
     gateway = Gateway.for_project(store, project, connection)
+    found = None
+    if worktree is not None:
+        from agent_launcher.session import worktree as worktrees
+        found = worktrees.ensure(directory, worktree)
     plan = build_plan(gateway, cli, str(directory), model, resume, gateway.catalog(offline=True),
-                      bypass_permissions=bypass_permissions, controlled=controlled, conversation=conversation)
+                      bypass_permissions=bypass_permissions, controlled=controlled, conversation=conversation,
+                      worktree=found, fork=fork)
     harness.ensure_resumable(plan)
     command = [str(console_python()), str(ROOT / "desktop.py"), "--home", str(store.home.resolve()),
                "--project", project["id"], "--connection", gateway.connection["id"], "--cli", cli, "--model", model]
@@ -140,10 +147,14 @@ def start_session(store: Store, project: dict, cli: str, model: str, resume: boo
         command.append("--resume")
     if resume and conversation:
         command += ["--conversation", conversation]
+    if fork:
+        command.append("--fork")
     if bypass_permissions:
         command.append("--bypass")
     if controlled:
         command.append("--controlled")
+    if found:
+        command += ["--worktree", found.name]
     if native_window:
         command.insert(0, str(native_window))
     background = controlled if background is None else background
@@ -179,10 +190,18 @@ def announce_wait(error: Exception, delay: float, attempt: int, attempts: int) -
 
 
 def prepare_session(store: Store, project: dict, title: str, cli: str, model: str, resume: bool,
-                    bypass_permissions: bool, controlled: bool, connection: str | None, conversation: str | None):
+                    bypass_permissions: bool, controlled: bool, connection: str | None, conversation: str | None,
+                    worktree: str | None = None, fork: bool = False):
     """Passo 1 da sessão: confere a conexão (com novas tentativas visíveis), monta e anuncia o plano, grava o registro
-    do perfil e prepara o destino. Devolve (adaptador, plano)."""
+    do perfil e prepara o destino. Com `worktree` (nome), o plano é o do worktree do projeto, reaproveitado ou criado.
+    Devolve (adaptador, plano)."""
+    found = None
+    if worktree is not None:
+        from agent_launcher.session import worktree as worktrees
+        found = worktrees.ensure(project["path"], worktree)
     print(f"\n  {title}\n  {project['path']}\n")
+    if found:
+        print(f"  Worktree: {found.path} (branch {found.branch})\n")
     gateway = Gateway.for_project(store, project, connection)
     harness = registry.get(cli)
     print(f"  Conexão: {gateway.name} • {harness.connection_url(gateway) or gateway.url}\n")
@@ -191,7 +210,7 @@ def prepare_session(store: Store, project: dict, title: str, cli: str, model: st
         print(f"  Aviso: {quota_notice(gateway, quota, cli)}\n")
     plan = build_plan(gateway, cli, project["path"], model, resume, gateway.catalog(), preserve_terminal_title=True,
                       bypass_permissions=bypass_permissions, controlled=controlled,
-                      admin_note=elevated.session_note(project), conversation=conversation)
+                      admin_note=elevated.session_note(project), conversation=conversation, worktree=found, fork=fork)
     for warning in plan.warnings:
         print(f"  Aviso: {warning}")
     record_session(store.home, project, gateway, plan)  # registro do perfil
@@ -201,7 +220,7 @@ def prepare_session(store: Store, project: dict, title: str, cli: str, model: st
 
 def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
                 bypass_permissions: bool = False, controlled: bool = False, connection: str | None = None,
-                conversation: str | None = None) -> int:
+                conversation: str | None = None, worktree: str | None = None, fork: bool = False) -> int:
     store = Store(home)
     project = store.find(reference)
     title = session_title(project, cli, store.home)
@@ -210,7 +229,7 @@ def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
     keys.register(os.getpid(), project["name"], project["id"], cli, title, controlled)  # para `launcher keys`
     try:
         harness, plan = prepare_session(store, project, title, cli, model, resume, bypass_permissions, controlled,
-                                        connection, conversation)
+                                        connection, conversation, worktree, fork)
         return harness.run(plan, project)
     finally:
         keys.unregister(os.getpid())
@@ -220,7 +239,7 @@ def run_session(home: Path, reference: str, cli: str, model: str, resume: bool,
 
 def hand_off_session(home: Path, reference: str, cli: str, model: str, resume: bool, handoff: int, host_pid: int,
                      bypass_permissions: bool = False, controlled: bool = False, connection: str | None = None,
-                     conversation: str | None = None) -> int:
+                     conversation: str | None = None, worktree: str | None = None, fork: bool = False) -> int:
     """Passo 1 para a janela nativa (sessao.exe): registra a sessão com o pid do host, planeja e entrega o plano pelo
     pipe herdado (handle `handoff`) para o host rodar o CLI; o host também desfaz o registro. Os arquivos do plano ficam
     na pasta estável do cache, compartilhada entre sessões, então `temp_dir` vai sempre nulo e o host não apaga nada.
@@ -233,7 +252,7 @@ def hand_off_session(home: Path, reference: str, cli: str, model: str, resume: b
     ctypes.windll.kernel32.SetConsoleTitleW(title)
     keys.register(host_pid, project["name"], project["id"], cli, title, controlled)  # para `launcher keys`
     harness, plan = prepare_session(store, project, title, cli, model, resume, bypass_permissions, controlled,
-                                    connection, conversation)
+                                    connection, conversation, worktree, fork)
     if harness.hosts_itself(plan):
         plan.window_pid = host_pid
         return harness.run(plan, project)
@@ -269,9 +288,12 @@ def main() -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--conversation", help="ID da conversa a retomar (com --resume); omitido retoma a última")
+    parser.add_argument("--fork", action="store_true", help="Com --resume e --conversation: retoma como cópia, numa conversa nova")
     parser.add_argument("--bypass", action="store_true", help="Ignora permissões; no Codex, também desativa o sandbox.")
     parser.add_argument("--controlled", action="store_true",
                         help="Sessão controlada por orquestrador (implica --bypass; Codex com app-server + TUI --remote).")
+    parser.add_argument("--worktree", metavar="NOME",
+                        help="Abre no worktree deste nome (pasta irmã do projeto), criado se não existir")
     parser.add_argument("--handoff", type=int, help=argparse.SUPPRESS)  # handle do pipe do plano (sessao.exe)
     parser.add_argument("--host-pid", type=int, help=argparse.SUPPRESS)  # pid do sessao.exe, dono do registro da sessão
     options = parser.parse_args()
@@ -282,10 +304,11 @@ def main() -> int:
         if handoff:
             result = hand_off_session(options.home, options.project, options.cli, options.model, options.resume,
                                       options.handoff, options.host_pid, options.bypass, options.controlled,
-                                      options.connection, options.conversation)
+                                      options.connection, options.conversation, options.worktree, options.fork)
         else:
             result = run_session(options.home, options.project, options.cli, options.model, options.resume,
-                                 options.bypass, options.controlled, options.connection, options.conversation)
+                                 options.bypass, options.controlled, options.connection, options.conversation,
+                                 options.worktree, options.fork)
     except (LauncherError, OSError, ValueError) as error:
         print(f"\n  Não foi possível iniciar a sessão: {error}")
         result = 1

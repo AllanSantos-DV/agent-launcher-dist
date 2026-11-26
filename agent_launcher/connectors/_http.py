@@ -91,6 +91,7 @@ def quota_suffix(payload: dict) -> str:
 def get_json(url: str, headers: dict | None = None, timeout: float = 15, quota=None) -> dict:
     """GET de JSON. `quota(status, corpo_do_erro)` diz quais respostas de erro são cota esgotada (QuotaExhausted) neste
     provedor; sem ele, todo status de erro é ConnectorError comum."""
+    import http.client
     import urllib.error
     import urllib.request
     request = urllib.request.Request(url, headers={"Accept": "application/json", **(headers or {})})
@@ -114,7 +115,7 @@ def get_json(url: str, headers: dict | None = None, timeout: float = 15, quota=N
         failure.status = error.code  # require_key_routing distingue 403/404 sem depender do texto
         failure.transient = error.code in TRANSIENT_STATUS
         raise failure from None
-    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException) as error:
         failure = ConnectorError(f"Sem resposta de {url}: {getattr(error, 'reason', error)}")
         failure.transient = True
         raise failure from None
@@ -129,6 +130,7 @@ def auth_probe(url: str, headers: dict, timeout: float = 15) -> None:
     """Confere a chave com um POST de corpo vazio: o host autentica antes de validar o corpo, então 401/403 é chave
     recusada, 502/503/504 ou sem resposta é host fora do ar (passageiro) e qualquer outro status (400 "Missing model"...)
     é chave aceita, sem gerar nenhuma resposta de modelo."""
+    import http.client
     import urllib.error
     import urllib.request
     request = urllib.request.Request(url, data=b"{}", headers={"Content-Type": "application/json", **headers},
@@ -144,7 +146,7 @@ def auth_probe(url: str, headers: dict, timeout: float = 15) -> None:
             failure.status = error.code
             failure.transient = error.code in TRANSIENT_STATUS
             raise failure from None
-    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException) as error:
         failure = ConnectorError(f"Sem resposta de {url}: {getattr(error, 'reason', error)}")
         failure.transient = True
         raise failure from None

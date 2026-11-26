@@ -20,16 +20,33 @@ REPORT_KEYS = ("cli", "project", "model", "connection", "connector", "targets", 
 
 
 def planned(home: Path, gateway, project_folder: str, cli: str, model: str, resume: bool, catalog: Catalog,
-            controlled: bool = False, conversation: str | None = None) -> LaunchPlan:
-    """O plano da sessão terminal; ao retomar, o aviso de conversa maior que a janela do modelo entra nos avisos."""
+            controlled: bool = False, conversation: str | None = None, worktree: agent_launcher.session.worktree.Worktree | None = None,
+            fork: bool = False) -> LaunchPlan:
+    """O plano da sessão terminal; ao retomar, o aviso de conversa maior que a janela do modelo entra nos avisos. Com
+    `worktree`, a sessão é a do worktree (veja build_plan)."""
     plan = build_plan(gateway, cli, project_folder, model, resume, catalog, controlled=controlled,
-                      conversation=conversation)
+                      conversation=conversation, worktree=worktree, fork=fork)
     if resume:
         warning = resume_window_warning(home, conversations_for(home, registry.get(cli), plan.directory), conversation,
                                         catalog.find(plan.model), catalog.verified)
         if warning:
             plan.warnings.append(warning)
     return plan
+
+
+def model_catalog(plan: LaunchPlan, catalog: Catalog) -> dict | None:
+    """Janela e preço por 1M de tokens (US$) que o host informou para o modelo do plano; None se não informou nada, para o
+    relatório não trazer zero nem janela inventados."""
+    record = catalog.find(plan.model)
+    if record is None:
+        return None
+
+    def per_million(value: float | None) -> float | None:
+        return None if value is None else round(value * 1_000_000, 6)
+
+    info = {"context_window": record.max_input_tokens, "input_per_million": per_million(record.input_cost_per_token),
+            "output_per_million": per_million(record.output_cost_per_token), "confirmed": catalog.verified}
+    return info if any(value is not None for key, value in info.items() if key != "confirmed") else None
 
 
 def plan_report(plan: LaunchPlan, gateway, resume: bool, catalog: Catalog) -> dict:
@@ -46,7 +63,22 @@ def plan_report(plan: LaunchPlan, gateway, resume: bool, catalog: Catalog) -> di
               "warnings": plan.warnings}
     if plan.endpoint:
         report["endpoint"] = plan.endpoint.url
+    if info := model_catalog(plan, catalog):
+        report["model_catalog"] = info
+    if plan.worktree:
+        report["worktree"] = plan.worktree.as_json()
     return report
+
+
+def catalog_line(info: dict | None) -> str:
+    """A linha do resumo com a janela e o preço do `model_catalog` do relatório; traço onde o host não informou."""
+    info = info or {}
+    window = info.get("context_window")
+    shown = "—" if window is None else token_label(window) + ("" if info.get("confirmed", True) else " (não confirmada)")
+    prices = [info.get("input_per_million"), info.get("output_per_million")]
+    price = "preço —" if all(value is None for value in prices) else (
+        "US$ " + "/".join("?" if value is None else f"{value:g}" for value in prices) + " por 1M (entrada/saída)")
+    return f"Janela e preço: janela {shown} • {price}"
 
 
 def plan_text(report: dict) -> str:
@@ -55,7 +87,10 @@ def plan_text(report: dict) -> str:
     lines = [f"{label} · {'retomar' if report['resume'] else 'nova sessão'}", "",
              f"Pasta:    {report['project']}", f"Modelo:   {report['model']}",
              f"Conexão:  {report['connection']} ({report['connector']})", f"Catálogo: {report['catalog_status']}",
-             f"Entrada informada: {token_label(report['input_limit'])}"]
+             f"Entrada informada: {token_label(report['input_limit'])}", catalog_line(report.get("model_catalog"))]
+    if report.get("worktree"):
+        found = report["worktree"]
+        lines.insert(3, f"Worktree: {found['branch']} ({'reaproveitado' if found['exists'] else 'novo'})")
     if report.get("endpoint"):
         lines.append(f"Endpoint local: {report['endpoint']} (a chave da conexão fica fora do ambiente da sessão)")
     if report.get("context_window") is not None:

@@ -11,9 +11,10 @@ from pathlib import Path
 from agent_launcher import ROOT
 from agent_launcher.domain import profiles, usage
 from agent_launcher.domain.cache import prune_old_versions
-from agent_launcher.domain.conversation_usage import conversation_usage
-from agent_launcher.domain.catalog import CLAUDE_FAMILIES, ModelInfo, base_model, token_label
+from agent_launcher.domain.conversation_usage import conversation_usage, conversations_tsv
+from agent_launcher.domain.catalog import CLAUDE_FAMILIES, ModelInfo, base_model, order_models, token_label
 from agent_launcher.domain.errors import LauncherError
+from agent_launcher.domain.files import project_path
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
 from agent_launcher.harnesses import cli_update
@@ -21,9 +22,11 @@ from agent_launcher.harnesses import installers as clis
 from agent_launcher.harnesses.installers import CliInstallError
 from agent_launcher.harnesses import registry
 from agent_launcher.platform import elevated, focus, keys, terminal
-from agent_launcher.session import reopen
+from agent_launcher.session import activity, open_session, reopen
+from agent_launcher.session.conversation_grep import grep_conversations
 from agent_launcher.session.conversations import conversations_for, record_session
 from agent_launcher.session.plan import quota_notice
+from agent_launcher.session import worktree as worktrees
 from agent_launcher.session.preview import RESUME_SHELLS, plan_command, plan_report, planned, resume_command
 from agent_launcher.ui import completion
 from agent_launcher.update import updater
@@ -31,6 +34,9 @@ from version import APP_NAME, VERSION
 
 
 MAX_USAGE_MONTHS = 24
+ADD_HERE_HELP = ("Se o projeto não está cadastrado, cadastra a pasta atual (com o nome da pasta) e segue; --project, se vier, "
+                 "tem de ser o nome ou o caminho da pasta atual. Recusa raiz de disco, pasta de usuário e pasta do sistema; "
+                 "projeto já cadastrado não é regravado")
 
 
 def destinations() -> tuple[str, ...]:
@@ -67,18 +73,103 @@ def show_projects(store: Store) -> None:
     for index, project in enumerate(store.projects, start=1):
         marker = " • recente" if project["id"] == store.data["last_project"] else ""
         missing = " • pasta indisponível" if not Path(project["path"]).is_dir() else ""
-        print(f"  {index:>2}. {project['name']}{marker}{missing}\n      {project['path']}")
+        is_git, branch = worktrees.current_branch(project["path"])
+        shown = f" • ramo {branch}" if branch else " • cabeça solta" if is_git else ""
+        print(f"  {index:>2}. {project['name']}{marker}{missing}{shown}\n      {project['path']}")
     if not store.projects:
         print("  Nenhum projeto cadastrado. Você pode adicionar uma pasta existente.")
 
 
+def project_branch(path: str) -> dict:
+    """`{"branch": ramo}` quando a pasta é um repositório git (`None` na cabeça solta); `{}` quando não é (sem a chave)."""
+    is_git, branch = worktrees.current_branch(path)
+    return {"branch": branch} if is_git else {}
+
+
 def projects_json(store: Store) -> str:
-    """Projetos na ordem da interface (fixados primeiro, depois o uso mais recente), em JSON estável para script."""
+    """Projetos na ordem da interface (fixados primeiro, depois o uso mais recente), em JSON estável para script. `branch`,
+    no fim, só nas pastas que são repositório git (ver project_branch)."""
     pinned = store.pinned_ids()
     return json.dumps([{"id": project["id"], "name": project["name"], "path": project["path"],
                         "pinned": project["id"] in pinned, "last_used": project["last_used"],
-                        "folder_available": Path(project["path"]).is_dir()} for project in store.projects],
+                        "folder_available": Path(project["path"]).is_dir(), **project_branch(project["path"]),
+                        **open_session.remembered(store, project)}
+                       for project in store.projects],
                       ensure_ascii=False, indent=2)
+
+
+def open_project_command(store: Store, options) -> None:
+    """`launcher projects open REF --folder|--vscode`: a pasta do projeto no Explorer ou no VS Code do usuário (o perfil
+    dele), como o menu do projeto na interface; nenhum console aparece."""
+    if options.folder and options.vscode:
+        raise LauncherError("Use --folder ou --vscode, não os dois.")
+    if not (options.folder or options.vscode):
+        raise LauncherError("Informe --folder (abre no Explorer) ou --vscode (abre no VS Code).")
+    folder = project_path(store.find(options.reference)["path"])
+    if options.folder:
+        try:
+            os.startfile(folder)
+        except OSError as error:
+            raise LauncherError(f"Não foi possível abrir a pasta no Explorer: {error}") from error
+        print(f"Pasta aberta no Explorer: {folder}")
+        return
+    from agent_launcher.harnesses import vscode
+    code = vscode.find_code()
+    if not code:
+        raise LauncherError("O VS Code não está instalado. Instale com 'launcher cli --install vscode' (sem admin) e "
+                            "repita o comando.")
+    try:
+        vscode.start_code(code, folder)
+    except OSError as error:
+        raise LauncherError(f"Não foi possível abrir no VS Code: {error}") from error
+    print(f"Pasta aberta no VS Code: {folder}")
+
+
+def discover_projects_command(store: Store, options) -> None:
+    """`launcher projects discover [--add] [--cli CLI]`: as pastas do histórico de conversas em JSON, as já cadastradas
+    marcadas; com `--add`, cadastra as cadastráveis (sem ele, só leitura)."""
+    from agent_launcher.session import discovery
+    rows = discovery.discover(store, options.cli)
+    if options.add:
+        discovery.register(store, rows)
+    print(json.dumps(rows, ensure_ascii=False, indent=2))
+
+
+def resolve_project(store: Store, options) -> tuple[dict, bool]:
+    """O projeto de `--project` (sem ele, o da pasta atual) e se ele acabou de ser criado por `--add-here`. Com a flag,
+    a pasta atual vira projeto só na memória quando o projeto ainda não existe; quem chama grava com `register_added`
+    depois que o pedido inteiro passou nas validações. Sem a flag, projeto desconhecido é o erro de sempre."""
+    if not options.add_here:
+        return store.find(options.project or os.getcwd()), False
+    return store.find_or_add_here(options.project, os.getcwd(), save=False)
+
+
+def register_added(store: Store, project: dict, added: bool, save: bool = True) -> None:
+    """Grava o projeto que `resolve_project` criou e avisa no stderr; com `save=False` (`--dry-run`) ele vale só nesta
+    execução."""
+    if not added:
+        return
+    if save:
+        store.save()
+    print(f"Aviso: projeto cadastrado a partir da pasta atual: {project['name']} ({project['path']})"
+          + ("" if save else "; só nesta execução, o --dry-run não grava") + ".", file=sys.stderr)
+
+
+def worktrees_command(store: Store, options) -> int:
+    """`launcher worktrees [--project REF] [--json]`: os worktrees do launcher no projeto (só leitura; remover é
+    `git worktree remove`)."""
+    project = store.find(options.project or os.getcwd())
+    found = worktrees.listing(project["path"])
+    if options.json:
+        print(json.dumps(found, ensure_ascii=False, indent=2))
+        return 0
+    if not found:
+        print(f"Nenhum worktree do launcher em {project['name']}.")
+    for item in found:
+        state = ("pasta ausente (git worktree prune limpa o registro)" if not item["exists"]
+                 else "pronto" if item["ready"] else f"sem o marcador {worktrees.MARKER} (incompleto ou criado à mão)")
+        print(f"  {item['name']} • {item['branch'] or 'cabeça solta'} • {state}\n      {item['path']}")
+    return 0
 
 
 def show_connections(store: Store) -> None:
@@ -357,11 +448,21 @@ def choose_model(gateway: Gateway, cli: str, previous: str = "") -> str | None:
             print("Seleção inválida.")
 
 
+def require_terminal_for_worktree(cli: str, worktree: str | None) -> None:
+    """`--worktree` só vale para os destinos de terminal; erro claro para os demais."""
+    if worktree is not None and registry.get(cli).KIND != "terminal":
+        accepted = ", ".join(item.LABEL for item in registry.terminals())
+        raise LauncherError(f"--worktree vale só para as sessões de terminal ({accepted}); "
+                            f"{registry.get(cli).LABEL} abre numa pasta própria.")
+
+
 def launch(store: Store, project: dict, gateway: Gateway, cli: str, model: str, resume: bool = False,
            dry_run: bool = False, controlled: bool = False, conversation: str | None = None,
-           command_shell: str | None = None) -> int:
+           command_shell: str | None = None, worktree: str | None = None, fork: bool = False) -> int:
     """Abre a sessão no terminal atual. Com `dry_run`, só imprime o plano (JSON); com `command_shell` (cmd ou powershell),
-    imprime em vez disso o comando que o reproduz fora do launcher."""
+    imprime em vez disso o comando que o reproduz fora do launcher. `worktree` (nome; vazio gera um) abre a sessão num
+    worktree git do projeto (session/worktree.py), criado se não existir; só vale para os destinos de terminal."""
+    require_terminal_for_worktree(cli, worktree)
     if not dry_run:
         quota = gateway.verify(tolerate_quota=True)
         if quota:
@@ -383,13 +484,18 @@ def launch(store: Store, project: dict, gateway: Gateway, cli: str, model: str, 
         print(harness.open(store, project, gateway, model, catalog, confirm=confirm_in_console))
         store.remember(project, gateway.connection, cli, base_model(model))
         return 0
-    plan = planned(store.home, gateway, project["path"], cli, model, resume, catalog, controlled, conversation)
+    found = worktrees.locate(project["path"], worktree) if worktree is not None else None
+    plan = planned(store.home, gateway, project["path"], cli, model, resume, catalog, controlled, conversation, found, fork)
     if dry_run:
         print(plan_command(plan, gateway, resume, catalog, command_shell) if command_shell else
               json.dumps(plan_report(plan, gateway, resume, catalog), ensure_ascii=False, indent=2))
         return 0
+    if found:
+        plan.worktree = worktrees.create(found)
     heading(f"{'RETOMAR' if resume else 'INICIAR'} / {cli.upper()}")
     print(f"  Projeto: {project['name']}\n  Pasta:   {plan.directory}\n  Modelo:  {plan.model}")
+    if found:
+        print(f"  Worktree: {plan.worktree.branch} ({'novo' if plan.worktree.created else 'reaproveitado'})")
     print(f"  Conexão: {gateway.name} • {harness.connection_url(gateway)}")
     print(f"  Catálogo: {catalog.status}\n  Entrada informada: {token_label(plan.input_limit)}")
     if plan.context_window is not None:
@@ -429,25 +535,49 @@ def conversation_usages(home: Path, conversations: list) -> dict:
     return found
 
 
-def list_conversations(store: Store, project: dict, cli: str | None = None, search: str = "") -> list[dict]:
-    """As conversas de found_conversations com o contexto e o custo estimado de cada uma; `search` fica só com as que
-    têm o texto no título, no CLI ou na data (a mesma regra do filtro da janela de conversas)."""
+def filtered_conversations(store: Store, project: dict, cli: str | None = None, search: str = "",
+                           grep: str | None = None) -> list:
+    """As conversas de found_conversations; `search` fica só com as que têm o texto no título, no CLI ou na data (a mesma
+    regra do filtro da janela de conversas) e `grep`, só com as que têm o texto em alguma mensagem (lê os transcripts;
+    o que os tetos de conversation_grep deixaram sem ler vai como [AVISO] no stderr)."""
     found = found_conversations(store, project, cli)
     query = search.strip().casefold()
     if query:
         found = [item for item in found if query in " ".join(
             (item.as_json()["updated"], item.cli, item.title)).casefold()]
+    if grep is not None:
+        found, notes = grep_conversations(found, grep)
+        for note in notes:
+            print(f"[AVISO] {note}", file=sys.stderr)
+    return found
+
+
+def folder_conversations_tsv(store: Store, project: dict, cli: str | None = None, search: str = "",
+                             grep: str | None = None) -> str:
+    """As conversas de filtered_conversations no texto separado por tabulação que o "Copiar lista" da janela de conversas
+    copia (sem a janela do modelo: contexto sem porcentagem)."""
+    found = filtered_conversations(store, project, cli, search, grep)
+    return conversations_tsv(found, conversation_usages(store.home, found), branches=True)
+
+
+def list_conversations(store: Store, project: dict, cli: str | None = None, search: str = "",
+                       grep: str | None = None) -> list[dict]:
+    """As conversas de filtered_conversations com o contexto e o custo estimado de cada uma e, no fim, o ramo git que o CLI
+    gravou (a chave `branch` só existe quando ele grava)."""
+    found = filtered_conversations(store, project, cli, search, grep)
     used = conversation_usages(store.home, found)
     return [{**item.as_json(), "context_tokens": used[item.id].context,
-             "cost_usd": None if used[item.id].cost is None else round(used[item.id].cost, 6)} for item in found]
+             "cost_usd": None if used[item.id].cost is None else round(used[item.id].cost, 6),
+             **({"branch": item.branch} if item.branch else {})} for item in found]
 
 
 def conversation_command(store: Store, project: dict, reference: str, cli: str | None = None,
-                         connection: str | None = None, model: str | None = None, shell: str = "cmd") -> str:
+                         connection: str | None = None, model: str | None = None, shell: str = "cmd",
+                         grep: str | None = None) -> str:
     """O comando que retoma fora do launcher a conversa `reference` (ID, ou posição de 1 em diante na lista de
-    `conversations`, já filtrada por `cli`), para colar no `shell` (cmd ou powershell): o mesmo plano do
+    `conversations`, já filtrada por `cli` e por `grep`), para colar no `shell` (cmd ou powershell): o mesmo plano do
     `launch --resume --conversation --dry-run`."""
-    found = found_conversations(store, project, cli)
+    found = filtered_conversations(store, project, cli, grep=grep)
     chosen = next((item for item in found if item.id == reference), None)
     if chosen is None:
         position = number_choice(reference, len(found))
@@ -718,6 +848,8 @@ def models_command(store: Store, options) -> int:
     catalog = gateway.catalog(options.refresh)
     pairs = listed_models(gateway, catalog, options, fields)
     listed = [record for record, _entry in pairs]
+    if options.sort:
+        listed = order_models(listed, options.sort)
     entries = {record.id: entry for record, entry in pairs}
     if options.json:
         print(catalog.status, file=sys.stderr)
@@ -937,10 +1069,41 @@ def usage_months_command(store, options) -> int:
     return 0
 
 
+def usage_days_command(store, options) -> int:
+    """`usage --days N`: o uso de cada um dos N últimos dias em que houve uso (JSON, ou `--tsv`), do de hoje para trás."""
+    if not 1 <= options.days <= usage.MAX_DAYS:
+        raise LauncherError(f"--days aceita de 1 a {usage.MAX_DAYS}.")
+    if options.month or options.months is not None or options.by_source or options.all or options.limit is not None:
+        raise LauncherError("--days não combina com --month, --months, --by-source, --all nem --limit.")
+    rows = usage.usage_days_report(store.home, options.days)
+    print(usage.usage_days_text(rows) if options.tsv else json.dumps(rows, ensure_ascii=False, indent=1))
+    return 0
+
+
+def usage_blocks_command(store, options) -> int:
+    """`usage --blocks [--active]`: os blocos de 5 h de uso dos últimos 8 dias, do mais recente para trás (JSON, ou `--tsv`);
+    `--active` deixa só o bloco em andamento."""
+    if (options.month or options.months is not None or options.by_source or options.all or options.limit is not None
+            or options.days is not None):
+        raise LauncherError("--blocks não combina com --month, --months, --by-source, --all, --limit nem --days.")
+    rows = usage.usage_blocks_report(store.home)
+    if options.active:
+        rows = [row for row in rows if row["active"]]
+    print(usage.usage_blocks_text(rows) if options.tsv else json.dumps(rows, ensure_ascii=False, indent=1))
+    return 0
+
+
 def usage_command(store, options) -> int:
     """`launcher usage [--month AAAA-MM] [--all] [--tsv]`: estimativa local de uso do perfil (ou de todos), em JSON ou
     no texto separado por tabulação que o "Copiar relatório" da interface copia. Com o teto mensal ligado, o JSON do
-    perfil traz também `limit`. `--limit VALOR|off` só grava ou desliga o teto, sem calcular o relatório."""
+    perfil traz também `limit`. `--limit VALOR|off` só grava ou desliga o teto, sem calcular o relatório. `--days N` lista
+    o uso por dia; `--blocks`, o por bloco de 5 h."""
+    if options.active and not options.blocks:
+        raise LauncherError("--active só vale com --blocks.")
+    if options.blocks:
+        return usage_blocks_command(store, options)
+    if options.days is not None:
+        return usage_days_command(store, options)
     if options.limit is not None:
         if options.month or options.all or options.tsv or options.by_source:
             raise LauncherError("--limit só grava ou desliga o teto mensal; rode 'usage' sem ele para ver o relatório.")
@@ -964,9 +1127,10 @@ def usage_command(store, options) -> int:
     return 0
 
 
-def status_report(store: Store, month: str | None = None) -> dict:
+def status_report(store: Store, month: str | None = None, now: float | None = None) -> dict:
     """Retrato único e sem segredos: CLIs, conexões, endpoint de cada uma, sessões abertas, projetos e o uso do mês.
-    Cada parte vem da função por trás do `doctor`, do `endpoint status`, do `keys --list`, do `projects list` e do `usage`."""
+    Cada parte vem da função por trás do `doctor`, do `endpoint status`, do `keys --list`, do `projects list` e do `usage`;
+    cada sessão aberta traz também `activity` (session/activity.py; `now` é o relógio, só para testes)."""
     from agent_launcher.endpoint import registry as endpoints
     tools = []
     for harness in registry.all():
@@ -985,7 +1149,7 @@ def status_report(store: Store, month: str | None = None) -> dict:
                          "quota_exhausted": (connection.get("status") or {}).get("state") == "quota_exhausted"}
                         for connection in store.connections],
         "endpoints": endpoints.status(store.home, store.connections),
-        "sessions": keys.sessions(),
+        "sessions": activity.annotate(store, keys.sessions(), now),
         "projects": json.loads(projects_json(store)),
         "usage": {**{key: report[key] for key in ("month", "currency", "destinations", "total")},
                   **({"limit": status} if status else {})},
@@ -1108,6 +1272,10 @@ def parser() -> argparse.ArgumentParser:
                              "declara fontes")
     models.add_argument("--capability", action="append", default=[], metavar="vision|audio|video|tools",
                         help="Só modelos com a capacidade confirmada (repetida ou separada por vírgula: todas)")
+    models.add_argument("--sort", choices=("name", "context", "price"),
+                        help="Ordem da lista, a do 'Ordenar' da interface: name (família e versão mais nova primeiro), "
+                             "context (maior entrada primeiro) ou price (menor preço de entrada primeiro); o que o host "
+                             "não informou vai para o fim. Sem a opção, a ordem do catálogo (ID)")
     models.add_argument("--json", action="store_true",
                         help="Os modelos em JSON, os mesmos itens do /v1/models do endpoint local")
     models.add_argument("words", nargs="*", metavar="test MODELO",
@@ -1132,6 +1300,23 @@ def parser() -> argparse.ArgumentParser:
     restore.add_argument("--date", metavar="AAAA-MM-DD", help="Cópia daquele dia; omitido usa a mais recente com projetos a devolver")
     legacy = actions.add_parser("import", help="Importar nomes e caminhos de outro config.json")
     legacy.add_argument("source", type=Path)
+    export = actions.add_parser("export", help="Exportar nomes e caminhos para um arquivo que o import lê (sem chaves)")
+    export.add_argument("file", type=Path, metavar="ARQUIVO")
+    open_folder = actions.add_parser("open", help="Abrir a pasta do projeto no Explorer (--folder) ou no VS Code (--vscode)")
+    open_folder.add_argument("reference", metavar="NOME", help="Nome, ID ou caminho")
+    open_folder.add_argument("--folder", action="store_true", help="Abrir a pasta no Explorer")
+    open_folder.add_argument("--vscode", action="store_true", help="Abrir a pasta no VS Code (o seu perfil normal)")
+    discover = actions.add_parser("discover", help="Descobrir pastas de projeto no histórico de conversas do Claude Code, do "
+                                                   "Codex e do Copilot CLI (JSON; só leitura sem --add)")
+    discover.add_argument("--add", action="store_true",
+                          help="Cadastrar, com o nome da pasta, as pastas descobertas que existem, ainda não estão "
+                               "cadastradas e não são raiz de disco, pasta de usuário, do sistema nem worktree do launcher; "
+                               "caminho não recuperado nunca é cadastrado")
+    discover.add_argument("--cli", choices=terminal_destinations(), help="Só o histórico deste CLI")
+    trees = commands.add_parser("worktrees", help="Worktrees do launcher no projeto (nome, branch, pasta, marcador; só "
+                                                  "leitura, o launcher nunca remove)")
+    trees.add_argument("--project", help="Nome, ID ou caminho de projeto cadastrado; omitido usa a pasta atual")
+    trees.add_argument("--json", action="store_true", help="Em vez do texto, a lista em JSON")
     cli_command = commands.add_parser("cli", help="Ferramentas (Claude Code, Codex, Copilot CLI, VS Code, Copilot app): "
                                                   "situação e instalação por usuário, sem admin")
     cli_command.add_argument("--install", choices=(*clis.installable(), "all"),
@@ -1208,6 +1393,18 @@ def parser() -> argparse.ArgumentParser:
     usage_parser.add_argument("--all", action="store_true", help="soma de todos os perfis, no mesmo formato")
     usage_parser.add_argument("--months", type=int, metavar="N",
                               help="o total de cada um dos N últimos meses (1 a 24), do corrente para trás (JSON)")
+    usage_parser.add_argument("--days", type=int, metavar="N",
+                              help="o uso de cada um dos N últimos dias (1 a 366), do de hoje para trás, sem os dias sem "
+                                   "uso (JSON; --tsv em tabela); não combina com --month, --months, --by-source, --all nem --limit")
+    usage_parser.add_argument("--blocks", action="store_true",
+                              help="os blocos de 5 horas de uso dos últimos 8 dias, como o ccusage blocks: cada bloco começa "
+                                   "na hora cheia, no fuso local, da primeira requisição e dura 5 h; mostra início, fim, se "
+                                   "está ativo (e o tempo restante), tokens e custo (JSON; --tsv em tabela). O custo é o "
+                                   "equivalente de API, não é o da assinatura; o bloco sai dos carimbos das conversas, não do "
+                                   "limite que a assinatura informa; não combina com --month, --months, --by-source, --all, "
+                                   "--limit nem --days")
+    usage_parser.add_argument("--active", action="store_true",
+                              help="com --blocks: só o bloco em andamento (lista vazia se não há)")
     usage_parser.add_argument("--tsv", action="store_true",
                               help="o relatório em texto separado por tabulação, o mesmo que a interface copia")
     usage_parser.add_argument("--by-source", action="store_true",
@@ -1226,8 +1423,16 @@ def parser() -> argparse.ArgumentParser:
                                 "recente primeiro; pasta em outro perfil: só as deste perfil)")
     talks.add_argument("--project", help="Nome, ID ou caminho de projeto cadastrado; omitido usa a pasta atual")
     talks.add_argument("--cli", choices=terminal_destinations())
+    talks.add_argument("--add-here", action="store_true", help=ADD_HERE_HELP)
     talks.add_argument("--search", metavar="TEXTO", default="",
                        help="Só as conversas com o texto no título, no CLI ou na data (sem distinguir maiúsculas)")
+    talks.add_argument("--grep", metavar="TEXTO", default=None,
+                       help="Só as conversas com o texto em alguma mensagem (a sua e a do modelo, sem distinguir "
+                            "maiúsculas; metadados e resultados de ferramenta não contam). Lê os transcripts, só leitura, "
+                            "com teto de 30 s no total e 64 MiB por conversa; combina com --search, --cli, --tsv e --command")
+    talks.add_argument("--tsv", action="store_true",
+                       help="Em vez do JSON, o texto separado por tabulação que 'Copiar lista' da janela de conversas "
+                            "copia (traço no que não se sabe)")
     talks.add_argument("--command", metavar="ID_OU_POSIÇÃO",
                        help="Em vez da lista, imprimir o comando que retoma esta conversa fora do launcher, com a "
                             "pasta, o ambiente e o modelo da conexão; a chave nunca vai no texto. Posição: 1 é a mais "
@@ -1246,13 +1451,17 @@ def parser() -> argparse.ArgumentParser:
                         help=f"Com --reopen: quantas horas atrás contar as aberturas (padrão {reopen.RECENT_HOURS})")
     recent.add_argument("--dry-run", action="store_true",
                         help="Com --reopen: só listar o que abriria, em JSON (linhas sem conversa identificada vêm com o motivo)")
+    open_session.add_parser(commands)
     session = commands.add_parser("launch", help="Iniciar um CLI no terminal atual (ou abrir VS Code / Copilot app)")
     session.add_argument("--project", help="Nome, ID ou caminho de projeto cadastrado; omitido usa a pasta atual")
     session.add_argument("--connection", help="Nome ou ID; omitido usa a última do projeto ou a padrão")
     session.add_argument("--cli", choices=destinations())
+    session.add_argument("--add-here", action="store_true", help=ADD_HERE_HELP)
     session.add_argument("--model", help="ID completo; omitido usa o último modelo desse CLI/projeto/conexão")
     session.add_argument("--resume", action="store_true", help="Retomar a última sessão do CLI no projeto")
     session.add_argument("--conversation", metavar="ID", help="Com --resume: retomar esta conversa (veja 'conversations')")
+    session.add_argument("--fork", action="store_true",
+                         help="Com --resume e --conversation: retomar como cópia, numa conversa nova (Claude Code e Codex)")
     session.add_argument("--dry-run", action="store_true", help="Exibir argumentos sem rede, sem salvar e sem iniciar CLI")
     session.add_argument("--command", action="store_true",
                          help="Com --dry-run: em vez do JSON, imprimir o comando que abre esta sessão fora do launcher, "
@@ -1260,6 +1469,10 @@ def parser() -> argparse.ArgumentParser:
     session.add_argument("--shell", choices=RESUME_SHELLS,
                          help="Com --command: o shell em que o texto será colado (padrão: cmd)")
     session.add_argument("--controlled", action="store_true", help="Sessão controlada por orquestrador (implica bypass)")
+    session.add_argument("--worktree", nargs="?", const="", metavar="NOME",
+                         help="Abrir a sessão num worktree git do projeto (Claude Code, Codex e Copilot CLI): pasta irmã "
+                              "<projeto>.worktrees/NOME, branch launcher/NOME, criado se não existir e reaproveitado se "
+                              "já existe; sem NOME, sessao-AAAAMMDD-HHMMSS. Nunca remove nada (git worktree remove)")
     return result
 
 
@@ -1325,6 +1538,8 @@ def main(arguments: list[str] | None = None) -> int:
             return usage_command(store, options)
         if options.action == "status":
             return status_command(store, options)
+        if options.action == "worktrees":
+            return worktrees_command(store, options)
         if options.action == "connectors":
             modules, errors = store.connectors()
             for module in modules.values():
@@ -1411,6 +1626,12 @@ def main(arguments: list[str] | None = None) -> int:
                 print("Cadastro removido. A pasta do projeto foi preservada.")
             elif options.project_action == "import":
                 import_projects(store, options.source)
+            elif options.project_action == "export":
+                print(f"{store.export_projects(options.file)} projeto(s) exportado(s) para {options.file}.")
+            elif options.project_action == "open":
+                open_project_command(store, options)
+            elif options.project_action == "discover":
+                discover_projects_command(store, options)
             elif options.project_action == "list":
                 print(projects_json(store))
             elif options.project_action == "restore":
@@ -1503,7 +1724,7 @@ def main(arguments: list[str] | None = None) -> int:
                 print(f"Atualização falhou: {error}")
                 return 1
         elif options.action == "launch":
-            project = store.find(options.project or os.getcwd())
+            project, added = resolve_project(store, options)
             gateway = Gateway.for_project(store, project, options.connection)
             last = store.last_cli(project)
             cli = options.cli or (last if last in gateway.clis else sorted(gateway.clis)[0])
@@ -1512,16 +1733,23 @@ def main(arguments: list[str] | None = None) -> int:
                 raise LauncherError("Informe --model com um ID completo, ou escolha um modelo pela interface primeiro.")
             if options.conversation and not options.resume:
                 raise LauncherError("--conversation só vale com --resume.")
+            if options.fork and not (options.resume and options.conversation):
+                raise LauncherError("--fork pede --resume e --conversation ID.")
             if options.command and not options.dry_run:
                 raise LauncherError("--command só vale com --dry-run: o launcher só imprime o comando, não abre a sessão.")
             if options.shell and not options.command:
                 raise LauncherError("--shell só vale com --command.")
+            require_terminal_for_worktree(cli, options.worktree)
+            register_added(store, project, added, save=not options.dry_run)
             if options.resume:
                 warn_shared(store, project, resume=True)
             return launch(store, project, gateway, cli, model, options.resume, options.dry_run, options.controlled,
-                          options.conversation, (options.shell or "cmd") if options.command else None)
+                          options.conversation, (options.shell or "cmd") if options.command else None,
+                          options.worktree, options.fork)
         elif options.action == "sessions":
             return sessions_command(store, options)
+        elif options.action == "session":
+            return open_session.command(store, options)
         elif options.action == "completion":
             if options.kind == "powershell":
                 print(completion.powershell_script(parser()), end="")
@@ -1529,15 +1757,23 @@ def main(arguments: list[str] | None = None) -> int:
                 items = store.projects if options.kind == "projects" else store.connections
                 print("\n".join(item["name"] for item in items))
         elif options.action == "conversations":
-            project = store.find(options.project or os.getcwd())
+            if options.grep is not None and not options.grep.strip():
+                raise LauncherError("--grep pede o texto a procurar nas mensagens; um valor vazio não filtra nada.")
+            project, added = resolve_project(store, options)
             if options.command:
-                print(conversation_command(store, project, options.command, options.cli, options.connection,
-                                           options.model, options.shell or "cmd"))
+                if options.tsv:
+                    raise LauncherError("--tsv lista as conversas; não combina com --command, que imprime um comando só.")
+                output = conversation_command(store, project, options.command, options.cli, options.connection,
+                                              options.model, options.shell or "cmd", options.grep)
             elif options.connection or options.model or options.shell:
                 raise LauncherError("--connection, --model e --shell só valem com --command.")
+            elif options.tsv:
+                output = folder_conversations_tsv(store, project, options.cli, options.search, options.grep)
             else:
-                print(json.dumps(list_conversations(store, project, options.cli, options.search), ensure_ascii=False,
-                                 indent=2))
+                output = json.dumps(list_conversations(store, project, options.cli, options.search, options.grep),
+                                    ensure_ascii=False, indent=2)
+            register_added(store, project, added)
+            print(output)
         return cleanup_status
     except (LauncherError, OSError) as error:
         print(f"Erro: {error}", file=sys.stderr)

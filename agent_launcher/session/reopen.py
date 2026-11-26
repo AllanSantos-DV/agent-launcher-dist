@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import project_path
 from agent_launcher.domain.store import Store
 from agent_launcher.harnesses import registry as harnesses
 from agent_launcher.platform import keys
-from agent_launcher.session import registry
+from agent_launcher.session import registry, worktree as worktrees
 from agent_launcher.session.conversations import conversation_of_opening, conversations_for
 
 RECENT_HOURS = 24
@@ -38,6 +39,7 @@ class Reopening:
     at: float
     conversation: str | None
     reason: str | None
+    worktree: str | None = None
 
     @property
     def selectable(self) -> bool:
@@ -45,14 +47,28 @@ class Reopening:
 
     def as_json(self) -> dict:
         moment = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(self.at))
-        return {"project": self.name, "folder": self.folder, "cli": self.cli, "connection": self.connection,
-                "model": self.model, "last_opened": moment, "conversation": self.conversation,
-                "selectable": self.selectable, "reason": self.reason}
+        found = {"project": self.name, "folder": self.folder, "cli": self.cli, "connection": self.connection,
+                 "model": self.model, "last_opened": moment, "conversation": self.conversation,
+                 "selectable": self.selectable, "reason": self.reason}
+        if self.worktree:
+            found["worktree"] = self.worktree
+        return found
+
+
+def _worktree_of(project: dict | None, entry: dict) -> str | None:
+    """O nome do worktree em que a abertura do registro aconteceu (`launch --worktree`); None se foi na pasta do projeto."""
+    if project is None:
+        return None
+    try:
+        return worktrees.name_of(project_path(project["path"]), entry["folder"])
+    except LauncherError:
+        return None
 
 
 def _row(store: Store, entry: dict) -> Reopening:
     project_id = str(entry.get("project") or "")
     project = next((item for item in store.projects if item["id"] == project_id), None)
+    worktree = _worktree_of(project, entry)
     cli = str(entry.get("cli") or "")
     harness = harnesses.find(cli)
     conversation, reason = None, None
@@ -66,13 +82,14 @@ def _row(store: Store, entry: dict) -> Reopening:
         except LauncherError:
             reason = "pasta do projeto não encontrada"
         else:
-            found = conversations_for(store.home, harness, directory)
-            conversation = conversation_of_opening(store.home, cli, directory, entry, found)
+            where = Path(entry["folder"]) if worktree else directory
+            found = conversations_for(store.home, harness, where)
+            conversation = conversation_of_opening(store.home, cli, where, entry, found)
             reason = None if conversation else NOT_IDENTIFIED
     return Reopening(project_id=project_id, name=project["name"] if project else project_id or "?",
                      folder=entry["folder"], cli=cli, connection=str(entry.get("connection") or ""),
                      model=str(entry.get("model") or ""), at=float(entry["at"]), conversation=conversation,
-                     reason=reason)
+                     reason=reason, worktree=worktree)
 
 
 def candidates(store: Store, hours: float = RECENT_HOURS, now: float | None = None, open_now=None) -> list[Reopening]:
@@ -81,13 +98,14 @@ def candidates(store: Store, hours: float = RECENT_HOURS, now: float | None = No
     aberturas que apontam para a mesma conversa."""
     since = (time.time() if now is None else now) - hours * 3600
     running = {(item.get("project_id"), item.get("cli")) for item in (open_now or keys.sessions)()}
+    projects = {item["id"]: item for item in store.projects}
     latest: dict[tuple, dict] = {}
     for entry in registry.entries(store.home):
         at = entry.get("at")
         if not isinstance(at, (int, float)) or at < since:
             continue
-        key = (entry.get("project"), entry.get("cli"))
-        if key not in running and at >= latest.get(key, {}).get("at", at):
+        key = (entry.get("project"), entry.get("cli"), _worktree_of(projects.get(entry.get("project")), entry))
+        if key[:2] not in running and at >= latest.get(key, {}).get("at", at):
             latest[key] = entry
     rows = sorted((_row(store, entry) for entry in latest.values()), key=lambda row: row.at, reverse=True)
     seen: set[tuple] = set()
@@ -115,7 +133,8 @@ def open_all(store: Store, rows: list[Reopening], start=None) -> list[dict]:
         result = {"project": row.name, "cli": row.cli, "conversation": row.conversation}
         try:
             start(store, store.find(row.project_id), row.cli, row.model, resume=True,
-                  connection=row.connection or None, background=True, minimized=True, conversation=row.conversation)
+                  connection=row.connection or None, background=True, minimized=True, conversation=row.conversation,
+                  **({"worktree": row.worktree} if row.worktree else {}))
         except (LauncherError, OSError, ValueError) as error:
             results.append({**result, "ok": False, "error": str(error)})
         else:

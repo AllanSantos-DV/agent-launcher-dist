@@ -15,12 +15,22 @@ Fontes (só números; nada de conteúdo de conversa sai dos arquivos):
 
 Conversas do perfil: as das pastas dos projetos dele. Pasta em mais de um perfil: só as que o registro (§1) atribui a
 este perfil (Claude por session_id; Codex/Copilot pela primeira conversa criada até 10 min depois de cada abertura, ou
-pelo session_id de uma retomada). Cache por arquivo (caminho, mtime, tamanho) em <home>/cache/usage.json.
+pelo session_id de uma retomada). Cache por arquivo (caminho, mtime, tamanho) em <home>/cache/usage.json; o uso por dia
+(`usage --days`) tem o seu, em <home>/cache/usage-days.json, e o por bloco (`usage --blocks`), o seu, em
+<home>/cache/usage-blocks.json, para não invalidar o do mês.
+
+Blocos de 5 horas (`usage --blocks`, como `ccusage blocks`): o bloco começa na hora cheia, no fuso local da máquina (o
+ccusage usa UTC), da primeira requisição e dura 5 h; a requisição que cai no fim do bloco ou depois dele abre o seguinte.
+Os carimbos vêm de cada CLI (Claude: timestamp de cada linha assistant; Codex: de cada evento token_count; Copilot CLI: de
+cada session.usage_record), guardados por hora local, com o menor e o maior minuto de cada hora. O `rate_limits` dos eventos do Codex não serve para mostrar o reset real: no
+dado real a janela é a semanal (`window_minutes` 10080) ou vem nula, nunca a de 5 h. O custo é o equivalente de API, não o
+da assinatura.
 """
 from __future__ import annotations
 
 import calendar
 import datetime
+import functools
 import glob
 import json
 import math
@@ -40,6 +50,14 @@ CONVERSATION_DESTINATIONS = ("claude", "codex")  # o uso deles vem das conversas
 ATTRIBUTION_WINDOW = 10 * 60
 CACHE_FILE = "usage.json"
 CACHE_SCHEMA = 2  # 2: resultado com "context" e o ponto de continuação ("resume")
+DAYS_CACHE_FILE = "usage-days.json"
+DAYS_CACHE_SCHEMA = 1
+BLOCKS_CACHE_FILE = "usage-blocks.json"
+BLOCKS_CACHE_SCHEMA = 2  # 2: baldes por hora local com o menor e o maior minuto (o 1 guardava um balde por minuto)
+BLOCK_SECONDS = 5 * 3600
+BLOCKS_HISTORY_DAYS = 8
+MAX_DAYS = 366
+DIALOG_DAYS = 14
 USAGE_FILE = "usage.jsonl"
 RECENT_IDS = 64  # ids do Claude lembrados entre leituras: os blocos de uma mensagem vêm em linhas próximas
 SAVE_EVERY = 30  # s entre gravações do cache durante uma leitura longa (a primeira leitura de um mês pode levar minutos)
@@ -72,6 +90,20 @@ def recent_months(count: int = 12, today: tuple[int, int] | None = None) -> list
     return months
 
 
+def local_today() -> datetime.date:
+    return datetime.date.today()
+
+
+def current_time() -> float:
+    return time.time()
+
+
+def recent_days(count: int, today: datetime.date | None = None) -> list[str]:
+    """Os `count` últimos dias (AAAA-MM-DD, hora local), do de hoje para trás; `today` só existe para os testes."""
+    first = today or local_today()
+    return [(first - datetime.timedelta(days=offset)).isoformat() for offset in range(count)]
+
+
 def parse_time(value) -> float | None:
     """ISO 8601 (com Z) ou epoch em s/ms -> epoch em segundos."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -86,6 +118,25 @@ def parse_time(value) -> float | None:
 
 def month_of(epoch: float) -> str:
     return time.strftime("%Y-%m", time.localtime(epoch))
+
+
+def day_of(epoch: float) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(epoch))
+
+
+def hour_of(epoch: float) -> str:
+    """A hora cheia local (epoch em segundos) como chave: o bloco do `usage --blocks` sempre começa numa hora cheia."""
+    return str(int(block_start(epoch)))
+
+
+def _note_span(spans: dict, key: str, at: float) -> None:
+    """Alarga o [menor, maior] minuto (epoch em segundos) em que houve requisição no balde `key`."""
+    minute = int(at // 60 * 60)
+    span = spans.get(key)
+    if span is None:
+        spans[key] = [minute, minute]
+    else:
+        span[0], span[1] = min(span[0], minute), max(span[1], minute)
 
 
 def _number(value) -> int:
@@ -138,13 +189,29 @@ def _months_copy(result: dict) -> dict:
     return json.loads(json.dumps(result.get("months") or {}))
 
 
-def read_claude(path: Path, resume: dict | None = None) -> dict:
+def _spans_start(resume: dict | None, offset: int, enabled: bool) -> dict | None:
+    """Os minutos extremos por balde: `None` quando o leitor não os guarda; com `resume`, os do resultado anterior."""
+    if not enabled:
+        return None
+    return json.loads(json.dumps(resume.get("spans") or {})) if offset else {}
+
+
+def _with_spans(result: dict, spans: dict | None) -> dict:
+    if spans is not None:
+        result["spans"] = spans
+    return result
+
+
+def read_claude(path: Path, resume: dict | None = None, bucket=month_of, with_spans: bool = False) -> dict:
     """{"months": {mês: {modelo: [entrada, saída, cache_lido, cache_gravado]}}, "resume": ...} de um transcript do Claude
-    Code. Com `resume` (o resultado anterior do mesmo arquivo) lê só o que foi acrescentado depois dele."""
+    Code. Com `resume` (o resultado anterior do mesmo arquivo) lê só o que foi acrescentado depois dele. `bucket` (epoch ->
+    chave) escolhe o período: com `day_of`, as chaves de "months" são dias. Com `with_spans`, o resultado traz também
+    "spans": {chave: [menor, maior minuto]} das requisições de cada período."""
     with open(path, "rb") as stream:
         offset = _resume_point(stream, (resume or {}).get("resume"))
         state = resume["resume"] if offset else {}
         months = _months_copy(resume) if offset else {}
+        spans = _spans_start(resume, offset, with_spans)
         recent = {item[0]: item[1:] for item in state.get("recent", [])}
         count, context = state.get("count", 0), (resume or {}).get("context") if offset else None
         position = [offset]
@@ -173,13 +240,15 @@ def read_claude(path: Path, resume: dict | None = None) -> dict:
             if identifier in recent:
                 old_month, old_model, old_values = recent.pop(identifier)
                 _add(months, old_month, old_model, [-value for value in old_values])
-            recent[identifier] = (month_of(at), base_model(model), values)
+            recent[identifier] = (bucket(at), base_model(model), values)
             _add(months, *recent[identifier])
+            if spans is not None:
+                _note_span(spans, recent[identifier][0], at)
             while len(recent) > RECENT_IDS:
                 recent.pop(next(iter(recent)))
         state = _resume_state(stream, position[0], count=count,
                               recent=[[identifier, *item] for identifier, item in recent.items()])
-    return {"months": months, "context": context, "resume": state}
+    return _with_spans({"months": months, "context": context, "resume": state}, spans)
 
 
 def codex_meta(path: Path) -> dict:
@@ -196,12 +265,13 @@ def codex_meta(path: Path) -> dict:
             "created": parse_time(payload.get("timestamp")) or parse_time(first.get("timestamp"))}
 
 
-def read_codex(path: Path, resume: dict | None = None) -> dict:
+def read_codex(path: Path, resume: dict | None = None, bucket=month_of, with_spans: bool = False) -> dict:
     """Como read_claude, para um rollout do Codex: soma o crescimento do acumulado entre eventos token_count."""
     with open(path, "rb") as stream:
         offset = _resume_point(stream, (resume or {}).get("resume"))
         state = resume["resume"] if offset else {}
         months = _months_copy(resume) if offset else {}
+        spans = _spans_start(resume, offset, with_spans)
         model, previous = state.get("model", ""), state.get("previous")
         context = (resume or {}).get("context") if offset else None
         position = [offset]
@@ -236,9 +306,11 @@ def read_codex(path: Path, resume: dict | None = None) -> dict:
                 delta = current  # primeiro evento (ou contador zerado)
             previous = current
             if any(delta):
-                _add(months, month_of(at), model, delta)
+                _add(months, bucket(at), model, delta)
+                if spans is not None:
+                    _note_span(spans, bucket(at), at)
         state = _resume_state(stream, position[0], model=model, previous=previous)
-    return {"months": months, "context": context, "resume": state}
+    return _with_spans({"months": months, "context": context, "resume": state}, spans)
 
 
 def copilot_meta(folder: Path, home: Path | None = None) -> dict:
@@ -270,8 +342,9 @@ def _copilot_values(usage: dict) -> tuple:
             _number(usage.get("cacheWriteTokens")))
 
 
-def read_copilot(path: Path) -> dict:
-    records, shutdowns, context = {}, [], None
+def read_copilot(path: Path, bucket=month_of, with_spans: bool = False) -> dict:
+    """Como read_claude, para o events.jsonl de uma sessão do Copilot CLI (relido inteiro: não tem `resume`)."""
+    records, shutdowns, context, spans = {}, [], None, {} if with_spans else None
     with open(path, encoding="utf-8", errors="replace") as stream:
         for line in stream:
             if '"session.usage_record"' not in line and '"session.shutdown"' not in line:
@@ -288,16 +361,18 @@ def read_copilot(path: Path) -> dict:
                 usage = data["usage"]
                 accounting = usage.get("accounting") if isinstance(usage.get("accounting"), dict) else {}
                 identifier = accounting.get("usageId") or usage.get("apiCallId") or entry.get("id") or len(records)
-                records[str(identifier)] = (month_of(at), str(usage.get("model") or "?"), _copilot_values(usage))
+                records[str(identifier)] = (bucket(at), str(usage.get("model") or "?"), _copilot_values(usage), at)
                 # inputTokens já inclui o cache lido: é o contexto inteiro do pedido
                 context = _number(usage.get("inputTokens")) or context
             elif entry.get("type") == "session.shutdown" and isinstance(data.get("modelMetrics"), dict):
                 shutdowns.append((at, data["modelMetrics"]))
     months: dict = {}
     if records:
-        for month, model, values in records.values():
+        for month, model, values, at in records.values():
             _add(months, month, model, values)
-        return {"months": months, "context": context}
+            if spans is not None:
+                _note_span(spans, month, at)
+        return _with_spans({"months": months, "context": context}, spans)
     previous: dict = {}
     for at, metrics in shutdowns:  # acumulado por modelo: soma só o que cresceu desde o último encerramento
         for model, metric in metrics.items():
@@ -310,19 +385,30 @@ def read_copilot(path: Path) -> dict:
                      if before and all(now >= old for now, old in zip(current, before)) else current)
             previous[model] = current
             if any(delta):
-                _add(months, month_of(at), model, delta)
-    return {"months": months}
+                _add(months, bucket(at), model, delta)
+                if spans is not None:
+                    _note_span(spans, bucket(at), at)
+    return _with_spans({"months": months}, spans)
+
+
+read_claude_days = functools.partial(read_claude, bucket=day_of)
+read_codex_days = functools.partial(read_codex, bucket=day_of)
+read_copilot_days = functools.partial(read_copilot, bucket=day_of)
+read_claude_hours = functools.partial(read_claude, bucket=hour_of, with_spans=True)
+read_codex_hours = functools.partial(read_codex, bucket=hour_of, with_spans=True)
+read_copilot_hours = functools.partial(read_copilot, bucket=hour_of, with_spans=True)
 
 
 # --------------------------------------------------------------------------------------------------------- cache
 class FileCache:
-    """Resultado por arquivo, válido enquanto (mtime, tamanho) não mudam."""
+    """Resultado por arquivo, válido enquanto (mtime, tamanho) não mudam. Cada par (arquivo, schema) é um cache à parte."""
 
-    def __init__(self, home: Path):
-        self.path = Path(home) / "cache" / CACHE_FILE
+    def __init__(self, home: Path, name: str = CACHE_FILE, schema: int = CACHE_SCHEMA):
+        self.path = Path(home) / "cache" / name
+        self.schema = schema
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            self.files = data["files"] if data.get("schema") == CACHE_SCHEMA and isinstance(data.get("files"), dict) else {}
+            self.files = data["files"] if data.get("schema") == schema and isinstance(data.get("files"), dict) else {}
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             self.files = {}
         self.used, self.changed = set(), False
@@ -358,7 +444,7 @@ class FileCache:
         self.saved_at = time.monotonic()
         if self.changed or stale:
             try:
-                atomic_json(self.path, {"schema": CACHE_SCHEMA, "files": self.files})
+                atomic_json(self.path, {"schema": self.schema, "files": self.files})
                 self.changed = False
             except OSError:
                 pass
@@ -399,6 +485,7 @@ def attributed(candidates: list[dict], openings: list[float], known: set[str]) -
 
 
 def _collect(totals: dict, destination: str, result: dict, month: str, conversation: str) -> None:
+    """Soma ao `totals` o período `month` (um mês, ou um dia no uso por dia) do resultado de um transcript."""
     for model, values in (result.get("months") or {}).get(month, {}).items():
         row = totals.setdefault((destination, model), {"values": [0, 0, 0, 0], "conversations": set(), "requests": 0,
                                                        "connections": set()})
@@ -407,7 +494,7 @@ def _collect(totals: dict, destination: str, result: dict, month: str, conversat
         row["conversations"].add(conversation)
 
 
-def _claude(home, folders, shared, month, start, cache, totals):
+def _claude(home, folders, shared, start, cache, collect, reader=read_claude):
     base = claude_projects()
     for folder in folders:
         directory = base / re.sub(r"[^A-Za-z0-9]", "-", str(folder))
@@ -428,10 +515,10 @@ def _claude(home, folders, shared, month, start, cache, totals):
                     continue
                 if stat.st_mtime < start:
                     continue
-                _collect(totals, "claude", cache.get(path, read_claude, stat), month, session)
+                collect("claude", cache.get(path, reader, stat), session)
 
 
-def _codex(home, folders, shared, month, start, cache, totals):
+def _codex(home, folders, shared, start, cache, collect, reader=read_codex):
     wanted = {_key(folder): folder for folder in folders}
     by_folder: dict = {}
     for name in glob.glob(str(codex_sessions() / "*" / "*" / "*" / "rollout-*.jsonl")):
@@ -445,10 +532,10 @@ def _codex(home, folders, shared, month, start, cache, totals):
         meta = _cached_meta(cache, path, stat, codex_meta)
         if meta.get("cwd") and _key(meta["cwd"]) in wanted:
             by_folder.setdefault(wanted[_key(meta["cwd"])], []).append((path, stat, meta))
-    _attribute(home, "codex", by_folder, shared, month, cache, totals, read_codex)
+    _attribute(home, "codex", by_folder, shared, cache, collect, reader)
 
 
-def _copilot(home, folders, shared, month, start, cache, totals):
+def _copilot(home, folders, shared, start, cache, collect, reader=read_copilot):
     wanted = {_key(folder): folder for folder in folders}
     by_folder: dict = {}
     try:
@@ -466,7 +553,7 @@ def _copilot(home, folders, shared, month, start, cache, totals):
         meta = copilot_meta(folder, home)
         if meta.get("cwd") and _key(meta["cwd"]) in wanted:
             by_folder.setdefault(wanted[_key(meta["cwd"])], []).append((path, stat, meta))
-    _attribute(home, "copilot", by_folder, shared, month, cache, totals, read_copilot)
+    _attribute(home, "copilot", by_folder, shared, cache, collect, reader)
 
 
 def _cached_meta(cache: FileCache, path: Path, stat, reader) -> dict:
@@ -483,7 +570,7 @@ def _cached_meta(cache: FileCache, path: Path, stat, reader) -> dict:
     return meta
 
 
-def _attribute(home, cli, by_folder, shared, month, cache, totals, reader):
+def _attribute(home, cli, by_folder, shared, cache, collect, reader):
     for folder, items in by_folder.items():
         if shared[folder]:
             candidates = [{"id": meta.get("id") or str(path), "created": meta.get("created")} for path, _s, meta in items]
@@ -491,7 +578,7 @@ def _attribute(home, cli, by_folder, shared, month, cache, totals, reader):
                                 registry.conversation_ids(home, folder, cli))
             items = [item for item in items if (item[2].get("id") or str(item[0])) in chosen]
         for path, stat, meta in items:
-            _collect(totals, cli, cache.get(path, reader, stat), month, meta.get("id") or str(path))
+            collect(cli, cache.get(path, reader, stat), meta.get("id") or str(path))
 
 
 def endpoint_destination(entry: dict) -> str:
@@ -499,7 +586,9 @@ def endpoint_destination(entry: dict) -> str:
     return destination if destination in DESTINATIONS else "endpoint"
 
 
-def _endpoint(base: Path, profile_id: str, start: float, end: float, totals: dict) -> None:
+def _endpoint(base: Path, profile_id: str, start: float, end: float, totals: dict, bucket=None, spans=None) -> None:
+    """Soma o usage.jsonl do endpoint no intervalo. Com `bucket` (epoch -> dia), `totals` é {dia: totais}; com `spans`,
+    guarda também o menor e o maior minuto de cada balde."""
     try:
         stream = open(Path(base) / USAGE_FILE, encoding="utf-8", errors="replace")
     except OSError:
@@ -519,7 +608,10 @@ def _endpoint(base: Path, profile_id: str, start: float, end: float, totals: dic
             if destination in CONVERSATION_DESTINATIONS:
                 continue
             model = str(entry.get("model") or "?")
-            row = totals.setdefault((destination, model), {
+            target = totals if bucket is None else totals.setdefault(bucket(at), {})
+            if spans is not None:
+                _note_span(spans, bucket(at), at)
+            row = target.setdefault((destination, model), {
                 "values": [0, 0, 0, 0], "conversations": set(), "requests": 0, "connections": set()})
             for index, field in enumerate(FIELDS):
                 row["values"][index] += _number(entry.get(field))
@@ -585,6 +677,18 @@ def _accumulate(target: dict, row: dict) -> None:
     target["cost_complete"] = target.get("cost_complete", True) and row["cost"] is not None
 
 
+def shared_folders(folders, base: Path) -> dict:
+    """Para cada pasta de projeto, se ela está em mais de um perfil (a conversa dela só conta para o dono que a abriu);
+    pasta que o cadastro de perfis não consegue ler conta como não compartilhada."""
+    shared = {}
+    for folder in folders:
+        try:
+            shared[folder] = len(profiles.profiles_with_path(folder, base)) > 1
+        except OSError:
+            shared[folder] = False
+    return shared
+
+
 def usage_report(home: Path, month: str | None = None) -> dict:
     """Uso do perfil dono de `home` no mês (AAAA-MM, hora local; padrão o mês corrente)."""
     home = Path(home)
@@ -592,20 +696,22 @@ def usage_report(home: Path, month: str | None = None) -> dict:
     base = profiles.base_of(home)
     profile_id = profiles.profile_of_home(home, base)["id"]
     folders = project_folders(home)
-    shared = {}
-    for folder in folders:
-        try:
-            shared[folder] = len(profiles.profiles_with_path(folder, base)) > 1
-        except OSError:
-            shared[folder] = False
+    shared = shared_folders(folders, base)
     cache = FileCache(home)
     totals: dict = {}
-    _claude(home, folders, shared, month, start, cache, totals)
-    _codex(home, folders, shared, month, start, cache, totals)
-    _copilot(home, folders, shared, month, start, cache, totals)
+
+    def collect(destination, result, conversation):
+        _collect(totals, destination, result, month, conversation)
+    _claude(home, folders, shared, start, cache, collect)
+    _codex(home, folders, shared, start, cache, collect)
+    _copilot(home, folders, shared, start, cache, collect)
     cache.save()
     _endpoint(base, profile_id, start, end, totals)
-    tables = price_table(home)
+    return _summary(profile_id, month, _model_rows(price_table(home), totals))
+
+
+def _model_rows(tables: dict, totals: dict) -> list[dict]:
+    """Linhas por destino e modelo, em ordem de destino e nome, com o custo do catálogo (null sem preço)."""
     models = []
     for (destination, model), row in sorted(totals.items(), key=lambda item: (DESTINATIONS.index(item[0][0])
                                                                               if item[0][0] in DESTINATIONS else 99,
@@ -616,7 +722,120 @@ def usage_report(home: Path, month: str | None = None) -> dict:
         models.append({"destination": destination, "model": model, **dict(zip(FIELDS, values)),
                        "conversations": len(row["conversations"]), "requests": row["requests"],
                        "cost": price, "priced": price is not None})
-    return _summary(profile_id, month, models)
+    return models
+
+
+def usage_days_report(home: Path, days: int, today: datetime.date | None = None) -> list[dict]:
+    """Uso do perfil dono de `home` em cada um dos `days` últimos dias (hora local, do de hoje para trás), como
+    {"day", "currency", "total"} com o mesmo `total` do relatório do mês. Dia sem uso fica de fora. Cache próprio."""
+    home = Path(home)
+    wanted = recent_days(days, today)
+    first = datetime.date.fromisoformat(wanted[-1])
+    start = datetime.datetime.combine(first, datetime.time.min).timestamp()
+    end = datetime.datetime.combine(datetime.date.fromisoformat(wanted[0]) + datetime.timedelta(days=1),
+                                    datetime.time.min).timestamp()
+    base = profiles.base_of(home)
+    profile_id = profiles.profile_of_home(home, base)["id"]
+    folders = project_folders(home)
+    shared = shared_folders(folders, base)
+    cache = FileCache(home, DAYS_CACHE_FILE, DAYS_CACHE_SCHEMA)
+    by_day: dict = {}
+
+    def collect(destination, result, conversation):
+        for day in wanted:
+            if day in (result.get("months") or {}):
+                _collect(by_day.setdefault(day, {}), destination, result, day, conversation)
+    _claude(home, folders, shared, start, cache, collect, read_claude_days)
+    _codex(home, folders, shared, start, cache, collect, read_codex_days)
+    _copilot(home, folders, shared, start, cache, collect, read_copilot_days)
+    cache.save()
+    _endpoint(base, profile_id, start, end, by_day, day_of)
+    tables = price_table(home)
+    rows = []
+    for day in wanted:
+        total = _summary(profile_id, day, _model_rows(tables, by_day.get(day, {})))["total"]
+        if any(total[field] for field in FIELDS):
+            rows.append({"day": day, "currency": "USD", "total": total})
+    return rows
+
+
+def block_start(epoch: float) -> float:
+    """A hora cheia, no fuso local, em que cai o instante."""
+    return datetime.datetime.fromtimestamp(epoch).replace(minute=0, second=0, microsecond=0).timestamp()
+
+
+def group_blocks(items: list[tuple[float, dict]]) -> list[tuple[float, list[tuple[float, dict]]]]:
+    """Agrupa (instante, linhas) em blocos de 5 h, do mais antigo ao mais novo, como (início, itens). Uma requisição a mais
+    de 5 h da anterior cai sempre depois do fim do bloco, então o fim do bloco é a única regra de corte."""
+    blocks: list = []
+    for item in sorted(items, key=lambda item: item[0]):
+        if not blocks or item[0] >= blocks[-1][0] + BLOCK_SECONDS:
+            blocks.append((block_start(item[0]), []))
+        blocks[-1][1].append(item)
+    return blocks
+
+
+def _local_iso(epoch: float) -> str:
+    return datetime.datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="seconds")
+
+
+def _merge_rows(target: dict, rows: dict) -> None:
+    for key, row in rows.items():
+        merged = target.setdefault(key, {"values": [0, 0, 0, 0], "conversations": set(), "requests": 0, "connections": set()})
+        for index, value in enumerate(row["values"]):
+            merged["values"][index] += value
+        merged["conversations"] |= row["conversations"]
+        merged["requests"] += row["requests"]
+        merged["connections"] |= row["connections"]
+
+
+def usage_blocks_report(home: Path, now: float | None = None) -> list[dict]:
+    """Blocos de 5 h do perfil dono de `home` nos últimos BLOCKS_HISTORY_DAYS dias, do mais recente para trás, como
+    {"start", "end", "active", "remaining_seconds", "first_request", "last_request", "currency", "total"} (horas locais
+    com deslocamento; `total` como o do `usage_days_report`, com `cost_complete`). `active`: `now` está dentro do bloco, e
+    então `remaining_seconds` conta até o fim dele. O primeiro bloco do histórico começa na primeira requisição dentro dele.
+    Os leitores são os do `usage --days`, por hora local com o menor e o maior minuto de cada hora; cache próprio. A
+    hora em que cai o começo do histórico só entra se começa depois dele (o balde é a hora inteira)."""
+    home = Path(home)
+    now = current_time() if now is None else now
+    since = now - BLOCKS_HISTORY_DAYS * 86400
+    first_hour = since if block_start(since) == since else block_start(since + 3600)
+    base = profiles.base_of(home)
+    profile_id = profiles.profile_of_home(home, base)["id"]
+    folders = project_folders(home)
+    shared = shared_folders(folders, base)
+    cache = FileCache(home, BLOCKS_CACHE_FILE, BLOCKS_CACHE_SCHEMA)
+    by_hour: dict = {}
+    spans: dict = {}
+
+    def collect(destination, result, conversation):
+        for hour in result.get("months") or {}:
+            if int(hour) >= first_hour:
+                _collect(by_hour.setdefault(hour, {}), destination, result, hour, conversation)
+                low, high = (result.get("spans") or {}).get(hour, (None, None))
+                if low is not None:
+                    _note_span(spans, hour, low)
+                    _note_span(spans, hour, high)
+    _claude(home, folders, shared, since, cache, collect, read_claude_hours)
+    _codex(home, folders, shared, since, cache, collect, read_codex_hours)
+    _copilot(home, folders, shared, since, cache, collect, read_copilot_hours)
+    cache.save()
+    _endpoint(base, profile_id, first_hour, math.inf, by_hour, hour_of, spans)
+    items = [(float(hour), rows) for hour, rows in by_hour.items() if any(any(row["values"]) for row in rows.values())]
+    tables = price_table(home)
+    report = []
+    for start, group in reversed(group_blocks(items)):
+        rows: dict = {}
+        for _moment, hour_rows in group:
+            _merge_rows(rows, hour_rows)
+        end = start + BLOCK_SECONDS
+        active = start <= now < end
+        report.append({"start": _local_iso(start), "end": _local_iso(end), "active": active,
+                       "remaining_seconds": int(end - now) if active else None,
+                       "first_request": _local_iso(spans[str(int(group[0][0]))][0]),
+                       "last_request": _local_iso(spans[str(int(group[-1][0]))][1]),
+                       "currency": "USD", "total": _summary(profile_id, day_of(start), _model_rows(tables, rows))["total"]})
+    return report
 
 
 def _summary(profile: str, month: str, models: list[dict]) -> dict:
@@ -697,6 +916,49 @@ def usage_text(report: dict) -> str:
     lines = [f"Mês {report['month']}{scope}", "\t".join(USAGE_HEADER)]
     lines += ["\t".join(row) for row in usage_rows(report)]
     return "\n".join(lines)
+
+
+USAGE_DAYS_HEADER = ("Dia", "Entrada", "Saída", "Custo")
+USAGE_BLOCKS_HEADER = ("Início", "Fim", "Ativo", "Restante", "Entrada", "Saída", "Custo")
+
+
+def _spent(total: dict) -> str:
+    """Custo de um total do relatório: "sem preço" onde o catálogo não cobre, "(parcial)" na soma que deixa um modelo de fora."""
+    if total["cost"] is None:
+        return "sem preço"
+    return money(total["cost"]) + ("" if total.get("cost_complete", True) else " (parcial)")
+
+
+def usage_days_rows(rows: list[dict]) -> list[tuple[str, str, str, str]]:
+    """Linhas da tabela de uso por dia (diálogo e `usage_days_text`): dia, entrada com o cache, saída e custo."""
+    return [(row["day"], tokens(row["total"]["input_tokens"] + row["total"]["cache_read"] + row["total"]["cache_write"]),
+             tokens(row["total"]["output_tokens"]), _spent(row["total"])) for row in rows]
+
+
+def usage_days_text(rows: list[dict]) -> str:
+    """O uso por dia separado por tabulação, no formato de `usage_text`: entrada com o cache, saída e custo."""
+    return "\n".join(["\t".join(USAGE_DAYS_HEADER)] + ["\t".join(row) for row in usage_days_rows(rows)])
+
+
+def remaining_text(seconds: int) -> str:
+    """Tempo restante de um bloco ativo: 2h 40min, ou 45min abaixo de uma hora."""
+    hours, minutes = divmod(seconds // 60, 60)
+    return f"{hours}h {minutes:02d}min" if hours else f"{minutes}min"
+
+
+def usage_blocks_rows(rows: list[dict]) -> list[tuple[str, ...]]:
+    """Linhas da tabela de blocos de 5 h (diálogo e `usage_blocks_text`): início e fim em hora local, "sim" e o tempo
+    restante no bloco ativo, entrada com o cache, saída e custo (equivalente de API)."""
+    return [(datetime.datetime.fromisoformat(row["start"]).strftime("%Y-%m-%d %H:%M"),
+             datetime.datetime.fromisoformat(row["end"]).strftime("%Y-%m-%d %H:%M"),
+             "sim" if row["active"] else "", remaining_text(row["remaining_seconds"]) if row["active"] else "",
+             tokens(row["total"]["input_tokens"] + row["total"]["cache_read"] + row["total"]["cache_write"]),
+             tokens(row["total"]["output_tokens"]), _spent(row["total"])) for row in rows]
+
+
+def usage_blocks_text(rows: list[dict]) -> str:
+    """Os blocos de 5 h separados por tabulação, no formato de `usage_days_text`."""
+    return "\n".join(["\t".join(USAGE_BLOCKS_HEADER)] + ["\t".join(row) for row in usage_blocks_rows(rows)])
 
 
 SOURCE_COST_HEADER = ("Fonte", "Custo", "Limite", "Entrada", "Saída")

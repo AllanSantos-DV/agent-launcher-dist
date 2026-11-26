@@ -22,6 +22,11 @@ def _key(folder) -> str:
     return os.path.normcase(os.path.normpath(str(folder)))
 
 
+def same_folder(first, second) -> bool:
+    """As duas pastas são a mesma, como o registro as compara."""
+    return _key(first) == _key(second)
+
+
 def record(home: Path, *, profile: str, project: str, folder, cli: str, connection: str, model: str,
            resume: bool = False, session_id: str | None = None, at: float | None = None) -> dict:
     """Acrescenta a abertura; mantém as últimas KEEP linhas. Falha de disco não impede a sessão (devolve a entrada)."""

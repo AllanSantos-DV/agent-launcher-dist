@@ -2,8 +2,10 @@
 
 - Rotas: /v1/messages, /v1/responses, /v1/chat/completions (e /v1/messages/count_tokens), cada uma só se a conexão
   serve o protocolo; /v1/models devolve o catálogo do launcher (só modelos com ferramentas, com limites, capacidades,
-  preço e fonte; `?capability=vision|audio|video|tools` exige as capacidades confirmadas); /usage devolve o uso do mês
-  (`?month=AAAA-MM`, `?all=1` soma os perfis); /health; /shutdown.
+  preço e fonte; `?capability=vision|audio|video|tools` exige as capacidades confirmadas, `?search=` filtra pelo trecho
+  do ID e `?source=` pela fonte); /usage devolve o uso do mês (`?month=AAAA-MM`, `?all=1` soma os perfis, `?limit=1`
+  acrescenta o `limit_status` do teto mensal); /quota diz se a conexão e a reserva estão marcadas com cota esgotada;
+  /status devolve o JSON do `launcher status` (somente leitura, sem chaves; `?month=AAAA-MM`); /health; /shutdown.
 - Autenticação: a da conexão (chave da DPAPI como Bearer ou x-api-key; nada quando o host já injeta). Qualquer
   credencial que venha do destino (Authorization, x-api-key, api-key) é descartada.
 - Streaming (SSE) repassado sem buffer; sem seguir redirecionamento; proxy do sistema só para host público.
@@ -20,7 +22,8 @@
 - Encerra sozinho depois de IDLE_SECONDS sem requisição; o supervisor desliga o encerramento por ociosidade (o `serve`
   supervisionado leva `--no-idle-exit`).
 - `resolve` imprime a conexão já resolvida (JSON, com a reserva quando há) para o endpoint nativo, que nunca executa
-  conector; `usage` imprime o relatório de uso (JSON) para o nativo, que nunca lê as conversas dos CLIs; `quota` diz se
+  conector; `usage` imprime o relatório de uso (JSON) para o nativo, que nunca lê as conversas dos CLIs; `status` imprime
+  o retrato do `launcher status` (JSON) pelo mesmo motivo; `quota` diz se
   uma resposta de erro é cota esgotada e, sendo, marca a conexão.
 - `supervise` mantém o `serve` da conexão de pé (ver supervisor.py); é o que o início no logon e o `ensure_running` lançam.
 """
@@ -213,27 +216,35 @@ class Upstream:
         from agent_launcher.domain import profiles
         self.profile_id = profiles.profile_of_home(self.home)["id"]
 
+    def _refresh(self) -> None:
+        """Relê o cadastro quando o cache venceu; quem chama segura o `_lock`."""
+        if self._cached is None or time.monotonic() - self._at > self.ttl:
+            from agent_launcher.domain.gateway import Gateway
+            from agent_launcher.domain.store import Store
+            store = Store(self.home)
+            connection = store.find_connection(self.connection_id)
+            self._cached = Gateway(store, connection)
+            reserve = store.fallback_of(connection)
+            try:
+                self._reserve = Gateway(store, reserve) if reserve else None
+            except LauncherError:
+                self._reserve = None  # reserva com conector indisponível: a conexão atende sozinha, como sem reserva
+            self._at = time.monotonic()
+
     def get(self):
         with self._lock:
-            if self._cached is None or time.monotonic() - self._at > self.ttl:
-                from agent_launcher.domain.gateway import Gateway
-                from agent_launcher.domain.store import Store
-                store = Store(self.home)
-                connection = store.find_connection(self.connection_id)
-                self._cached = Gateway(store, connection)
-                reserve = store.fallback_of(connection)
-                try:
-                    self._reserve = Gateway(store, reserve) if reserve else None
-                except LauncherError:
-                    self._reserve = None  # reserva com conector indisponível: a conexão atende sozinha, como sem reserva
-                self._at = time.monotonic()
+            self._refresh()
             return self._cached
 
     def fallback(self):
         """O Gateway da conexão reserva da conexão atendida, ou None (sem reserva, ou reserva inválida)."""
-        self.get()
+        return self.pair()[1]
+
+    def pair(self):
+        """(conexão atendida, reserva) da mesma leitura do cadastro."""
         with self._lock:
-            return self._reserve
+            self._refresh()
+            return self._cached, self._reserve
 
     def invalidate(self) -> None:
         """Descarta o cache: o próximo `get` lê o cadastro de novo (depois de gravar ou limpar uma marca de cota)."""
@@ -267,6 +278,14 @@ def with_capabilities(entries: list[dict], fields: list[str]) -> list[dict]:
     return [entry for entry in entries if all(entry["capabilities"][field] is True for field in fields)]
 
 
+def with_search_and_source(entries: list[dict], search: str | None, source: str | None) -> list[dict]:
+    """Itens cujo ID contém `search` e cuja fonte é `source`, sem diferença de maiúscula (a regra de `launcher models
+    --search/--source`). Vazio ou ausente não filtra; item sem fonte não casa com nenhuma."""
+    needle = (search or "").casefold()
+    return [entry for entry in entries if needle in entry["id"].casefold()
+            and (not source or entry.get("source", "").casefold() == source.casefold())]
+
+
 def single_value(query: dict[str, list[str]], name: str) -> str | None:
     """Valor de um parâmetro da URL que só aceita um; ValueError se veio repetido."""
     values = query.get(name, [])
@@ -275,18 +294,53 @@ def single_value(query: dict[str, list[str]], name: str) -> str | None:
     return values[0] if values else None
 
 
-def usage_request(query: dict[str, list[str]]) -> tuple[str | None, bool]:
-    """(mês, soma dos perfis) do `GET /usage`. ValueError para parâmetro repetido ou `all` fora de 1/true/0/false."""
-    month, every = single_value(query, "month"), single_value(query, "all")
-    if every not in (None, "1", "true", "0", "false"):
-        raise ValueError(f"Valor inválido para all: {every!r}. Use 1, true, 0 ou false.")
-    return month, every in ("1", "true")
+def flag_value(query: dict[str, list[str]], name: str) -> bool:
+    """Parâmetro liga/desliga da URL (1, true, 0, false; ausente vale desligado). ValueError para repetido ou outro valor."""
+    value = single_value(query, name)
+    if value not in (None, "1", "true", "0", "false"):
+        raise ValueError(f"Valor inválido para {name}: {value!r}. Use 1, true, 0 ou false.")
+    return value in ("1", "true")
 
 
-def usage_of(home: Path, month: str | None, every: bool) -> dict:
-    """Relatório de uso do mês do perfil dono de `home`, ou de todos os perfis. ValueError para mês fora de AAAA-MM."""
+def usage_request(query: dict[str, list[str]]) -> tuple[str | None, bool, bool]:
+    """(mês, soma dos perfis, com o teto) do `GET /usage`. ValueError para parâmetro repetido, `all` ou `limit` fora de
+    1/true/0/false."""
+    month = single_value(query, "month")
+    return month, flag_value(query, "all"), flag_value(query, "limit")
+
+
+def usage_of(home: Path, month: str | None, every: bool, with_limit: bool = False) -> dict:
+    """Relatório de uso do mês do perfil dono de `home`, ou de todos os perfis. Com `with_limit`, acrescenta
+    `limit_status` (o gasto frente ao teto mensal do perfil, de `usage.limit_status`), nulo com o teto desligado ou na
+    soma dos perfis, que não tem teto. ValueError para mês fora de AAAA-MM."""
     from agent_launcher.domain import usage
-    return (usage.usage_report_all if every else usage.usage_report)(home, month)
+    from agent_launcher.domain.store import Store
+    report = (usage.usage_report_all if every else usage.usage_report)(home, month)
+    if with_limit:
+        report["limit_status"] = None if every else usage.limit_status(report, Store(home).monthly_limit())
+    return report
+
+
+def status_of(home: Path, month: str | None) -> dict:
+    """O retrato de `launcher status` (`ui.text.status_report`: CLIs, conexões sem chave, endpoints, sessões, projetos e uso
+    do mês) do perfil dono de `home`. ValueError para mês fora de AAAA-MM."""
+    from agent_launcher.domain.store import Store
+    from agent_launcher.ui.text import status_report
+    return status_report(Store(home), month)
+
+
+def loopback_host(host: str | None, port: int) -> bool:
+    """O cabeçalho Host é `127.0.0.1`, `localhost` ou `[::1]` com a porta do servidor (nome sem diferenciar maiúsculas)?
+    Barra o DNS rebinding: uma página de outra origem chega aqui com o Host do próprio nome."""
+    if host is None:
+        return False
+    return host.lower() in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}")
+
+
+def check_month(month: str | None) -> None:
+    """ValueError para mês fora de AAAA-MM (a mensagem do `/usage`)."""
+    from agent_launcher.domain import usage
+    usage.month_bounds(month)
 
 
 def usage_file_of(home: Path) -> Path | None:
@@ -373,6 +427,12 @@ def quota_active(connection: dict, now: float | None = None) -> bool:
     hora no futuro não vale: a conexão é tentada como sempre."""
     at = quota_mark_at(connection)
     return at is not None and 0 <= (time.time() if now is None else now) - at < QUOTA_RETRY_SECONDS
+
+
+def quota_entry(gateway) -> dict:
+    """Estado de cota de uma conexão no `GET /quota`: nome, id, se a marca de cota esgotada ainda vale e a hora dela."""
+    return {"connection": gateway.name, "connection_id": gateway.connection["id"],
+            "quota_active": quota_active(gateway.connection), "quota_mark_at": quota_mark_at(gateway.connection)}
 
 
 def mark_quota_exhausted(home: Path, gateway, message: str) -> None:
@@ -466,7 +526,17 @@ class Handler(BaseHTTPRequestHandler):
     def error(self, status: int, message: str, kind: str = "agent_launcher_error") -> None:
         self.reply_json(status, {"error": {"type": kind, "message": message}})
 
+    def host_refused(self) -> bool:
+        """Recusa com 403 (e fecha a conexão, pois o corpo do pedido não é lido) o Host que não é o do próprio endpoint."""
+        if loopback_host(self.headers.get("Host"), self.server.server_address[1]):
+            return False
+        self.close_connection = True
+        self.error(403, "Host recusado: use 127.0.0.1, localhost ou [::1] com a porta do endpoint.")
+        return True
+
     def do_GET(self):
+        if self.host_refused():
+            return
         self.server.touch()
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
@@ -482,18 +552,24 @@ class Handler(BaseHTTPRequestHandler):
             return self.models(query)
         if path == "/usage":
             return self.usage(query)
+        if path == "/quota":
+            return self.quota()
+        if path == "/status":
+            return self.status(query)
         self.error(404, f"Rota não servida pelo endpoint local do Agent Launcher: {path}")
 
     def models(self, query: dict[str, list[str]]):
         try:
             fields = capabilities_wanted(query.get("capability", []))
+            search, source = single_value(query, "search"), single_value(query, "source")
         except ValueError as error:
             return self.error(400, str(error))
         try:
             data = model_entries(self.server.upstream.get(), online=True)
         except LauncherError as error:
             return self.error(502, str(error))
-        self.reply_json(200, {"object": "list", "data": with_capabilities(data, fields)})
+        data = with_search_and_source(with_capabilities(data, fields), search, source)
+        self.reply_json(200, {"object": "list", "data": data})
 
     def usage(self, query: dict[str, list[str]]):
         try:
@@ -504,7 +580,28 @@ class Handler(BaseHTTPRequestHandler):
             return self.error(500, f"{type(error).__name__}: {error}")
         self.reply_json(200, report)
 
+    def status(self, query: dict[str, list[str]]):
+        try:
+            month = single_value(query, "month")
+            check_month(month)
+        except ValueError as error:
+            return self.error(400, str(error))
+        try:
+            report = status_of(self.server.upstream.home, month)
+        except Exception as error:  # o cliente recebe a causa; o retrato lê arquivos de outros programas
+            return self.error(500, f"{type(error).__name__}: {error}")
+        self.reply_json(200, report)
+
+    def quota(self):
+        try:
+            gateway, reserve = self.server.upstream.pair()
+        except LauncherError as error:
+            return self.error(502, str(error))
+        self.reply_json(200, {**quota_entry(gateway), "fallback": quota_entry(reserve) if reserve else None})
+
     def do_POST(self):
+        if self.host_refused():
+            return
         self.server.touch()
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
@@ -826,11 +923,32 @@ def _main_resolve(options) -> int:
     return 1
 
 
+def _main_status(options) -> int:
+    """`status`: o retrato de `launcher status` em JSON UTF-8 no stdout. Mesmos códigos de `usage`: 3 para mês fora de
+    AAAA-MM, 1 para falha na leitura, com a mensagem no stderr lida pelo endpoint nativo."""
+    try:
+        check_month(options.month)
+    except ValueError as error:
+        message, code = str(error), 3
+    else:
+        try:
+            text = json.dumps(status_of(options.home, options.month), ensure_ascii=False)
+        except Exception as error:
+            message, code = f"{type(error).__name__}: {error}", 1
+        else:
+            sys.stdout.buffer.write(text.encode("utf-8"))
+            sys.stdout.buffer.flush()
+            return 0
+    sys.stderr.buffer.write(message.encode("utf-8"))
+    sys.stderr.buffer.flush()
+    return code
+
+
 def _main_usage(options) -> int:
     """`usage`: o relatório em JSON UTF-8 no stdout. Código 3 para pedido inválido (mês fora de AAAA-MM), 1 para falha
     na leitura; a mensagem vai ao stderr, lido pelo endpoint nativo."""
     try:
-        text = json.dumps(usage_of(options.home, options.month, options.all), ensure_ascii=False)
+        text = json.dumps(usage_of(options.home, options.month, options.all, options.limit), ensure_ascii=False)
     except ValueError as error:
         message, code = str(error), 3
     except Exception as error:
@@ -895,24 +1013,29 @@ def _main_supervise(options) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Endpoint local de uma conexão do Agent Launcher")
-    parser.add_argument("action", choices=("serve", "resolve", "supervise", "usage", "quota"))
+    parser.add_argument("action", choices=("serve", "resolve", "supervise", "usage", "status", "quota"))
     parser.add_argument("--home", type=Path, required=True)
-    parser.add_argument("--connection", help="obrigatório, menos em usage")
+    parser.add_argument("--connection", help="obrigatório, menos em usage e status")
     parser.add_argument("--port", type=int)
     parser.add_argument("--no-idle-exit", action="store_true")
     parser.add_argument("--wait-port", action="store_true",
                         help="supervise: esperar a --port ficar livre antes de abrir o serve (adoção de endpoint avulso)")
     parser.add_argument("--online", action="store_true", help="resolve: busca o catálogo no host se o cache está vazio")
-    parser.add_argument("--month", metavar="AAAA-MM", help="usage: mês do relatório (padrão: o atual)")
+    parser.add_argument("--month", metavar="AAAA-MM", help="usage e status: mês do uso (padrão: o atual)")
     parser.add_argument("--all", action="store_true", help="usage: soma de todos os perfis")
+    parser.add_argument("--limit", action="store_true", help="usage: acrescenta limit_status (o teto mensal do perfil)")
     parser.add_argument("--status", type=int, help="quota: status HTTP da resposta de erro (o corpo vem no stdin)")
     options = parser.parse_args(argv)
     if options.action == "usage":
         return _main_usage(options)
+    if options.action == "status":
+        if options.all or options.limit:
+            parser.error("--all e --limit só valem em usage")
+        return _main_status(options)
     if not options.connection:
         parser.error("--connection é obrigatório")
-    if options.month or options.all:
-        parser.error("--month e --all só valem em usage")
+    if options.month or options.all or options.limit:
+        parser.error("--month só vale em usage e status; --all e --limit só valem em usage")
     if options.action == "quota":
         if options.status is None:
             parser.error("--status é obrigatório em quota")

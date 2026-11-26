@@ -9,12 +9,13 @@ import time
 import uuid
 from pathlib import Path
 
+from agent_launcher.domain import usage
 from agent_launcher.domain.catalog import CLAUDE_FAMILIES, Catalog, ModelInfo, base_model, token_label
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import read_text_retrying, replace_retrying
 from agent_launcher.harnesses import installers
-from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines,
-                                           key_mcp_urls, npm_cli_command, parse_time)
+from agent_launcher.harnesses.base import (Conversation, Harness, HistoryItem, conversation_title, count_lines,
+                                           head_lines, key_mcp_urls, npm_cli_command, parse_time, recorded_branch)
 from agent_launcher.session.controlled import CONTROLLED_NOTE, UNATTENDED_RESUME_THRESHOLD, delegation_code
 from agent_launcher.session.plan import LaunchPlan
 
@@ -61,9 +62,10 @@ def _counted_user_line(line: bytes) -> bool:
     return b'"type":"user"' in line and b'"tool_result"' not in line and b'"isMeta":true' not in line
 
 
-def claude_conversation(transcript: Path) -> Conversation | None:
-    """Conversa de um transcript, se o --continue/--resume a aceita (entrypoint que não é sdk-*)."""
-    started = resumable = None
+def claude_conversation(transcript: Path, detail: bool = True) -> Conversation | None:
+    """Conversa de um transcript, se o --continue/--resume a aceita (entrypoint que não é sdk-*). Sem `detail` não procura o
+    título (vazio) e para de ler assim que sabe o começo e o entrypoint: linhas de transcript chegam a centenas de KB."""
+    started = resumable = branch = None
     titles = {}  # custom (nome dado pelo usuário), user, meta, summary: o primeiro de cada, nesta ordem de preferência
     for line in head_lines(transcript):
         try:
@@ -74,6 +76,7 @@ def claude_conversation(transcript: Path) -> Conversation | None:
             continue
         if started is None and entry.get("timestamp"):
             started = parse_time(entry["timestamp"], None)
+        branch = branch or recorded_branch(entry.get("gitBranch"))
         kind = entry.get("type")
         if kind == "custom-title" and entry.get("customTitle"):
             titles["custom"] = entry["customTitle"]
@@ -85,6 +88,8 @@ def claude_conversation(transcript: Path) -> Conversation | None:
             resumable = not str(entry.get("entrypoint") or "").startswith("sdk-")
             if not resumable:
                 return None
+        if not detail and started is not None:
+            break
         for key, meta in (("user", False), ("meta", True)):
             if key not in titles and _user_text(entry, meta):
                 titles[key] = _user_text(entry, meta)
@@ -97,12 +102,45 @@ def claude_conversation(transcript: Path) -> Conversation | None:
         return None
     started = started or status.st_ctime
     return Conversation(transcript.stem, "claude", started, max(status.st_mtime, started), conversation_title(title),
-                        count_lines(transcript, _counted_user_line, CLAUDE_USER_MARKER))
+                        count_lines(transcript, _counted_user_line, CLAUDE_USER_MARKER) if detail else None, branch)
+
+
+RECORDED_FOLDER_LINES = 50  # o `cwd` aparece nas primeiras linhas do transcript
+
+
+def claude_folder_name(directory) -> str:
+    """O nome da pasta de projeto no histórico do Claude Code: todo caractere não alfanumérico do caminho vira `-`, então o
+    caminho não volta a partir do nome."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(directory))
 
 
 def claude_project_folder(directory: Path) -> Path:
     base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
-    return base / re.sub(r"[^A-Za-z0-9]", "-", str(directory))  # a mesma codificação de pasta do Claude Code
+    return base / claude_folder_name(directory)
+
+
+def claude_recorded_folder(transcript: Path, encoded: str) -> str | None:
+    """O `cwd` de uma linha do transcript que, codificado como o Claude Code o codifica, dá exatamente `encoded` (o nome da
+    pasta de projeto): o caminho real da pasta. None quando nenhuma linha traz `cwd` ou nenhum confere (o `cwd` pode ser o
+    de uma subpasta)."""
+    for line in head_lines(transcript, RECORDED_FOLDER_LINES):
+        if '"cwd"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        cwd = entry.get("cwd") if isinstance(entry, dict) else None
+        if isinstance(cwd, str) and claude_folder_name(cwd).casefold() == encoded.casefold():
+            return cwd
+    return None
+
+
+def _modified(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def claude_config_file() -> Path:
@@ -181,7 +219,8 @@ class ClaudeCode(Harness):
     LABEL = "Claude Code"
     KIND = "terminal"
     CONSUMES = ("messages",)
-    CAPABILITIES = frozenset({"resume", "controlled", "keys", "bypass", "context_window", "families"})
+    CAPABILITIES = frozenset({"resume", "fork", "controlled", "keys", "bypass", "context_window", "families"})
+    FORK_CONTROLLED = True
     SUBTITLE = "Anthropic Messages"
     SYMBOL = "terminal"
     TAB_COLOR = "#D97757"
@@ -313,7 +352,9 @@ class ClaudeCode(Harness):
             command += ["--append-system-prompt", "\n\n".join(notes)]
         if context.resume:
             command += ["--resume", context.conversation] if context.conversation else ["--continue"]
-            session_id = context.conversation
+            if context.fork:
+                command.append("--fork-session")
+            session_id = None if context.fork else context.conversation
         else:
             # Sessão nova com id escolhido pelo launcher: a conversa fica conhecida na hora (registro por perfil, §1).
             session_id = str(uuid.uuid4())
@@ -338,9 +379,26 @@ class ClaudeCode(Harness):
     def has_previous_conversation(self, directory: Path) -> bool:
         return any(_resumable_claude_transcript(transcript) for transcript in claude_project_folder(directory).glob("*.jsonl"))
 
-    def conversations(self, directory: Path) -> list[Conversation]:
-        found = (claude_conversation(transcript) for transcript in claude_project_folder(directory).glob("*.jsonl"))
+    def conversations(self, directory: Path, detail: bool = True) -> list[Conversation]:
+        found = (claude_conversation(transcript, detail) for transcript in claude_project_folder(directory).glob("*.jsonl"))
         return sorted((item for item in found if item), key=lambda item: item.updated, reverse=True)
+
+    def history(self) -> list[HistoryItem]:
+        """Cada pasta de ~/.claude/projects com o caminho real lido do `cwd` das linhas (só vale o que confere com o nome da
+        pasta); sem `cwd` que confira, `folder` é None e `label` é o nome da pasta."""
+        try:
+            folders = sorted(path for path in usage.claude_projects().iterdir() if path.is_dir())
+        except OSError:
+            return []
+        items = []
+        for folder in folders:
+            transcripts = sorted(folder.glob("*.jsonl"), key=_modified, reverse=True)
+            found = [item for item in (claude_conversation(transcript, False) for transcript in transcripts) if item]
+            if not found:
+                continue
+            real = next(filter(None, (claude_recorded_folder(transcript, folder.name) for transcript in transcripts)), None)
+            items += [HistoryItem(real, folder.name, item) for item in found]
+        return items
 
 
 HARNESS = ClaudeCode()

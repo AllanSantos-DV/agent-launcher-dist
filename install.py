@@ -29,7 +29,7 @@ MANIFEST = ".install-manifest.json"
 # bootstrap Node (bin/, package.json). terminal/ e .venv/ são da instalação e nunca são apagados por obsolescência.
 BLOCKED = {"__pycache__", ".git", ".github", ".claude", ".vscode", ".memory", ".token-guard", ".venv", "terminal",
            "terminal.old", "tests", "docs", "site", "release", "npm", "dist", "bin", "node_modules",
-           "AGENTS.md", "CLAUDE.md", "install.py", "package.json", ".gitignore", ".gitattributes", "nativo", MANIFEST}
+           "AGENTS.md", "CLAUDE.md", "install.py", "package.json", ".gitignore", ".gitattributes", "nativo", "interface-avalonia", MANIFEST}
 NATIVE_DIR = "nativo-bin"
 LEFTOVER = ".old-"  # sufixo da imagem em execução renomeada para dar lugar à nova; só existe em NATIVE_DIR
 MIN_PYTHON = (3, 10)

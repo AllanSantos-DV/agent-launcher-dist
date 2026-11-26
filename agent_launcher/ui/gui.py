@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QFileSystemWatcher, QSize, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QSize, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QDialog, QFileDialog, QFormLayout, QFrame,
@@ -21,8 +21,9 @@ from PySide6.QtWidgets import (
 from agent_launcher import ROOT
 from agent_launcher.domain import cache, model_probe, profiles, usage
 from agent_launcher.domain.usage import USAGE_HEADER, usage_rows, usage_text
-from agent_launcher.domain.conversation_usage import resume_window_warning, window_warning
-from agent_launcher.domain.catalog import base_model, media_states, price_label, token_label
+from agent_launcher.domain.conversation_usage import (
+    CONVERSATIONS_HEADER, conversation_row, conversations_text, resume_window_warning, window_warning)
+from agent_launcher.domain.catalog import base_model, media_states, order_models, price_label, token_label
 from agent_launcher.domain.errors import LauncherBusy, LauncherError
 from agent_launcher.domain.files import append_capped, atomic_text, project_path
 from agent_launcher.domain.gateway import Gateway
@@ -537,24 +538,18 @@ class SessionScreenDialog(TextDialog):
         self.refresh()
 
 
-def conversation_usage_cells(result, record, verified: bool) -> tuple[str, str]:
-    """Contexto (com a parte da janela do modelo escolhido, quando confirmada) e custo estimado; traço = desconhecido."""
-    if result is None:
-        return "—", "—"
-    window = record.max_input_tokens if record and verified else None
-    context = "—" if result.context is None else (f"{round(result.context / 1000)}k" if result.context >= 1000 else str(result.context))
-    if result.context and window:
-        context += f" ({round(result.context * 100 / window)}%)"
-    cost = "—" if result.cost is None else f"US$ {result.cost:.2f}".replace(".", ",")
-    return context, cost
+class ContentSearchTask(BackgroundTask):
+    """Busca de texto nas mensagens das conversas (session/conversation_grep.py) fora da thread da interface: lê os
+    transcripts. O módulo só entra na memória quando a busca é pedida."""
 
+    def __init__(self, conversations: list, text: str):
+        super().__init__()
+        self.conversations, self.text = conversations, text
 
-CONVERSATIONS_HEADER = ("Data", "CLI", "Título", "Mensagens", "Contexto", "Custo (est.)")
-
-
-def conversations_text(rows: list[list[str]]) -> str:
-    """A lista de conversas separada por tabulação: colada numa planilha, cada valor cai na sua coluna."""
-    return "\n".join("\t".join(row) for row in [list(CONVERSATIONS_HEADER), *rows])
+    def outcome(self):
+        from agent_launcher.session.conversation_grep import grep_conversations
+        matched, notes = grep_conversations(self.conversations, self.text)
+        return ({item.id for item in matched}, notes), ""
 
 
 class ConversationsDialog(placement.GrowingDialog):
@@ -567,9 +562,9 @@ class ConversationsDialog(placement.GrowingDialog):
     TITLE_CHARS = 40
 
     def __init__(self, conversations: list, parent=None, cli_label: str = "", usages: dict | None = None,
-                 record=None, verified: bool = False, command_for=None):
+                 record=None, verified: bool = False, command_for=None, branch: str | None = None,
+                 can_fork: bool = False):
         super().__init__(parent, QSize(720, 420))
-        from datetime import datetime
         self.setWindowTitle(f"Conversas do {cli_label}" if cli_label else "Escolher conversa")
         layout = self.body_layout
         layout.addWidget(label("Escolha a conversa a retomar (mais recente primeiro).", "muted"))
@@ -579,6 +574,24 @@ class ConversationsDialog(placement.GrowingDialog):
         self.filter.setAccessibleName("Filtrar conversas")
         self.filter.textChanged.connect(self.apply_filter)
         layout.addWidget(self.filter)
+        self.conversations = conversations
+        self.content_ids: set[str] = set()
+        self.content_query: str | None = None
+        self.content_task = None
+        self.branch = branch
+        self.branch_of = {conversation.id: conversation.branch for conversation in conversations}
+        self.branch_check = QCheckBox(f"Só o ramo {branch}" if branch else "Só o ramo do projeto")
+        self.branch_check.setToolTip("Mostra só as conversas gravadas neste ramo do projeto; a conversa de um CLI que não grava "
+                                     "o ramo fica de fora. O texto do filtro não muda.")
+        self.branch_check.setVisible(bool(branch))
+        self.branch_check.toggled.connect(lambda _checked: self.apply_filter(self.filter.text()))
+        layout.addWidget(self.branch_check)
+        self.content_check = QCheckBox("Buscar também no texto das mensagens")
+        self.content_check.setToolTip("Com a caixa marcada, Enter no filtro lê o texto das mensagens das conversas (pode levar "
+                                      "alguns segundos) e mostra também as que têm o texto.")
+        self.content_check.toggled.connect(self.search_content)
+        self.filter.installEventFilter(self)
+        layout.addWidget(self.content_check)
         usages = usages or {}
         self.table = RowsTable(len(conversations), len(CONVERSATIONS_HEADER))
         self.table.setHorizontalHeaderLabels(list(CONVERSATIONS_HEADER))
@@ -594,11 +607,7 @@ class ConversationsDialog(placement.GrowingDialog):
         for column in (0, 1, 3, 4, 5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         for row, conversation in enumerate(conversations):
-            values = (datetime.fromtimestamp(conversation.updated).strftime("%d/%m/%Y %H:%M"),
-                      registry.get(conversation.cli).LABEL if registry.find(conversation.cli) else conversation.cli,
-                      conversation.title or "(sem título)",
-                      "" if conversation.messages is None else str(conversation.messages),
-                      *conversation_usage_cells(usages.get(conversation.id), record, verified))
+            values = conversation_row(conversation, usages.get(conversation.id), record, verified)
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, conversation.id)
@@ -635,6 +644,13 @@ class ConversationsDialog(placement.GrowingDialog):
         self.resume.setEnabled(bool(conversations))
         self.resume.clicked.connect(self.accept)
         actions.addWidget(self.resume)
+        self.fork = False
+        self.fork_button = QPushButton("Retomar como cópia")
+        self.fork_button.setToolTip("Abre a conversa selecionada numa conversa nova, copiada dela: a original fica como está.")
+        self.fork_button.setEnabled(bool(conversations))
+        self.fork_button.setVisible(can_fork)
+        self.fork_button.clicked.connect(self.accept_as_copy)
+        actions.insertWidget(actions.count() - 1, self.fork_button)
         self.command_for = command_for
         self.command_button = QPushButton("Copiar comando de retomada")
         self.command_button.setToolTip("Copia o comando que continua a conversa selecionada num terminal seu, com a pasta, "
@@ -672,9 +688,12 @@ class ConversationsDialog(placement.GrowingDialog):
     def apply_filter(self, text: str) -> None:
         """Esconde as conversas sem o texto na data, no CLI ou no título; a seleção vai para uma que continua à vista."""
         query = text.strip().casefold()
+        content = self.content_ids if self.content_check.isChecked() and self.content_query == query else set()
         for row in range(self.table.rowCount()):
             haystack = " ".join(self.table.item(row, column).text() for column in range(3)).casefold()
-            self.table.setRowHidden(row, query not in haystack)
+            identifier = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            other_branch = self.branch_check.isChecked() and self.branch_of.get(identifier) != self.branch
+            self.table.setRowHidden(row, other_branch or (query not in haystack and identifier not in content))
         shown = self.visible_rows()
         selected = self.table.selectionModel().selectedRows()
         if not shown:
@@ -682,10 +701,48 @@ class ConversationsDialog(placement.GrowingDialog):
         elif not selected or self.table.isRowHidden(selected[0].row()):
             self.table.selectRow(shown[0])
         self.resume.setEnabled(bool(shown))
+        self.fork_button.setEnabled(bool(shown))
         self.copy_button.setEnabled(bool(shown))
         self.command_button.setEnabled(bool(shown) and self.command_for is not None)
         self.powershell_button.setEnabled(bool(shown) and self.command_for is not None)
         self.copied.setText("")
+
+    def eventFilter(self, watched, event) -> bool:
+        """Com a caixa de busca no texto marcada, o Enter do filtro busca em vez de acionar o Retomar (o botão padrão); com
+        ela desmarcada, o Enter segue como sempre."""
+        if (watched is getattr(self, "filter", None) and event.type() == QEvent.Type.KeyPress and self.content_check.isChecked()
+                and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)):
+            self.search_content()
+            return True
+        return super().eventFilter(watched, event)
+
+    def accept_as_copy(self) -> None:
+        """Retomar como cópia: aceita a janela com `fork` marcado."""
+        self.fork = True
+        self.accept()
+
+    def search_content(self) -> None:
+        """Com a caixa marcada e um texto no filtro, busca o texto nas mensagens das conversas e soma as achadas ao filtro; um
+        pedido anterior que chega depois é descartado."""
+        query = self.filter.text().strip().casefold()
+        self.content_ids, self.content_query, self.content_task = set(), None, None
+        self.apply_filter(self.filter.text())
+        if not self.content_check.isChecked() or not query:
+            return
+        self.copied.setText("Buscando no texto das mensagens…")
+        task = self.content_task = ContentSearchTask(self.conversations, query)
+        run_task(task, lambda result, text="": task is self.content_task and self.show_content(query, result))
+
+    def show_content(self, query: str, result) -> None:
+        if query != self.filter.text().strip().casefold():
+            return
+        if isinstance(result, Exception):
+            self.copied.setText(f"Não foi possível buscar no texto das mensagens: {result}")
+            return
+        ids, notes = result
+        self.content_ids, self.content_query = ids, query
+        self.apply_filter(self.filter.text())
+        self.copied.setText(" ".join([f"{plural(len(ids), 'conversa tem', 'conversas têm')} o texto nas mensagens.", *notes]))
 
     def copy_command(self, shell: str = "cmd") -> None:
         """Copia o comando de retomada da conversa selecionada, escrito para o `shell` (cmd ou powershell); sem
@@ -735,7 +792,8 @@ class ReopenDialog(placement.GrowingDialog):
         for column in (0, 1, 2):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         for number, row in enumerate(rows):
-            values = (row.name, reopen.cli_label(row.cli), datetime.fromtimestamp(row.at).strftime("%d/%m/%Y %H:%M"),
+            values = (row.name + (f" · worktree {row.worktree}" if row.worktree else ""), reopen.cli_label(row.cli),
+                      datetime.fromtimestamp(row.at).strftime("%d/%m/%Y %H:%M"),
                       row.reason or f"retoma a conversa {row.conversation[:8]}")
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -904,6 +962,117 @@ class UsageTask(BackgroundTask):
         return report(self.home, self.month), ""
 
 
+class PeriodTask(BackgroundTask):
+    """Uso por dia ou em blocos de 5 h do perfil (domain/usage.py) fora da thread da interface: lê os arquivos de conversa."""
+
+    def __init__(self, home: Path, view: str):
+        super().__init__()
+        self.home, self.view = home, view
+
+    def outcome(self):
+        if self.view == "days":
+            return usage.usage_days_report(self.home, usage.DIALOG_DAYS), ""
+        return usage.usage_blocks_report(self.home), ""
+
+
+class DiscoverTask(BackgroundTask):
+    """Pastas do histórico de conversas dos CLIs (session/discovery.py) fora da thread da interface: lê os arquivos de
+    conversa. O módulo só entra na memória quando a janela é aberta."""
+
+    def __init__(self, home: Path):
+        super().__init__()
+        self.home = home
+
+    def outcome(self):
+        from agent_launcher.session import discovery
+        return discovery.discover(Store(self.home)), ""
+
+
+class WorktreeTask(BackgroundTask):
+    """Cria ou reaproveita o worktree de uma sessão (session/worktree.py: vários `git`, o `worktree add` com checkout
+    inteiro) fora da thread da interface. Devolve o nome resolvido, que é gerado quando o pedido vem vazio."""
+
+    def __init__(self, project_folder: str, name: str):
+        super().__init__()
+        self.project_folder, self.name = project_folder, name
+
+    def outcome(self):
+        from agent_launcher.session import worktree
+        return worktree.ensure(self.project_folder, self.name).name, ""
+
+
+class DiscoverProjectsDialog(QDialog):
+    """Achar projetos no histórico: lista, marcadas, as pastas que `launcher projects discover --add` cadastraria; Cadastrar
+    grava só as que continuam marcadas. `added` é quantas foram cadastradas."""
+
+    def __init__(self, parent, home: Path):
+        super().__init__(parent)
+        self.setWindowTitle("Achar projetos no histórico")
+        self.home = home
+        self.added = 0
+        self.addable: list[dict] = []
+        self.resize(640, 420)
+        layout = QVBoxLayout(self)
+        self.status = QLabel("Procurando no histórico…")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.list = QListWidget()
+        self.list.setAccessibleName("Pastas achadas no histórico")
+        layout.addWidget(self.list, 1)
+        actions = QHBoxLayout()
+        self.register_button = QPushButton("Cadastrar marcados")
+        self.register_button.setEnabled(False)
+        self.register_button.clicked.connect(self.register)
+        actions.addWidget(self.register_button)
+        actions.addStretch()
+        close = QPushButton("Fechar")
+        close.clicked.connect(self.reject)
+        actions.addWidget(close)
+        layout.addLayout(actions)
+        task = self.task = DiscoverTask(home)
+        run_task(task, lambda rows, text="": task is self.task and self.show_rows(rows))
+
+    def show_rows(self, rows) -> None:
+        if isinstance(rows, Exception):
+            self.status.setText(f"Não foi possível ler o histórico: {rows}")
+            return
+        self.addable = [row for row in rows if row["addable"]]
+        for row in self.addable:
+            item = QListWidgetItem(f"{row['name']} • {row['path']} • {plural(row['conversations'], 'conversa', 'conversas')}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.list.addItem(item)
+        left_out = len(rows) - len(self.addable)
+        self.register_button.setEnabled(bool(self.addable))
+        if not self.addable:
+            self.status.setText("Nenhuma pasta nova no histórico para cadastrar.")
+        else:
+            rest = f" {plural(left_out, 'pasta fica', 'pastas ficam')} de fora: já cadastradas ou recusadas (veja `launcher projects discover`)." if left_out else ""
+            self.status.setText(f"{plural(len(self.addable), 'pasta achada', 'pastas achadas')}; desmarque o que não quer.{rest}")
+
+    def register(self) -> None:
+        """Cadastra as pastas marcadas, com o nome da pasta, e fecha a janela."""
+        from agent_launcher.session import discovery
+        numbers = [number for number in range(len(self.addable)) if self.list.item(number).checkState() == Qt.CheckState.Checked]
+        selected = [self.addable[number] for number in numbers]
+        try:
+            self.added += discovery.register(Store(self.home), selected)
+        except (LauncherError, OSError, ValueError) as error:
+            self.status.setText(f"Não foi possível cadastrar: {error}")
+            return
+        for number in numbers:
+            if self.addable[number]["added"]:
+                item = self.list.item(number)
+                item.setCheckState(Qt.CheckState.Unchecked)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+        failed = [row for row in selected if not row["added"]]
+        if failed:
+            self.status.setText(f"{plural(self.added, 'pasta cadastrada', 'pastas cadastradas')}; "
+                                f"{len(failed)} recusada(s): {failed[0]['reason']}")
+            return
+        self.accept()
+
+
 class SourceCostsTask(BackgroundTask):
     """Custo do mês por fonte (a rota `costs` do conector da conexão) fora da thread da interface: é uma chamada de rede."""
 
@@ -931,20 +1100,6 @@ MODEL_ORDERS = (("Ordenar: Nome", "name"), ("Ordenar: Contexto", "context"), ("O
 MODEL_ORDER_TIPS = {"name": "Família e versão mais nova primeiro",
                     "context": "Maior contexto de entrada primeiro; o que o conector não informou vai para o fim",
                     "price": "Menor preço de entrada primeiro; o que o conector não informou vai para o fim"}
-
-
-def order_models(records: list, order: str) -> list:
-    """Os modelos na ordem pedida: "name" (família e versão mais nova primeiro, a ordem de sempre), "context" (maior
-    entrada primeiro) ou "price" (menor preço de entrada primeiro). Quem não tem o dado vai para o fim, na ordem do nome."""
-    families = {"opus": 0, "sonnet": 1, "haiku": 2}
-    ordered = sorted(records, key=lambda record: record.version, reverse=True)
-    ordered.sort(key=lambda record: families.get(record.family, 3))
-    values = {"context": lambda record: record.max_input_tokens, "price": lambda record: record.input_cost_per_token}
-    if order not in values:
-        return ordered
-    known = [record for record in ordered if values[order](record) is not None]
-    known.sort(key=values[order], reverse=order == "context")
-    return known + [record for record in ordered if values[order](record) is None]
 
 
 def models_text(records: list, catalog) -> str:
@@ -993,6 +1148,17 @@ class UsageDialog(QDialog):
             self.month_choice.addItem(month, month)
         self.month_label.setBuddy(self.month_choice)
         choice.addWidget(self.month_choice)
+        self.view_label = QLabel("Visão")
+        choice.addWidget(self.view_label)
+        self.view_choice = ReadableCombo()
+        self.view_choice.setAccessibleName("Visão do uso")
+        self.view_choice.setToolTip("Por modelo: o mês escolhido. Por dia e Blocos de 5 h: os últimos dias deste perfil, "
+                                    "como `launcher usage --days` e `--blocks`")
+        for text, view in (("Por modelo", "models"), (f"Por dia ({usage.DIALOG_DAYS} dias)", "days"),
+                           ("Blocos de 5 h", "blocks")):
+            self.view_choice.addItem(text, view)
+        self.view_label.setBuddy(self.view_choice)
+        choice.addWidget(self.view_choice)
         self.everyone_check = QCheckBox("Somar todos os perfis")
         self.everyone_check.setToolTip("Soma o uso de todos os perfis numa tabela só; a tabela de um perfil mostra só o dele")
         self.everyone_check.setVisible(len(profiles.list_profiles(profiles.base_of(home))) > 1)
@@ -1017,6 +1183,14 @@ class UsageDialog(QDialog):
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table, 1)
+        self.period_table = UsageTable(0, 0)
+        self.period_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.period_table.verticalHeader().setVisible(False)
+        self.period_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.period_table.horizontalHeader().setStretchLastSection(True)
+        self.period_table.hide()
+        layout.addWidget(self.period_table, 1)
+        self.period = None  # (visão, linhas do relatório) mostrado na tabela de período
         self.source_costs_title = self.source_costs_status = self.source_costs_table = self.source_costs_task = None
         if self.gateway is not None:
             self.build_source_costs(layout)
@@ -1070,7 +1244,9 @@ class UsageDialog(QDialog):
         actions.addWidget(close)
         layout.addLayout(actions)
         self.report = None
+        self.period_task = None
         self.month_choice.currentIndexChanged.connect(self.calculate)
+        self.view_choice.currentIndexChanged.connect(self.calculate)
         self.calculate()
 
     def build_source_costs(self, layout: QVBoxLayout) -> None:
@@ -1138,18 +1314,73 @@ class UsageDialog(QDialog):
         self.fit_source_costs_height()
 
     def calculate(self) -> None:
-        """Calcula o mês escolhido; o resultado de uma escolha anterior que chega depois é descartado."""
+        """Calcula o mês escolhido (ou o período da visão); o resultado de uma escolha anterior que chega depois é descartado."""
+        view = self.view_choice.currentData()
+        by_model = view == "models"
+        self.table.setVisible(by_model)
+        self.period_table.setVisible(not by_model)
+        self.month_choice.setEnabled(by_model)
+        self.everyone_check.setEnabled(by_model)
+        self.period_task = None
+        if not by_model:
+            self.calculate_period(view)
+            return
         if self.gateway is not None:
             self.load_source_costs()
         self.status.setText("Calculando…")
         self.error.hide()
-        self.report = self.limit_basis = None
+        self.report = self.limit_basis = self.period = None
         self.show_limit_note()
         self.copy_button.setEnabled(False)
         self.save_button.setEnabled(False)
         self.table.setRowCount(0)
         task = self.task = UsageTask(self.home, self.month_choice.currentData(), self.everyone_check.isChecked())
         run_task(task, lambda report, text="": task is self.task and self.show_report(report, text))
+
+    def calculate_period(self, view: str) -> None:
+        """Uso por dia ou em blocos de 5 h do perfil, fora da thread da interface."""
+        self.status.setText("Calculando…")
+        self.error.hide()
+        self.task = self.report = self.limit_basis = self.period = None
+        self.show_limit_note()
+        self.copy_button.setEnabled(False)
+        self.save_button.setEnabled(False)
+        self.period_table.setRowCount(0)
+        header = usage.USAGE_DAYS_HEADER if view == "days" else usage.USAGE_BLOCKS_HEADER
+        self.period_table.setColumnCount(len(header))
+        self.period_table.setHorizontalHeaderLabels(list(header))
+        for column in range(1 if view == "days" else 4, len(header)):
+            self.period_table.horizontalHeaderItem(column).setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        task = self.period_task = PeriodTask(self.home, view)
+        run_task(task, lambda rows, text="": task is self.period_task and self.show_period(view, rows))
+
+    def show_period(self, view: str, rows) -> None:
+        if isinstance(rows, Exception):
+            self.status.setText("")
+            self.error.setText(f"Não foi possível calcular o uso: {rows}")
+            self.error.show()
+            return
+        lines = usage.usage_days_rows(rows) if view == "days" else usage.usage_blocks_rows(rows)
+        self.period = (view, rows) if rows else None
+        self.copy_button.setEnabled(self.period is not None)
+        self.save_button.setEnabled(self.period is not None)
+        days = usage.DIALOG_DAYS if view == "days" else usage.BLOCKS_HISTORY_DAYS
+        self.status.setText("" if rows else f"Nenhum uso nos últimos {days} dias.")
+        first_right = 1 if view == "days" else 4
+        self.period_table.setRowCount(len(lines))
+        for number, line in enumerate(lines):
+            for column, value in enumerate(line):
+                item = QTableWidgetItem(value)
+                if column >= first_right:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if view == "blocks" and rows[number]["active"]:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                if column == len(line) - 1 and (value == "sem preço" or value.endswith("(parcial)")):
+                    tone_item(item, MUTED)
+                self.period_table.setItem(number, column, item)
 
     def show_report(self, report, _text: str = ""):
         if isinstance(report, Exception):
@@ -1181,14 +1412,24 @@ class UsageDialog(QDialog):
                     tone_item(item, MUTED)
                 self.table.setItem(number, column, item)
 
+    def report_text(self) -> tuple[str, str]:
+        """O texto separado por tabulação da visão mostrada e o nome de arquivo sugerido para ele."""
+        if self.period is None:
+            return usage_text(self.report), f"uso-{self.report['month']}.tsv"
+        view, rows = self.period
+        if view == "days":
+            return usage.usage_days_text(rows), "uso-por-dia.tsv"
+        return usage.usage_blocks_text(rows), "uso-blocos.tsv"
+
     def copy(self) -> None:
-        QApplication.clipboard().setText(usage_text(self.report))
+        QApplication.clipboard().setText(self.report_text()[0])
         self.copied.setText("Relatório copiado: cole numa planilha, cada valor vai para a sua coluna.")
 
     def save(self, path: str | None = None) -> None:
         """Grava o texto do relatório (o mesmo do Copiar, separado por tabulação) no arquivo escolhido."""
         try:
-            saved = save_text_file(self, "Salvar relatório de uso", f"uso-{self.report['month']}.tsv", usage_text(self.report), path)
+            text, name = self.report_text()
+            saved = save_text_file(self, "Salvar relatório de uso", name, text, path)
         except OSError as error:
             self.copied.setText(f"Não foi possível salvar: {error}")
             return
@@ -1360,6 +1601,7 @@ class LauncherWindow(QMainWindow):
         self.refreshing = False
         self.sessions = []
         self.reopening = False
+        self.worktree_task = None
         self.terminal_installing = False
         self.terminal_updating = False
         self.cli_versions = {}
@@ -1629,6 +1871,7 @@ class LauncherWindow(QMainWindow):
         menu.setToolTipsVisible(True)
         self.add_project_actions(menu, context=False)
         menu.addSeparator()
+        menu.addAction("Achar projetos no histórico…", self.find_projects_in_history)
         menu.addAction("Conexões…", self.manage_connections)
         menu.addAction("Diagnóstico da conexão", self.show_diagnostics)
         self.bypass_preference = QAction("Bypass marcado por padrão", self)
@@ -1990,6 +2233,9 @@ class LauncherWindow(QMainWindow):
         self.run_next_cli_update()
         self.update_actions()
 
+    DEFERRED_STAGES = {"sessions": "Adiada · sessões abertas", "locked": "Adiada · arquivo em uso",
+                       "other_window": "Adiada · outra janela"}
+
     @staticmethod
     def sessions_note(count: int) -> str:
         return (f" {plural(count, 'sessão aberta segue', 'sessões abertas seguem')} na versão antiga; a nova vale na "
@@ -2027,7 +2273,7 @@ class LauncherWindow(QMainWindow):
         found = self.cli_versions.get(cli) or {}
         if isinstance(result, cli_update.UpdateDeferred):
             self.clear_error(f"cli:{cli}")
-            self.cli_buttons[cli].finish_update("Adiada · sessões abertas")
+            self.cli_buttons[cli].finish_update(self.DEFERRED_STAGES.get(result.reason, "Adiada"))
             self.show_info(str(result), origin=f"cli:{cli}")
         elif isinstance(result, Exception):
             self.cli_failed.add((cli, found.get("latest")))
@@ -2665,6 +2911,14 @@ class LauncherWindow(QMainWindow):
         except (LauncherError, OSError, ValueError):
             return []
 
+    def project_branch(self) -> str | None:
+        """O ramo git atual da pasta do projeto (None fora de repositório ou com a cabeça solta)."""
+        from agent_launcher.session import worktree
+        try:
+            return worktree.current_branch(project_path(self.project["path"]))[1]
+        except (LauncherError, OSError, ValueError):
+            return None
+
     def choose_conversation(self):
         if not self.project:
             return
@@ -2674,9 +2928,10 @@ class LauncherWindow(QMainWindow):
             return
         dialog = ConversationsDialog(found, self, registry.get(self.cli).LABEL, conversation_usages(self.store.home, found),
                                      self.selected_model, bool(self.catalog and self.catalog.verified),
-                                     command_for=self.resume_command_for)
+                                     command_for=self.resume_command_for, branch=self.project_branch(),
+                                     can_fork="fork" in registry.get(self.cli).CAPABILITIES)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected():
-            self.launch_session(True, conversation=dialog.selected())
+            self.launch_session(True, conversation=dialog.selected(), fork=dialog.fork)
 
     def reopen_candidates(self) -> list:
         return reopen.candidates(self.store)
@@ -2781,7 +3036,7 @@ class LauncherWindow(QMainWindow):
         self.populate_sources()
         self.populate_models()
 
-    def launch_session(self, resume=False, conversation=None):
+    def launch_session(self, resume=False, conversation=None, worktree=None, fork=False):
         if not self.project or not self.gateway or not self.selected_model or not self.online or self.refreshing:
             return
         self.clear_transient()
@@ -2801,7 +3056,9 @@ class LauncherWindow(QMainWindow):
         try:
             process = start_session(self.store, self.project, self.cli, self.selected_model.id, resume,
                                     bypass_permissions=bypass_permissions, connection=self.gateway.connection["id"],
-                                    **({"conversation": conversation} if conversation else {}))
+                                    **({"conversation": conversation} if conversation else {}),
+                                    **({"worktree": worktree} if worktree is not None else {}),
+                                    **({"fork": True} if fork else {}))
         except LauncherBusy as error:
             self.show_info(str(error), origin="sessao")
             return
@@ -2824,6 +3081,8 @@ class LauncherWindow(QMainWindow):
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(f"A janela abriu, mas não foi possível salvar a preferência: {error}")
         mode = " · bypass ativo" if bypass_permissions else ""
+        mode += " · em worktree" if worktree is not None else ""
+        mode += " · cópia da conversa" if fork else ""
         self.set_footer("sessao", f"{self.quota_note()}Janela aberta: {title}{mode}. A janela verifica a conexão antes de iniciar.")
         note = self.shared_resume_note() if resume else None
         if note:
@@ -3148,6 +3407,15 @@ class LauncherWindow(QMainWindow):
         except (LauncherError, OSError, ValueError) as error:
             self.show_error(str(error))
 
+    def find_projects_in_history(self) -> None:
+        """Item "Achar projetos no histórico…" do menu de opções: abre a janela e, se cadastrou algo, refaz a lista."""
+        dialog = DiscoverProjectsDialog(self, self.store.home)
+        dialog.exec()
+        if dialog.added:
+            self.store = Store(self.store.home)
+            self.populate_projects(self.project["id"] if self.project else None)
+            self.set_footer("importacao", f"{plural(dialog.added, 'projeto cadastrado', 'projetos cadastrados')} a partir do histórico.")
+
     def import_projects(self):
         path, _ = QFileDialog.getOpenFileName(self, "Importar projetos de outro config.json", str(Path.home()), "Configuração (*.json)")
         if not path:
@@ -3189,7 +3457,48 @@ class LauncherWindow(QMainWindow):
             menu.addAction("Copiar caminho", lambda: QApplication.clipboard().setText(self.project["path"]))
         if context and self.project:
             menu.addAction("Desafixar" if self.store.is_pinned(self.project) else "Fixar no topo", self.toggle_pinned)
+        if context and self.project and registry.get(self.cli).KIND == "terminal":
+            menu.addAction("Nova sessão em worktree…", self.open_in_worktree).setEnabled(self.launch_button.isEnabled())
         menu.add_danger_action("Remover do launcher…", self.remove_project)
+
+    def open_in_worktree(self) -> None:
+        """Item "Nova sessão em worktree…" do menu do projeto: pede o nome (vazio gera `sessao-AAAAMMDD-HHMMSS`) e abre a
+        nova sessão num worktree git do projeto, com o CLI, o modelo e a conexão escolhidos na tela. O worktree é preparado
+        em segundo plano; a sessão só abre quando ele está pronto."""
+        if self.worktree_task is not None:
+            self.show_info("Já há um worktree sendo preparado; espere ele terminar.", origin="worktree")
+            return
+        name, accepted = QInputDialog.getText(
+            self, "Nova sessão em worktree",
+            "Nome do worktree (a pasta fica ao lado do projeto, na branch launcher/NOME).\n"
+            "Vazio gera um nome com a data e a hora; repetir um nome reaproveita o worktree:")
+        if not (accepted and self.project):
+            return
+        project_id, cli = self.project["id"], self.cli
+        task = self.worktree_task = WorktreeTask(self.project["path"], name.strip())
+        self.clear_error("worktree")
+        self.set_footer("worktree", "Preparando o worktree…", busy=True)
+        run_task(task, lambda result, _text="": task is self.worktree_task and self.finish_worktree(project_id, cli, result))
+
+    def finish_worktree(self, project_id: str, cli: str, result) -> None:
+        """Fim da preparação do worktree: com o nome resolvido abre a sessão nele; o erro vai para a faixa de erros. Se o
+        projeto da tela mudou no meio, ou a conexão ou o modelo não estão prontos, o worktree fica criado, a sessão não abre
+        e a faixa de informação diz o motivo."""
+        self.worktree_task = None
+        self.end_footer("worktree")
+        if isinstance(result, Exception):
+            self.show_error(f"Não foi possível preparar o worktree: {result}", origin="worktree")
+        elif not (self.project and self.project["id"] == project_id):
+            self.show_info(f"O worktree {result} ficou pronto, mas o projeto da tela mudou: a sessão não abriu. Volte ao "
+                           "projeto e repita Nova sessão em worktree… com esse nome.", origin="worktree")
+        elif self.cli != cli:
+            self.show_info(f"O worktree {result} ficou pronto, mas a ferramenta da tela mudou: a sessão não abriu. Volte à "
+                           "ferramenta de antes e repita Nova sessão em worktree… com esse nome.", origin="worktree")
+        elif not (self.gateway and self.selected_model and self.online) or self.refreshing:
+            self.show_info(f"O worktree {result} ficou pronto, mas a conexão ou o modelo ainda não estão prontos: a sessão "
+                           "não abriu. Repita Nova sessão em worktree… com esse nome.", origin="worktree")
+        else:
+            self.launch_session(False, worktree=result)
 
     @staticmethod
     def open_sessions_of(project_id: str) -> list[dict]:

@@ -33,6 +33,26 @@ def path_key(value: str) -> str:
     return os.path.normcase(str(Path(value).resolve()))
 
 
+def protected_folder(folder: Path) -> str | None:
+    """Por que `folder` não vira projeto sem o cadastro explícito: a raiz de um disco, uma pasta do sistema ou uma pasta de
+    usuário (a do home, a que a contém e toda filha direta dela: outros perfis, Public, Default, All Users; as subpastas
+    delas servem); None quando serve."""
+    key = path_key(str(folder))
+    if folder.parent == folder:
+        return "a raiz de um disco"
+    system = os.environ.get("SystemRoot")
+    if system and (key == path_key(system) or key.startswith(path_key(system) + os.sep)):
+        return "uma pasta do sistema"
+    for name in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"):
+        if os.environ.get(name) and key == path_key(os.environ[name]):
+            return "uma pasta do sistema"
+    home = Path.home()
+    users = path_key(str(home.parent))
+    if key in (path_key(str(home)), users) or (home.parent != home and path_key(str(folder.parent)) == users):
+        return "uma pasta de usuário"
+    return None
+
+
 def validate_model(model: str) -> str:
     if not isinstance(model, str) or not MODEL_PATTERN.fullmatch(model):
         raise LauncherError("ID de modelo inválido. Use o ID completo do catálogo, incluindo o provider.")

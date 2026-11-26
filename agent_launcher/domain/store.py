@@ -14,8 +14,8 @@ from agent_launcher import connectors
 from agent_launcher.connectors import ConnectorError, QuotaExhausted
 from agent_launcher.domain.catalog import CLIS
 from agent_launcher.domain.errors import LauncherError
-from agent_launcher.domain.files import (atomic_json, clean_text, path_key, project_path, read_json_state,
-                                         read_text_retrying, validate_model)
+from agent_launcher.domain.files import (atomic_json, clean_text, path_key, project_path, protected_folder,
+                                         read_json_state, read_text_retrying, validate_model)
 from agent_launcher.domain.vault import Vault
 from version import data_home
 
@@ -298,6 +298,34 @@ class Store:
                 return project
         raise LauncherError("Projeto não cadastrado. Use 'projects add CAMINHO' ou a interface.")
 
+    def find_or_add_here(self, reference: str | None, folder: str, save: bool = True) -> tuple[dict, bool]:
+        """`--add-here`: o projeto da referência (sem ela, o da pasta `folder`) quando já está cadastrado; senão cadastra
+        `folder`, a pasta atual, com o nome dela; se a pasta já é um projeto (com outro nome), devolve esse projeto sem
+        cadastrar. A referência, se vier, tem de ser o nome ou o caminho dessa pasta, para um nome errado nunca virar
+        cadastro. Recusa a raiz de um disco, a pasta de usuário e as do sistema. Devolve
+        (projeto, recém-cadastrado); `save=False` cadastra só na memória (`--dry-run` não grava)."""
+        try:
+            return self.find(reference or folder), False
+        except LauncherError:
+            pass
+        here = project_path(folder)
+        if reference and reference.casefold() != here.name.casefold() and path_key(reference) != path_key(str(here)):
+            raise LauncherError(f"--add-here cadastra a pasta atual ({here}) com o nome dela, e {reference!r} não é esse "
+                                f"nome nem esse caminho. Omita --project, use --project {here.name!r} ou cadastre com "
+                                f"'projects add CAMINHO --name {reference}'.")
+        registered = next((project for project in self.projects if path_key(project["path"]) == path_key(str(here))), None)
+        if registered:
+            return registered, False
+        protected = protected_folder(here)
+        if protected:
+            raise LauncherError(f"--add-here não cadastra {protected}: {here}. Entre na pasta do projeto e repita, ou "
+                                "cadastre com 'projects add CAMINHO'.")
+        same_name = next((project for project in self.projects if project["name"].casefold() == here.name.casefold()), None)
+        if same_name:
+            raise LauncherError(f"Já existe um projeto chamado {same_name['name']!r} em {same_name['path']}, e --add-here "
+                                f"não renomeia. Cadastre esta pasta com 'projects add \"{here}\" --name OUTRO NOME'.")
+        return self.add(str(here), save=save), True
+
     def update(self, reference: str, name: str | None = None, path: str | None = None) -> dict:
         """Renomeia o projeto e/ou aponta para outra pasta existente; modelos e histórico de uso continuam."""
         project = self.find(reference)
@@ -475,6 +503,27 @@ class Store:
         if added:
             self.save()
         return added, skipped
+
+    def export_projects(self, destination: Path) -> int:
+        """Grava só nome e pasta de cada projeto, no formato que `import_legacy` lê. Recusa arquivo existente e pasta
+        de destino inexistente (nada é criado); devolve quantos projetos foram gravados."""
+        if destination.is_dir():
+            raise LauncherError(f"{destination} é uma pasta; informe o nome de um arquivo.")
+        if not destination.parent.is_dir():
+            raise LauncherError(f"A pasta de destino não existe: {destination.parent}. Crie a pasta ou escolha outro caminho.")
+        projects = [{"name": project["name"], "path": project["path"]} for project in self.projects]
+        try:
+            destination.open("x").close()  # a criação exclusiva é o que recusa o arquivo que outro processo criou agora
+        except FileExistsError:
+            raise LauncherError(f"{destination} já existe e não é sobrescrito. Escolha outro nome ou apague o arquivo antes.") from None
+        except OSError as error:
+            raise LauncherError(f"Não foi possível gravar {destination}: {error}") from error
+        try:
+            atomic_json(destination, {"projects": projects})
+        except OSError as error:
+            destination.unlink(missing_ok=True)
+            raise LauncherError(f"Não foi possível gravar {destination}: {error}") from error
+        return len(projects)
 
     # Conexões
 

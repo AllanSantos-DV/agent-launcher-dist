@@ -32,12 +32,22 @@ class Conversation:
     updated: float
     title: str
     messages: int | None
+    branch: str | None = None  # ramo git gravado pelo CLI ao abrir a conversa; None quando ele não grava
 
     def as_json(self) -> dict:
         def moment(value: float) -> str:
             return datetime.datetime.fromtimestamp(value).astimezone().isoformat(timespec="seconds")
         return {"id": self.id, "cli": self.cli, "started": moment(self.started), "updated": moment(self.updated),
                 "title": self.title, "messages": self.messages}
+
+
+@dataclass(frozen=True)
+class HistoryItem:
+    """Uma conversa do histórico de um CLI com a pasta onde ela rodou. `folder` é None quando o CLI guarda a conversa por
+    pasta mas o caminho real não se recupera com certeza; `label` é, nesse caso, o nome da pasta no histórico."""
+    folder: str | None
+    label: str
+    conversation: Conversation
 
 
 def vscode_shim(entry: str) -> bool:
@@ -56,6 +66,13 @@ def conversation_title(text) -> str:
     text = re.sub(r"\x1b?\[20[01]~", "", str(text or ""))
     text = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", text).split())
     return text if len(text) <= TITLE_LENGTH else text[:TITLE_LENGTH - 1].rstrip() + "…"
+
+
+def recorded_branch(value) -> str | None:
+    """O ramo gravado por um CLI: texto não vazio que não seja `HEAD` (o que o git diz na cabeça solta e o que o Claude
+    Code grava fora de um repositório); senão None."""
+    value = value.strip() if isinstance(value, str) else ""
+    return value if value and value != "HEAD" else None
 
 
 def parse_time(value, default: float = 0.0) -> float:
@@ -139,7 +156,7 @@ class Harness:
     LABEL = ""                      # "Claude Code"
     KIND = "terminal"               # "terminal" (janela de sessão), "ide" ou "app"
     CONSUMES: tuple = ()            # protocolos aceitos, em ordem de preferência
-    CAPABILITIES = frozenset()      # "resume", "controlled", "keys", "bypass", "context_window", "families"
+    CAPABILITIES = frozenset()      # "resume", "fork", "controlled", "keys", "bypass", "context_window", "families"
     SUBTITLE = ""                   # linha de baixo do botão na interface
     SYMBOL = "terminal"             # ícone do botão (ui/theme.PATHS)
     TAB_COLOR = "#286046"           # cor da aba no Windows Terminal
@@ -149,6 +166,7 @@ class Harness:
     SESSION_HINT = "Terminal com título do projeto"
     MISSING_HINT = ""               # como instalar à mão
     SCRUB = frozenset()             # variáveis herdadas que saem do ambiente da sessão (além das genéricas)
+    FORK_CONTROLLED = False         # a sessão controlada também retoma como cópia
     RESUME_BY_ID = False            # "retomar última" vai pelo id da conversa mais recente da pasta, não pelo CLI
     SCRUB_PREFIXES: tuple = ()
     EXECUTABLE = ""                 # nome no PATH
@@ -269,8 +287,14 @@ class Harness:
     def has_previous_conversation(self, directory: Path) -> bool:
         return False
 
-    def conversations(self, directory: Path) -> list[Conversation]:
-        """Conversas desta pasta que o destino retoma, mais recente primeiro. Só lê arquivos (não roda o CLI)."""
+    def conversations(self, directory: Path, detail: bool = True) -> list[Conversation]:
+        """Conversas desta pasta que o destino retoma, mais recente primeiro. Só lê arquivos (não roda o CLI). Com
+        `detail=False` só id e datas: o título vem vazio e `messages` None, sem ler o transcript inteiro para contá-las."""
+        return []
+
+    def history(self) -> list[HistoryItem]:
+        """Todas as conversas do histórico do destino, de qualquer pasta, cada uma com a pasta onde rodou (só leitura, sem o
+        detalhe do transcript). Vazio para o destino que não guarda histórico por pasta."""
         return []
 
     def dry_run_extra(self, plan) -> dict:

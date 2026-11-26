@@ -261,6 +261,20 @@ def merge_records(available: list, metadata: list) -> list[ModelInfo]:
     return records
 
 
+def order_models(records: list, order: str) -> list:
+    """Os modelos na ordem pedida: "name" (família e versão mais nova primeiro, a ordem de sempre), "context" (maior
+    entrada primeiro) ou "price" (menor preço de entrada primeiro). Quem não tem o dado vai para o fim, na ordem do nome."""
+    families = {"opus": 0, "sonnet": 1, "haiku": 2}
+    ordered = sorted(records, key=lambda record: record.version, reverse=True)
+    ordered.sort(key=lambda record: families.get(record.family, 3))
+    values = {"context": lambda record: record.max_input_tokens, "price": lambda record: record.input_cost_per_token}
+    if order not in values:
+        return ordered
+    known = [record for record in ordered if values[order](record) is not None]
+    known.sort(key=values[order], reverse=order == "context")
+    return known + [record for record in ordered if values[order](record) is None]
+
+
 def generation(model: str) -> int:
     """Geração do GPT pelo nome (gpt-5.4-mini -> 5, gpt-6-astra -> 6); 0 se não for GPT."""
     match = re.search(r"(?:^|[./])gpt-(\d+)", model.lower())

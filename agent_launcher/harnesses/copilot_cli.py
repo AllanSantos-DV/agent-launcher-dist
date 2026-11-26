@@ -16,8 +16,9 @@ from agent_launcher.connectors._http import NO_KEY, is_local_host
 from agent_launcher.domain.catalog import Catalog, ModelInfo, generation, protocol_for, token_label
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.harnesses import installers
-from agent_launcher.harnesses.base import (Conversation, Harness, conversation_title, count_lines, head_lines,
-                                           npm_cli_command, parse_time, same_folder)
+from agent_launcher.harnesses.base import (Conversation, Harness, HistoryItem, conversation_title, count_lines,
+                                           head_lines, npm_cli_command, parse_time, recorded_branch,
+                                           same_folder)
 from agent_launcher.session.plan import LaunchPlan
 
 PROVIDER_TYPES = {"messages": "anthropic", "responses": "openai", "chat_completions": "openai"}
@@ -71,10 +72,10 @@ def _counted_copilot_line(line: bytes) -> bool:
     return b'"type":"user.message"' in line
 
 
-def copilot_conversation(folder: Path, fields: dict) -> Conversation | None:
+def copilot_conversation(folder: Path, fields: dict, detail: bool = True) -> Conversation | None:
     events = folder / "events.jsonl"
     title = None
-    for line in head_lines(events):
+    for line in head_lines(events) if detail else ():
         if '"user.message"' not in line:
             continue
         try:
@@ -91,9 +92,10 @@ def copilot_conversation(folder: Path, fields: dict) -> Conversation | None:
         return None
     started = parse_time(fields.get("created_at"), status.st_ctime)
     updated = max(parse_time(fields.get("updated_at"), started), status.st_mtime, started)
-    messages = count_lines(events, _counted_copilot_line, b'"type":"user.message"') if events.is_file() else 0
+    messages = (count_lines(events, _counted_copilot_line, b'"type":"user.message"') if events.is_file() else 0) if detail else None
     return Conversation(fields.get("id") or folder.name, "copilot", started, updated,
-                        conversation_title(title or fields.get("summary")), messages)
+                        conversation_title(title or fields.get("summary")), messages,
+                        recorded_branch(fields.get("branch")))
 
 
 class CopilotCli(Harness):
@@ -192,15 +194,27 @@ class CopilotCli(Harness):
         """Sessões em ~/.copilot/session-state/<id>/workspace.yaml com `cwd: <pasta>` (a mais recente primeiro)."""
         return any(same_folder(_workspace(folder).get("cwd"), directory) for folder in _session_folders())
 
-    def conversations(self, directory: Path) -> list[Conversation]:
+    def conversations(self, directory: Path, detail: bool = True) -> list[Conversation]:
         found = []
         for folder in _session_folders():
             fields = _workspace(folder)
             if same_folder(fields.get("cwd"), directory):
-                conversation = copilot_conversation(folder, fields)
+                conversation = copilot_conversation(folder, fields, detail)
                 if conversation:
                     found.append(conversation)
         return sorted(found, key=lambda item: item.updated, reverse=True)
+
+    def history(self) -> list[HistoryItem]:
+        """As conversas que `conversations` lista (as 400 sessões mais recentes), de qualquer pasta: a pasta é o `cwd` do
+        workspace.yaml."""
+        items = []
+        for folder in _session_folders():
+            fields = _workspace(folder)
+            cwd = fields.get("cwd")
+            conversation = copilot_conversation(folder, fields, False) if cwd else None
+            if conversation:
+                items.append(HistoryItem(cwd, cwd, conversation))
+        return items
 
     def dry_run_extra(self, plan) -> dict:
         return {}

@@ -55,6 +55,8 @@ class LaunchPlan:
     window_pid: int | None = None   # primeiro processo da janela, quando não é este (janela nativa); None = este processo
     scrubbed: tuple[str, ...] = ()  # nomes das variáveis herdadas que saem do ambiente da sessão
     endpoint: EndpointRoute | None = None  # a sessão vai pelo endpoint local, não direto ao host
+    worktree: agent_launcher.session.worktree.Worktree | None = None  # a sessão abre num worktree do projeto (`launch --worktree`); `directory` é a pasta dele
+    fork: bool = False              # retomada como cópia da conversa (`launch --resume --conversation ID --fork`)
 
     @property
     def public_overrides(self) -> dict[str, str]:
@@ -83,6 +85,7 @@ class LaunchContext:
     input_limit: int | None
     conversation: str | None = None  # id da conversa a retomar (None: a última, --continue/resume --last)
     endpoint: EndpointRoute | None = None  # preferência da conexão ligada: o adaptador aponta a sessão para o endpoint
+    fork: bool = False  # retomar a conversa como cópia: a original fica como está e a sessão abre numa conversa nova
 
 
 def uses_endpoint(gateway, harness) -> bool:
@@ -103,7 +106,10 @@ def endpoint_route(gateway, harness) -> EndpointRoute | None:
 def build_plan(gateway, cli: str, directory: str, model: str, resume: bool = False,
                catalog: Catalog | None = None, preserve_terminal_title: bool = False,
                bypass_permissions: bool = False, controlled: bool = False, admin_note: str | None = None,
-               conversation: str | None = None) -> LaunchPlan:
+               conversation: str | None = None, worktree: agent_launcher.session.worktree.Worktree | None = None, fork: bool = False) -> LaunchPlan:
+    """O plano da sessão. Com `worktree`, a sessão roda na pasta dele (que pode ainda não existir, no `--dry-run`) em vez
+    da de `directory`. Com `fork` (exige `resume` e `conversation`), a conversa é retomada como cópia: o CLI cria uma
+    conversa nova a partir dela e a original não é tocada."""
     from agent_launcher.harnesses import registry
     harness = registry.get(cli)
     bypass_permissions = bypass_permissions or controlled
@@ -111,6 +117,13 @@ def build_plan(gateway, cli: str, directory: str, model: str, resume: bool = Fal
         raise LauncherError(f"O {harness.LABEL} não tem sessão controlada pelo orquestrador.")
     if cli not in gateway.clis:
         raise LauncherError(f"A conexão {gateway.name} não atende o {cli}. Escolha outra conexão ou o outro CLI.")
+    if fork:
+        if "fork" not in harness.CAPABILITIES:
+            raise LauncherError(f"O {harness.LABEL} não tem retomar como cópia.")
+        if controlled and not harness.FORK_CONTROLLED:
+            raise LauncherError(f"O {harness.LABEL} não retoma como cópia em sessão controlada pelo orquestrador.")
+        if not (resume and conversation):
+            raise LauncherError("--fork pede --resume e --conversation ID: a cópia sai de uma conversa escolhida.")
     model = validate_model(model)
     catalog = catalog or gateway.empty_catalog()
     listed = catalog.find(model)
@@ -127,11 +140,12 @@ def build_plan(gateway, cli: str, directory: str, model: str, resume: bool = Fal
     if catalog.records and not catalog.any_model and listed is None:
         warnings.append(f"O modelo {selected.id} não está no catálogo de {gateway.name}; o host pode tê-lo aposentado. "
                         "Escolha outro modelo da lista.")
-    path = project_path(directory)
+    path = worktree.path if worktree else project_path(directory)
     if resume:
         from agent_launcher.session.conversations import resume_target
         resume, conversation = resume_target(getattr(getattr(gateway, "store", None), "home", None), harness, path,
                                              conversation, warnings)
+        fork = fork and resume
     else:
         conversation = None
     command = harness.command()
@@ -145,12 +159,14 @@ def build_plan(gateway, cli: str, directory: str, model: str, resume: bool = Fal
     route = endpoint_route(gateway, harness)
     context = LaunchContext(gateway, catalog, selected, model, model, path, resume, bypass_permissions, controlled,
                             preserve_terminal_title, admin_note, command, environment, warnings, input_limit, conversation,
-                            route)
+                            route, fork)
     plan = harness.plan(context)
     plan.endpoint = route
+    plan.worktree = worktree
     plan.resume = resume
+    plan.fork = fork
     plan.scrubbed = tuple(sorted(scrubbed))
-    if resume and conversation:
+    if resume and conversation and not fork:
         plan.session_id = conversation
     environment.update(plan.overrides)
     local_hosts = ["127.0.0.1", "localhost"]

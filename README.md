@@ -13,7 +13,9 @@ O filtro "Entrada" lista só os modelos com visão, áudio ou vídeo; o modelo e
 ganha um aviso; **Ordenar** põe a lista por nome (a ordem de sempre), por contexto (maior primeiro) ou por preço de entrada
 (menor primeiro), com o que o host não informou sempre no fim; **Copiar lista** copia a lista filtrada, separada por tabulação; o botão direito num modelo oferece **Copiar ID**, que copia o ID completo dele, e **Testar modelo (1 token)…**, que mostra o custo em tokens e só faz a chamada real de 1 token depois de **Testar** (Cancelar é o padrão; nunca roda sozinho). O que o host informa sobre imagem também
 vai para o chat do VS Code (anexar imagem) e para o Codex (modelo declarado só de texto não recebe imagem); `launcher models`
-mostra visão, áudio e vídeo só do que o host informou.
+mostra visão, áudio e vídeo só do que o host informou, e `launcher models --sort name|context|price` ordena como o **Ordenar** (o que o
+host não informou vai para o fim; `name` é família e versão mais nova primeiro; sem a opção a lista sai na ordem do
+catálogo, por ID).
 A lista também traz a saída máxima e, na dica e na cópia, o preço por 1M de tokens (traço quando o host não informa). A lista de
 conversas para retomar mostra o contexto e o custo estimado de cada conversa (Claude Code e Codex) e o launcher avisa ao
 retomar uma conversa que já enche a janela do modelo escolhido.
@@ -93,8 +95,11 @@ Com **Atualizar as CLIs automaticamente** ligado (padrão), o launcher dispara o
 `npm install -g …@<versão publicada> --prefix <prefixo>` na instalação do npm que o launcher abre, recusando o shim
 sem pacote do npm ao lado, como os do pnpm e do yarn) e avisa "Codex atualizado: 0.162.1 → 0.164.0". Sessão
 aberta não impede: o Windows deixa renomear um .exe em execução, então a sessão segue na versão antiga e a nova vale na próxima
-abertura (a faixa diz quantas sessões estão nessa situação); só quando a tentativa bate num arquivo preso (npm com a CLI
-rodando) a atualização fica adiada, com o nome do processo e o PID, e tenta de novo na próxima verificação. Falha vira
+abertura (a faixa diz quantas sessões estão nessa situação); só quando a falha da tentativa cita arquivo preso da própria
+instalação (o executável da CLI ou a pasta do pacote dela) a atualização fica adiada, com o nome do processo e o PID quando
+há um, e o cartão diz a causa (sessões abertas, arquivo em uso ou outra janela atualizando); tenta de novo na próxima
+verificação. A trava de atualização guarda o PID de quem atualiza; se ele morreu, deixa de bloquear a abertura de sessão e a próxima atualização a assume na hora (só essa trava, nunca outro arquivo); trava de PID vivo ou sem PID vale pela idade (30 min).
+Qualquer outra falha (cache do npm sem permissão, rede, prefixo alheio) vai para `cli-install.log`. Falha vira
 aviso, nunca derruba o launcher, e no npm uma CLI que deixou de executar volta à versão anterior. Para desligar: o item do
 menu de opções, `launcher preferences --cli-auto-update off` ou `AGENT_LAUNCHER_NO_CLI_UPDATE=1`. Modo texto: `launcher cli`
 mostra as versões e `launcher cli --update claude|codex|copilot|all` atualiza na hora. VS Code e o app do Copilot ficam de
@@ -146,10 +151,15 @@ sobe ao abrir o destino e encerra sozinho após 4 h sem uso; `launcher endpoint 
 subir com o Windows (sem janela, sem admin), para o VS Code e o app acharem a conexão com o launcher fechado. O log
 (`~/.agent-launcher/endpoint.log`) tem rota, modelo, status e duração; nunca corpo, prompt ou chave; `launcher endpoint logs [--lines N] [--summary]` mostra o fim dele (com `--summary`, o resumo: pedidos, erros por modelo, failovers e latência). Além de repassar, o endpoint
 responde `GET /usage` (o uso do mês do perfil em JSON, só números; `?month=AAAA-MM` escolhe o mês e `?all=1` soma os
-perfis) e `GET /v1/models?capability=vision|audio|video|tools`, que lista só os modelos com a capacidade confirmada pelo
-catálogo (valor repetido ou separado por vírgula exige todas; valor desconhecido dá 400). Cada item de `/v1/models`
+perfis; `?limit=1` acrescenta `limit_status`, o gasto frente ao teto mensal do perfil, nulo com o teto desligado) e
+`GET /v1/models?capability=vision|audio|video|tools`, que lista só os modelos com a capacidade confirmada pelo
+catálogo (valor repetido ou separado por vírgula exige todas; valor desconhecido dá 400). `?search=` filtra pelo trecho
+do ID e `?source=` pela fonte inteira, sem diferença de maiúscula, como `launcher models --search/--source`; os filtros
+se combinam, e a conexão cujo conector não declara fontes não lista nada com `?source=`. Cada item de `/v1/models`
 traz `source`, o nome da fonte exatamente como o conector declarou, só quando o conector da conexão declara fontes e o
-modelo tem uma (sem fonte, o campo não vem).
+modelo tem uma (sem fonte, o campo não vem). `GET /quota` diz se a conexão atendida e a reserva estão marcadas com cota
+esgotada (`quota_active`, `quota_mark_at`); sem reserva, `fallback` vem nulo.
+`GET /status` devolve o mesmo JSON do `launcher status` (aceita `?month=AAAA-MM`), sem chaves, inclusive o `activity` de cada sessão aberta. Como o `launcher status`, ele lê o perfil e os registros de sessão, e pode descartar o registro de uma sessão cujo processo já terminou.
 
 **Conexão reserva.** Uma conexão pode ter outra como reserva. Quando a conexão atendida responde cota ou crédito
 esgotado (HTTP 429 com código de cota, ou 402 de pagamento, a mesma detecção do teste de conexão) antes de entregar
@@ -195,6 +205,10 @@ cada perfil ficam num arquivo próprio. Quem não cria perfil continua no **Padr
 - A mesma pasta em dois perfis é permitida, com aviso: os CLIs guardam o histórico por pasta, então **Retomar
   última** usa só as conversas abertas neste perfil (a interface avisa, sem perguntar).
 - Conectores do usuário (`~/.agent-launcher/connectors`) valem para todos os perfis.
+- **Achar projetos no histórico…** (menu ⋯ ao lado do projeto) lista, marcadas, as pastas do histórico de conversas do
+  Claude Code, do Codex e do Copilot CLI que `launcher projects discover --add` cadastraria; **Cadastrar marcados** grava só as
+  que continuam marcadas, com o nome da pasta. Pasta inexistente, de usuário, do sistema, worktree do launcher ou de nome já usado
+  fica de fora, e a janela diz quantas.
 - **Importar perfil…** (ou duplo clique num arquivo `.alprofile`) cria o perfil pronto, com conexões e conectores;
   **Exportar perfil…** gera esse arquivo. O arquivo nunca leva chave: se a conexão pede uma, o launcher pergunta.
 - **Compartilhar sem chave…** (painel Conexões) grava só a conexão selecionada num arquivo `.alprofile` (o mesmo formato do perfil,
@@ -204,7 +218,10 @@ cada perfil ficam num arquivo próprio. Quem não cria perfil continua no **Padr
 - **Uso do mês…**: tokens e custo estimado por destino e modelo, lidos das conversas e do endpoint deste perfil. Com mais de
   um perfil, **Somar todos os perfis** junta o uso de todos numa tabela só.
   É estimativa local; o custo usa o preço que o host informa no catálogo. **Copiar relatório** copia a tabela com os
-  valores separados por tabulação: colada numa planilha, cada valor cai na sua coluna.
+  valores separados por tabulação: colada numa planilha, cada valor cai na sua coluna. A caixa **Visão** troca a tabela
+  por **Por dia** (os últimos 14 dias) ou **Blocos de 5 h** (os últimos 8 dias, com o bloco ativo em negrito e o tempo
+  restante), os mesmos números de `launcher usage --days` e `--blocks`; nessas visões o mês e **Somar todos os perfis**
+  ficam desligados, e **Copiar relatório** e **Salvar em arquivo…** seguem a visão. O padrão continua **Por modelo**.
 - **Limite mensal** (campo no **Uso do mês…**, com **Salvar**): teto de gasto do mês, por perfil, em US$. A faixa de
   avisos da janela (âmbar) avisa ao chegar a 80% e a 100% dele. Nasce desligado (campo vazio, ou `off`) e só avisa:
   nada é bloqueado. O gasto é o custo estimado do mês; modelo sem preço fica fora da conta e o aviso diz **soma parcial**.
@@ -230,6 +247,21 @@ cada perfil ficam num arquivo próprio. Quem não cria perfil continua no **Padr
   **Copiar relatório**; `--by-source` imprime o custo do mês por fonte que o conector da conexão informa pela rota `costs`, na
   moeda dele, e falha se o conector não declara fontes ou não oferece a rota), `launcher usage --limit VALOR|off` (grava ou desliga o limite mensal do perfil; com o limite
   ligado, o JSON de `usage` e o de `status` ganham `limit` com valor, gasto, percentual, nível e se a soma é parcial),
+  `launcher usage --days N` (o uso de cada um dos N últimos dias, de 1 a 366, do de hoje para trás: tokens e custo estimado
+  por dia, pelos mesmos leitores do Claude Code, Codex e Copilot CLI e pelo endpoint local; dia sem uso não aparece; JSON,
+  ou `--tsv` em tabela; não combina com `--month`, `--months`, `--by-source`, `--all` nem `--limit`; guarda o cache em
+  `cache/usage-days.json`, sem mexer no do mês),
+  `launcher usage --blocks [--active]` (os blocos de 5 horas de uso dos últimos 8 dias, como `ccusage blocks`: cada bloco
+  começa na hora cheia, **no fuso local da máquina** (o ccusage usa UTC), da primeira requisição e dura 5 h; uma requisição no
+  fim do bloco ou depois dele abre o seguinte. Por bloco: início, fim, se está ativo, o tempo restante do ativo, tokens e custo,
+  com a mesma regra de custo e de `cost_complete` do `--days`, pelos leitores do Claude Code, Codex e Copilot CLI e pelo
+  endpoint local; JSON, ou `--tsv` em tabela; `--active` deixa só o bloco em andamento. **O custo é o equivalente de API, não o
+  da assinatura.** O bloco sai do carimbo de tempo de cada requisição, com resolução de um minuto no primeiro e no último pedido do bloco (Claude: de cada resposta;
+  Codex: de cada evento `token_count`; Copilot CLI: de cada `session.usage_record`, e, só nas sessões sem esses registros, do
+  encerramento da sessão), e não do reset que a assinatura informa: o `rate_limits` do Codex traz a janela semanal ou nada,
+  nunca a de 5 h, e o Claude não grava o limite nas conversas. Uso fora do launcher (Claude Desktop, outra máquina) não
+  aparece. Não combina com `--month`, `--months`, `--by-source`, `--all`, `--limit` nem `--days`; guarda o cache em
+  `cache/usage-blocks.json`, sem mexer nos outros),
   `launcher status` e `launcher --profile NOME <comando>`.
 - Os perfis extras ficam em `~/.agent-launcher/profiles/<id>/`; o orquestrador lista e abre projetos de todos.
 
@@ -314,7 +346,15 @@ também não as mistura com as do launcher. A última conversa do Codex é retom
 se ela estiver aberta em outra janela ou programa, a sessão não abre e o aviso diz onde ela está (uma sessão que já
 fechou e deixou o Codex preso é liberada sozinha). A seta ao lado abre **Escolher conversa…**: a lista das
 conversas do projeto (data, título, mensagens, contexto e custo estimado) para retomar qualquer uma, não só a última; o campo
-acima da lista filtra por título, data ou CLI e **Copiar lista** copia as linhas à vista, separadas por tabulação.
+acima da lista filtra por título, data ou CLI e **Copiar lista** copia as linhas à vista, separadas por tabulação (`launcher conversations --tsv` imprime esse mesmo texto, com traço no
+custo desconhecido). Esse filtro olha só título, data e CLI; a caixa **Só o ramo X** (desligada por padrão; só aparece quando a pasta é um repositório com ramo) esconde as
+conversas gravadas em outro ramo, sem mexer no texto do filtro; a caixa **Buscar também no texto das mensagens** (desligada
+por padrão) faz o Enter no campo ler as mensagens e somar à lista as conversas que têm o texto, com a mesma busca (e os mesmos tetos,
+avisados na janela) do `launcher conversations --grep TEXTO`, que procura dentro das mensagens procura dentro das mensagens
+(a sua e a do modelo, sem distinguir maiúsculas) das conversas de Claude Code, Codex e Copilot CLI, e deixa de fora metadados,
+resultados de ferramenta, raciocínio e o contexto de ambiente. Só lê os transcripts, nunca grava nada neles; a busca para em 30 s
+no total, lê no máximo 64 MiB de cada conversa e pula linha acima de 16 MiB, e o que ficou sem ler aparece como `[AVISO]` no stderr.
+Valor vazio é erro. Com `--command`, a posição conta a lista já filtrada pelo `--grep`.
 **Copiar comando de retomada** copia, para a conversa selecionada, o comando do cmd que a continua num terminal seu (SSH,
 outro shell): vai à pasta do projeto, limpa do shell as variáveis que o launcher tira do ambiente das sessões, define o
 ambiente da conexão e roda o CLI com o modelo escolhido na tela; é o mesmo plano do botão **Retomar** e do `--dry-run`, que
@@ -322,6 +362,12 @@ segue como está. **Copiar para PowerShell**, ao lado, copia o mesmo comando esc
 nunca vai no texto: no lugar dela fica `<sua chave>`, na variável de ambiente que o CLI lê. Vale para Claude Code, Codex e
 Copilot CLI. Em modo texto:
 `launcher conversations --project X` e `launch --resume --conversation ID`.
+**Retomar como cópia** (Claude Code e Codex), na mesma janela, abre a conversa selecionada numa conversa nova copiada dela
+(`--fork-session` do Claude Code, `codex fork ID`): a original fica como está, e no Codex a cópia não espera a trava de escritor
+da conversa original. Em modo texto, `launch --resume --conversation ID --fork`; o Copilot CLI e a sessão controlada do Codex
+recusam com o motivo. O id da conversa nova é do CLI (o launcher não o escolhe), então a cópia não entra no registro de
+conversas por perfil: numa pasta compartilhada entre perfis ela não aparece na lista do perfil, e o **Reabrir sessões
+recentes…** não a reabre.
 **Reabrir sessões recentes…**, no mesmo menu da seta (e em `Ctrl+Shift+H`, que vale mesmo sem conversa no projeto selecionado), serve para depois de reiniciar o Windows: lista as sessões abertas nas últimas 24 horas que não estão abertas agora, uma por projeto e CLI (a mais recente), e reabre as que você marcar, em sequência, cada uma na própria conversa, como aba da mesma janela do Terminal e sem tirar o foco de quem está trabalhando; o resumo diz quantas abriram e, de cada uma que falhou, o motivo, e uma falha não impede as outras. O Claude Code retoma pelo id exato da conversa. O Codex e o Copilot CLI não guardam o id na abertura: vale a conversa que começou até 10 minutos depois dela, e só quando nenhuma outra abertura da pasta disputa essa conversa. Sem essa certeza a linha vem desmarcada e desabilitada, com o motivo ("conversa não identificada"), e nunca retoma outra conversa; o mesmo vale para o Claude Code aberto por **Retomar última** (sem id gravado). Cada sessão reabre com a conexão e o modelo da abertura, sem bypass. **Retomar última** e **Escolher conversa…** não mudam. Sem conversa anterior (inclusive numa sessão aberta pelo orquestrador), a retomada vira
 sessão nova, com um aviso na janela, em vez de parar em "No conversation found to continue". Com o Windows Terminal instalado, cada sessão vira
 uma aba da janela **agent-launcher** (laranja para Claude Code, verde para Codex), com o título
@@ -330,10 +376,10 @@ sessões. Quando uma sessão termina com o launcher minimizado ou sem foco, o Wi
 mensagem do rodapé; o ícone da bandeja só existe enquanto há sessão aberta ou aviso a mostrar. A lista de projetos fica do mais
 recente para o mais antigo e se reordena a cada abertura, com os projetos fixados no topo; projeto com sessão
 aberta agora (por esta ou por outra janela do launcher) aparece com "· aberta" ou "· 2 abertas", e a dica diz quais CLIs.
-O botão direito em um projeto abre a pasta, abre no VS Code (só com o VS Code instalado, no seu perfil normal), mostra
+O botão direito em um projeto abre a pasta, abre no VS Code (só com o VS Code instalado, no seu perfil normal), abre uma **nova sessão em worktree…** (veja **Sessão em worktree**), mostra
 **a tela da sessão aberta** (a tela é só leitura e a janela dela não vem para a frente; o botão **Enviar**, ao lado do campo **Teclas a enviar**, responde um diálogo parado da sessão com as mesmas fichas do `launcher keys`, e só envia quando você clica: nunca ao abrir, ao atualizar nem por timer), edita (nome e pasta),
 **fixa no topo** (ou desafixa; o fixado aparece com um alfinete no lugar da pasta) ou remove o cadastro. O botão do olho ao lado de **Retomar última** mostra, antes de abrir, o que a nova sessão vai iniciar
-(comando, conexão, modelo, ambiente e avisos, sem a chave); **Copiar comando** e **Copiar para PowerShell**, nessa janela, copiam o comando que abre essa mesma sessão nova num terminal seu (SSH, outro shell), como o comando de retomada: pasta, limpeza do ambiente, variáveis e o CLI com o modelo escolhido, com `<sua chave>` no lugar da chave (só sessões de terminal; **Copiar resumo** segue igual). `Ctrl+K` busca projetos, `Ctrl+F` modelos, `Ctrl+N` adiciona
+(comando, conexão, modelo, janela e preço por 1M do modelo, com traço onde o host não informou, ambiente e avisos, sem a chave); **Copiar comando** e **Copiar para PowerShell**, nessa janela, copiam o comando que abre essa mesma sessão nova num terminal seu (SSH, outro shell), como o comando de retomada: pasta, limpeza do ambiente, variáveis e o CLI com o modelo escolhido, com `<sua chave>` no lugar da chave (só sessões de terminal; **Copiar resumo** segue igual). `Ctrl+K` busca projetos, `Ctrl+F` modelos, `Ctrl+N` adiciona
 projeto, `F5` atualiza o catálogo, `Ctrl+R` retoma a última conversa, `Ctrl+H` escolhe a conversa, `Ctrl+Shift+H` reabre sessões recentes, `Ctrl+U` abre o uso do mês e `Ctrl+Enter` abre a Nova sessão.
 No menu **…**, **Tema da interface…** escolhe Claro, Escuro ou Seguir o Windows e a cor de destaque (Verde, Azul, Roxo
 ou Grafite); a troca vale na hora, inclusive nas janelas abertas, e fica gravada para todos os perfis.
@@ -347,6 +393,49 @@ alterados.
   versão disponível de cada família, preferindo o mesmo provider do modelo escolhido. Família ausente no host usa o
   modelo principal, com aviso, em vez de cair num ID que o host não tem.
 - **Codex:** provider `agent_launcher` por `-c` (`base_url`, `env_key=AGENT_LAUNCHER_API_KEY`, `wire_api=responses`).
+
+### Sessão em worktree
+
+Duas sessões abertas na mesma pasta (a lista mostra "· 2 abertas") podem sobrescrever a edição uma da outra. `launcher launch
+--worktree [NOME]` abre a sessão num **worktree git** do projeto: uma cópia de trabalho própria, com branch própria, que divide
+o histórico do repositório com o projeto. Sem a opção, nada muda: a sessão abre na pasta do projeto, como sempre.
+
+- **Onde fica:** na pasta irmã do projeto, `<pai do projeto>/<nome do projeto>.worktrees/NOME`, na branch nova `launcher/NOME`
+  (a partir do HEAD do projeto). Fora da pasta do projeto, o `git status` dele não muda. Sem NOME, o nome é
+  `sessao-AAAAMMDD-HHMMSS`. O NOME serve de pasta e de trecho de branch: até 64 letras, números, `.`, `-` ou `_`, começando por
+  letra ou número, sem `..`, sem terminar em `.` ou `.lock`, sem nome reservado do Windows (`con`, `nul`...).
+- **Reaproveitar:** repetir o mesmo NOME abre a sessão no worktree que o launcher criou, se ele está na branch `launcher/NOME`; o
+  trabalho que está lá fica como está, e retomar (`--resume`) acha as conversas dele. O launcher só reaproveita o que ele mesmo
+  terminou de criar: depois do `git worktree add` com sucesso grava o marcador `launcher-pronto` na pasta administrativa do
+  worktree (`.git/worktrees/<nome>/`, fora do working tree). Worktree sem o marcador (o `git worktree add` passou de 60 s e foi
+  encerrado, foi interrompido, ou você o criou à mão) é recusado como incompleto, com o comando para conferir
+  (`git -C <worktree> status`) e para recomeçar (`git worktree remove --force <pasta>` e `git branch -D launcher/NOME`, por você).
+  Qualquer outra coisa no lugar (pasta que não é worktree deste projeto, worktree em outra branch, branch `launcher/NOME` que já
+  existe sem worktree) também é erro com o que fazer, e nada é sobrescrito.
+- **Exige:** o git instalado (sem rede), e a pasta do projeto ser a **raiz** de um repositório git com ao menos um commit; fora
+  disso o erro diz o que falta. O worktree traz só o que está versionado: `node_modules`, `.env` e outros arquivos ignorados
+  não são copiados.
+- **Limite conhecido:** a criação roda o git na thread da interface; num repositório muito grande ou preso, a tela pode ficar
+  parada por até 60 s (o teto do git) antes de o erro aparecer.
+- **Não remove nada:** o launcher nunca apaga worktree nem branch, para não perder trabalho. Para remover, quando a sessão
+  acabar: `git worktree remove <pasta do worktree>` e, se quiser, `git branch -d launcher/NOME` (um `git worktree prune` limpa o
+  registro de uma pasta que você apagou à mão).
+- **Listar:** `launcher worktrees --project "Meu app"` (só leitura; sem `--project` vale o projeto da pasta atual) mostra os
+  worktrees que ficam na pasta irmã `<projeto>.worktrees` — nome, branch, pasta, se tem o marcador `launcher-pronto` e se a
+  pasta existe —, e `--json` entrega a mesma lista em JSON (`name`, `branch`, `path`, `exists`, `ready`; `branch` é null com a
+  cabeça solta e `ready` é null quando a pasta sumiu). O worktree principal e os que você criou fora dessa pasta não entram.
+  O comando nunca cria, altera nem remove nada: a remoção é `git worktree remove`, por você.
+- **Plano:** `launch --worktree NOME --dry-run` mostra o plano com `project` apontando para o worktree e uma chave nova
+  `worktree` (`name`, `branch`, `path`, `project`, `exists`), só presente com a opção; as demais chaves ficam como eram. O
+  `--dry-run` não cria nada (`exists` diz se o worktree já existe). `--command` escreve o `cd /d` na pasta do worktree. A janela
+  do olho (**O que vai abrir**) ganha a linha `Worktree:` só nesse caso.
+- **Registro:** a sessão continua cadastrada no projeto (a marca "· aberta" da lista e o `launcher keys` não mudam); o registro
+  de aberturas do perfil guarda a pasta do worktree, e **Reabrir sessões recentes…** (`sessions --reopen`) reabre a sessão no
+  worktree dela, com o nome na linha.
+- **Quais destinos:** Claude Code, Codex e Copilot CLI, igual para os três: só muda a pasta em que a sessão roda. VS Code e
+  GitHub Copilot app abrem numa pasta própria e recusam a opção com uma mensagem.
+- **Pela interface:** botão direito no projeto, **Nova sessão em worktree…** (só quando o destino escolhido é de terminal):
+  pergunta o NOME (vazio gera um) e abre com o CLI, o modelo e a conexão escolhidos na tela.
 
 ### Contexto
 
@@ -488,6 +577,25 @@ launcher keys --project "Meu app" --wait "Do you want to proceed" --timeout 120 
 Em Python: `keys.sessions()`, `keys.resolve(ids_do_projeto, cli, pid)`, `keys.send(pid, tokens)`,
 `keys.read_screen(pid)`, `keys.wait_for_text(pid, texto, prazo)`.
 
+**Estado e última atividade das sessões:** cada sessão de `sessions` no `launcher status` (e no `GET /status`) traz um
+objeto novo `activity` com `last_activity` (carimbo ISO, com fuso, da última gravação do transcript da sessão) e `state`:
+`working` se essa gravação tem menos de 30 s (`WORKING_WINDOW_S` em `session/activity.py`: os três CLIs gravam a cada
+mensagem e a cada ferramenta, e 30 s cobre o intervalo comum entre elas), `idle` se passou disso e `unknown` (com
+`last_activity` nulo) quando não há transcript seguro para a sessão. Não diz que o CLI espera por você: é só a idade da
+última gravação, então uma geração longa ou uma ferramenta lenta pode aparecer como `idle`. Os campos que já existiam
+não mudam, e `launcher keys --list` segue igual. O launcher só lê o transcript (Claude `~/.claude/projects`, Codex
+`~/.codex/sessions`, Copilot CLI `~/.copilot/session-state`), nunca o grava, e ignora arquivo ausente ou linha inválida.
+Como acha o transcript: cada abertura do registro do perfil (`sessions.jsonl`), na pasta do projeto ou na do worktree dele,
+vai para a sessão aberta do mesmo projeto e CLI que registrou mais recentemente antes dela, e a sessão só vale com
+exatamente uma abertura (a conversa é procurada na pasta em que a abertura aconteceu); daí vale a mesma regra do
+**Retomar**: no Claude o id da conversa que o launcher passou (`--session-id`, ou a retomada por id) e, no Codex e no
+Copilot CLI, a primeira conversa que começou depois da abertura, se nenhuma outra abertura da pasta a reivindica. Duas
+sessões do mesmo projeto e CLI abertas em instantes diferentes se resolvem cada uma na sua conversa; em qualquer dúvida
+(duas abertas juntas sem id, Claude retomado com `--continue` sem id, conversa que ainda não tem transcript, projeto de
+outro perfil) as duas ficam `unknown`, nunca um palpite; o mesmo vale para todas as sessões de um projeto e CLI que têm
+aberturas na pasta do projeto e em worktree quando alguma delas não pode ser atribuída com certeza. A janela principal não mostra esse estado: resolver o transcript
+varre a pasta de conversas do CLI e o laço de 1,5 s da lista de projetos roda na thread da interface.
+
 **Monitor das sessões:** `launcher preferences --sessions-monitor other` leva as sessões em segundo plano para o
 monitor que não tem a janela marcada (ou para um não principal, sem janela marcada), se houver mais de um.
 `--sessions-monitor primary` volta ao padrão (ficam onde abrirem).
@@ -563,18 +671,29 @@ launcher doctor --json         # as mesmas verificações em JSON: nome, estado 
 launcher projects add "C:\meus projetos\app" --name "Meu app"
 launcher projects edit "Meu app" --name "App" --path "D:\app"   # só o cadastro muda
 launcher projects import "C:\caminho\config.json"   # só nomes e caminhos
-launcher projects list         # JSON: id, nome, pasta, fixado, último uso, pasta disponível
+launcher projects export "D:\projetos.json"   # o par do import: grava só nomes e pastas (nunca chaves), sem sobrescrever arquivo existente
+launcher projects list         # JSON: id, nome, pasta, fixado, último uso, pasta disponível e, no fim, branch (o ramo git lido do .git/HEAD, sem chamar o git, também no arquivo .git de worktree; null na cabeça solta; sem a chave quando a pasta não é repositório git ou o HEAD não diz o ramo, como no armazenamento reftable); o menu de texto mostra "ramo X" ou "cabeça solta" na linha do projeto; e o que o projeto lembra da última abertura (last_cli, last_connection, last_models: {id da conexão: {destino: modelo}}; o `status` traz os mesmos campos)
+launcher projects open "Meu app" --folder   # abre a pasta do projeto no Explorer, como o "Abrir pasta" do menu do projeto (--vscode abre no VS Code, no seu perfil normal, só com o VS Code instalado); sem janela de console, e erro claro se o projeto não existe, a pasta sumiu ou o VS Code não está instalado
+launcher projects discover [--add] [--cli claude|codex|copilot]   # JSON das pastas de projeto achadas no histórico de conversas do Claude Code, do Codex e do Copilot CLI: nome sugerido (o da pasta), caminho, CLIs de origem, nº de conversas, a última e se já está cadastrada; sem --add é só leitura (nada é gravado); --add cadastra, com o nome da pasta, as que existem, ainda não estão cadastradas e não são raiz de disco, pasta de usuário, pasta do sistema nem worktree do launcher (as mesmas recusas do --add-here; nome repetido de outra pasta fica de fora com o que fazer) e repetir não muda nada. O nome da pasta do histórico do Claude troca todo caractere não alfanumérico por '-' e não volta ao caminho: só vale o cwd que as linhas do transcript trazem e que, codificado, dá exatamente o nome da pasta; sem isso o item sai com "caminho não recuperado" e nunca é cadastrado. Conta as mesmas conversas que o 'conversations' lista (Codex só as interativas deste launcher; Copilot CLI, as 400 sessões mais recentes)
 launcher projects restore --date 2026-11-20   # devolve os removidos a partir da cópia diária daquele dia
 launcher models --connection OpenRouter --cli claude --search sonnet --refresh
 launcher models --source "Azure Foundry" # só modelos dessa fonte, com o nome que o conector declarou; só vale em conector que declara fontes
 launcher models --capability vision --capability audio   # só os que confirmam as capacidades (vision, audio, video, tools; a mesma regra do endpoint)
 launcher models --json                   # os itens do /v1/models do endpoint local (com a fonte, quando o conector declara)
+launcher models --sort context           # a ordem do "Ordenar" da interface: name (família e versão mais nova primeiro), context (maior entrada primeiro) ou price (menor preço primeiro); o que o host não informou vai para o fim, em texto e em --json
 launcher models test openai/gpt-6 --connection OpenRouter [--yes]   # chamada real de 1 token, opt-in: sem --yes só mostra o custo em tokens e o preço ("sem preço" quando o host não informou) e não envia nada (código 2); com --yes (ou "s" no console) chama pelo endpoint local, entra no uso do mês e imprime OK com latência e tokens do host, ou o erro real (código 1)
 launcher launch --project "Meu app" --connection OpenRouter --cli codex --model "openai/gpt-6" --dry-run
 launcher launch --project "Meu app" --resume
-launcher conversations --project "Meu app" --cli claude                        # JSON das conversas, mais recente primeiro
+launcher session open --project "Meu app" --cli claude [--connection OpenRouter] [--model ID] [--resume [--conversation ID]]   # abre a janela da sessão (aba da janela única do Windows Terminal) pelo mesmo caminho dos botões Nova sessão e Retomar da interface, grava a última escolha do projeto (se a gravação falhar com a janela já aberta, o JSON segue com opened true e o motivo em warnings) e devolve JSON; sem --cli/--connection/--model usa o que o projeto lembra; só Claude Code, Codex e Copilot CLI
+launcher session open --project "Meu app" --cli claude --dry-run   # as mesmas validações e o plano em JSON, sem abrir nada e sem gravar
+launcher launch --project "Meu app" --worktree feature-a   # a sessão abre no worktree git ../Meu app.worktrees/feature-a (branch launcher/feature-a), criado ou reaproveitado; sem NOME, sessao-AAAAMMDD-HHMMSS; nunca remove nada
+launcher worktrees --project "Meu app" [--json]   # só leitura: os worktrees do launcher no projeto (nome, branch, pasta, marcador launcher-pronto, pasta existe); remover é 'git worktree remove', nunca o launcher
+launcher conversations --project "Meu app" --cli claude                        # JSON das conversas, mais recente primeiro; no fim de cada uma, branch: o ramo git que o CLI gravou ao abrir a conversa (Codex na session_meta, Claude em gitBranch, Copilot CLI no workspace.yaml; sem a chave quando o CLI não grava ou a conversa abriu fora de um repositório)
 cd "C:\caminho\do\projeto"; launcher conversations   # sem --project (em conversations e launch) vale o projeto cadastrado da pasta atual
+cd "C:\caminho\do\projeto"; launcher launch --add-here --cli claude --model "ID completo"   # --add-here (em launch e conversations): pasta atual ainda não cadastrada vira projeto, com o nome da pasta, e o comando segue; --project, se vier, tem de ser o nome ou o caminho da pasta atual; recusa raiz de disco, pasta do sistema e pasta de usuário (a do seu perfil, a que a contém e as pastas de outros perfis, Public, Default e All Users; as subpastas delas servem); projeto já cadastrado não é regravado; o cadastro só é gravado depois que o pedido inteiro passou nas validações (conexão, modelo e combinação de opções), então pedido recusado não cadastra nada; com --dry-run cadastra só na memória. Sem a flag o erro "Projeto não cadastrado" é o de sempre
 launcher conversations --search janela   # só as conversas com o texto no título, no CLI ou na data (sem distinguir maiúsculas)
+launcher conversations --grep "erro de cache"   # só as conversas com o texto em alguma mensagem (a sua ou a do modelo, sem distinguir maiúsculas); combina com --search, --cli, --tsv e --command
+launcher conversations --tsv             # em vez do JSON, o texto do "Copiar lista" da janela de conversas: tabulação, traço no custo desconhecido (não combina com --command); ganha a coluna final Ramo (traço no que não se sabe) só quando alguma conversa da lista tem ramo gravado
 launcher sessions --reopen --dry-run [--hours 48]   # JSON do que reabriria (padrão 24 h): projeto, CLI, conversa, e o motivo da linha que não abre
 launcher sessions --reopen [--hours 48]   # reabre todas as que têm conversa identificada, como abas em segundo plano; código 1 se alguma aba falhar
 launcher conversations --project "Meu app" --command 1 --model "vertex_ai.anthropic.claude-opus-5-5"   # comando do cmd que retoma a conversa 1 (ou o ID), sem a chave
@@ -584,9 +703,11 @@ launcher endpoint                # endpoint local de cada conexão (start, stop,
 launcher endpoint logs --connection OpenRouter --lines 100   # fim do endpoint.log (padrão 50 linhas; o log é único por perfil, --connection só confere o nome e não filtra)
 launcher usage --all --tsv --month 2026-11   # uso do mês de todos os perfis, texto de planilha
 launcher usage --months 6   # o total de cada um dos 6 últimos meses (1 a 24), do corrente para trás (JSON; com --all soma os perfis)
+launcher usage --days 7   # tokens e custo de cada um dos 7 últimos dias (1 a 366), sem os dias sem uso (JSON; --tsv em tabela)
+launcher usage --blocks   # blocos de 5 h de uso dos últimos 8 dias, do mais recente para trás, com o tempo restante do ativo (custo = equivalente de API; hora local; --tsv em tabela, --active só o ativo)
 launcher usage --by-source --connection Central --month 2026-11 --tsv   # custo do mês por fonte, como o conector informa (JSON sem --tsv); só em conector com a rota costs
 launcher usage --limit 100,50    # teto de gasto do mês deste perfil (US$); off desliga; a janela só avisa a 80% e 100%
-launcher status                # um JSON: CLIs, conexões (cota), endpoint, sessões abertas, projetos e uso do mês; sem chaves
+launcher status                # um JSON: CLIs, conexões (cota), endpoint, sessões abertas (cada uma com `activity`: `state` working|idle|unknown e `last_activity`, ver abaixo), projetos e uso do mês; sem chaves
 launcher completion powershell >> $PROFILE   # Tab completa comandos, opções, CLIs, projetos e conexões no PowerShell
 launcher cli --install vscode    # qualquer ferramenta por usuário: claude, codex, copilot, vscode, copilot_app
 launcher cli --update all        # atualiza as CLIs instaladas (adia com sessão aberta)
@@ -597,7 +718,7 @@ launcher keys --project "Meu app" --screen      # ver e responder um diálogo ab
 launcher preferences --sessions-monitor other   # sessões em segundo plano no outro monitor
 ```
 
-`--dry-run` mostra o plano (comando, overrides, contexto, avisos) com a chave mascarada, sem rede e sem salvar nada.
+`--dry-run` mostra o plano (comando, overrides, contexto, avisos) com a chave mascarada, sem rede e sem salvar nada. Quando o host informou algo do modelo, o JSON ganha a chave `model_catalog` (`context_window`, `input_per_million` e `output_per_million` em US$ por 1M de tokens, `confirmed`), igual para Claude Code, Codex e Copilot CLI; o que o host não informou vem `null` (nunca zero) e as demais chaves ficam como eram. É só informação: não bloqueia a abertura.
 
 `conversations --command ID_OU_POSIÇÃO` imprime, em vez da lista, as linhas para colar no cmd: `cd /d` na pasta, um
 `set "NOME="` por variável que o launcher tira do ambiente das sessões (`ANTHROPIC_*`, `CLAUDE_CODE_OAUTH*`,
