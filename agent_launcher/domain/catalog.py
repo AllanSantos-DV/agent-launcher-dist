@@ -46,13 +46,17 @@ def price(value: object) -> float | None:
     return None
 
 
+def price_sides(record: ModelInfo) -> tuple[str | None, str | None]:
+    """Preço por 1M de tokens (US$) de entrada e de saída como o usuário os lê; None no lado que o host não informou."""
+    return tuple(None if value is None else f"{value * 1_000_000:g}" for value in
+                 (record.input_cost_per_token, record.output_cost_per_token))
+
+
 def price_label(record: ModelInfo) -> str | None:
     """Preço por 1M de tokens (US$) como "entrada/saída"; só o que o host informou, nunca zero no lugar de desconhecido."""
     if record.input_cost_per_token is None and record.output_cost_per_token is None:
         return None
-    per_million = [("?" if value is None else f"{value * 1_000_000:g}") for value in
-                   (record.input_cost_per_token, record.output_cost_per_token)]
-    return "/".join(per_million)
+    return "/".join("?" if side is None else side for side in price_sides(record))
 
 
 def token_label(value: int | None) -> str:
@@ -304,6 +308,14 @@ def protocol_for(record: ModelInfo, protocols, any_model: bool, consumes) -> str
     return next((protocol for protocol in preferred if protocol in consumes and protocol in protocols), None)
 
 
+@dataclass(frozen=True)
+class Change:
+    """Um modelo cujo preço ou janela mudou desde a última lista vista, com o rótulo de antes e o de agora."""
+    id: str
+    before: str
+    after: str
+
+
 @dataclass
 class Catalog:
     """Modelos de UMA conexão. `clis` vem da conexão: os destinos (adaptadores) que consomem algum protocolo que o host
@@ -318,25 +330,34 @@ class Catalog:
     segregates_sources: bool = False
     added: tuple[str, ...] = ()
     removed: tuple[str, ...] = ()
+    price_changes: tuple[Change, ...] = ()
+    window_changes: tuple[Change, ...] = ()
 
     def news(self, shown: int = 5) -> str:
-        """Frase com os modelos que entraram e saíram desde a última lista que o usuário viu ("" se nada mudou); `added` e
-        `removed` só são preenchidos quando há uma lista vista para comparar (ver `Gateway.mark_news_seen`)."""
-        def part(ids: tuple[str, ...], singular: str, plural: str) -> str:
-            if not ids:
+        """Frase com os modelos que entraram, saíram ou mudaram de preço ou janela desde a última lista que o usuário viu
+        ("" se nada mudou); os quatro campos só são preenchidos quando há uma lista vista para comparar (ver
+        `Gateway.mark_news_seen`)."""
+        def part(items: tuple[str, ...], singular: str, plural: str) -> str:
+            if not items:
                 return ""
-            names = ", ".join(ids[:shown]) + (f" e mais {len(ids) - shown}" if len(ids) > shown else "")
-            return f"{len(ids)} {singular if len(ids) == 1 else plural} ({names})"
+            names = ", ".join(items[:shown]) + (f" e mais {len(items) - shown}" if len(items) > shown else "")
+            return f"{len(items)} {singular if len(items) == 1 else plural} ({names})"
+        prices = tuple(f"{item.id}: US$ {item.before} → {item.after} por 1M" for item in self.price_changes)
+        windows = tuple(f"{item.id}: {item.before} → {item.after}" for item in self.window_changes)
         parts = [found for found in (part(self.added, "modelo novo", "modelos novos"),
-                                     part(self.removed, "removido", "removidos")) if found]
+                                     part(self.removed, "removido", "removidos"),
+                                     part(prices, "preço alterado", "preços alterados"),
+                                     part(windows, "janela alterada", "janelas alteradas")) if found]
         return f"Novidades do catálogo: {'; '.join(parts)}." if parts else ""
 
     def find(self, model: str) -> ModelInfo | None:
         return next((record for record in self.records if record.id == base_model(model)), None)
 
     def allows(self, record: ModelInfo, cli: str) -> bool:
-        """O destino `cli` aceita este modelo nesta conexão? Quem decide é o adaptador (harnesses/)."""
-        if cli not in self.clis or not record.chat:
+        """O destino `cli` aceita este modelo nesta conexão? Quem decide é o adaptador (harnesses/); modelo que não é de
+        texto (embedding, imagem, áudio) nunca passa, mesmo num adaptador que não o confira. `tools=False` não o tira
+        daqui: quem exige ferramentas é o adaptador."""
+        if cli not in self.clis or not replace(record, tools=None).chat:
             return False
         from agent_launcher.harnesses import registry  # import tardio: o catálogo não depende dos destinos
         harness = registry.find(cli)

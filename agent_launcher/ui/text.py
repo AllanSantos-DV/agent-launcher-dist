@@ -4,6 +4,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -11,7 +12,8 @@ from pathlib import Path
 from agent_launcher import ROOT
 from agent_launcher.domain import profiles, usage
 from agent_launcher.domain.cache import prune_old_versions
-from agent_launcher.domain.conversation_usage import conversation_usage, conversations_tsv
+from agent_launcher.domain.conversation_usage import (CONVERSATION_SORTS, conversation_usage, conversations_tsv,
+                                                      sort_conversations)
 from agent_launcher.domain.catalog import CLAUDE_FAMILIES, ModelInfo, base_model, order_models, token_label
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import project_path
@@ -189,6 +191,35 @@ def show_connections(store: Store) -> None:
         print("  Nenhuma conexão. Adicione um provedor (LiteLLM, 9router, OmniRoute, OpenRouter, Anthropic, OpenAI...).")
     for error in errors:
         print(f"  [AVISO] conector do usuário não carregado: {error}")
+
+
+def _quoted(value: str) -> str | None:
+    """`value` entre aspas duplas para colar no cmd e no PowerShell; só para texto de letras, números, espaço e `. _ - ( ) : / `.
+    Qualquer outro caractere (aspas, `%`, `&`, `$`, barra invertida) ou um começo com `-` (o argparse o leria como
+    opção) volta como None: a dica pede um marcador em vez de arriscar um quoting que um dos dois shells interpretaria."""
+    return f'"{value}"' if re.fullmatch(r"(?!-)[\w .()\-:/]+", value) else None
+
+
+def detect_ollama_command(store: Store, options) -> None:
+    """`connections detect`: procura o Ollama, mostra os modelos e o que o host não informa e, com --add, cadastra a
+    conexão. Sem Ollama (ou sem modelo) levanta LauncherError com o motivo: a saída é 1 e nada é gravado."""
+    from agent_launcher.domain import ollama_local
+    detection = ollama_local.detect(options.address)
+    if not detection.found:
+        raise LauncherError(detection.error)
+    print(f"Ollama em {detection.address}")
+    for note in detection.notes:
+        print(f"  {note}")
+    for record in detection.models:
+        print(f"  - {record.id}")
+    if options.add:
+        connection, updated = ollama_local.register(store, detection, options.name or ollama_local.CONNECTION_NAME)
+        print(f"Conexão {'atualizada' if updated else 'salva'}: {connection['name']}")
+    else:
+        name = _quoted(options.name) if options.name else None
+        named = f" --name {name}" if name else (" --name NOME" if options.name else "")
+        address = _quoted(detection.address) or "ENDERECO"
+        print(f"Para cadastrar a conexão: launcher connections detect --address {address}{named} --add")
 
 
 def set_fallback_command(store: Store, options) -> None:
@@ -535,12 +566,10 @@ def conversation_usages(home: Path, conversations: list) -> dict:
     return found
 
 
-def filtered_conversations(store: Store, project: dict, cli: str | None = None, search: str = "",
-                           grep: str | None = None) -> list:
-    """As conversas de found_conversations; `search` fica só com as que têm o texto no título, no CLI ou na data (a mesma
-    regra do filtro da janela de conversas) e `grep`, só com as que têm o texto em alguma mensagem (lê os transcripts;
-    o que os tetos de conversation_grep deixaram sem ler vai como [AVISO] no stderr)."""
-    found = found_conversations(store, project, cli)
+def narrowed_conversations(found: list, search: str = "", grep: str | None = None) -> list:
+    """`found` com o filtro `search` (só as que têm o texto no título, no CLI ou na data: a mesma regra do filtro da janela
+    de conversas) e com `grep` (só as que têm o texto em alguma mensagem; lê os transcripts, e o que os tetos de
+    conversation_grep deixaram sem ler vai como [AVISO] no stderr)."""
     query = search.strip().casefold()
     if query:
         found = [item for item in found if query in " ".join(
@@ -552,12 +581,81 @@ def filtered_conversations(store: Store, project: dict, cli: str | None = None, 
     return found
 
 
+def filtered_conversations(store: Store, project: dict, cli: str | None = None, search: str = "",
+                           grep: str | None = None) -> list:
+    """As conversas de found_conversations, filtradas por `search` e `grep` (ver narrowed_conversations)."""
+    return narrowed_conversations(found_conversations(store, project, cli), search, grep)
+
+
+def all_projects_conversations(store: Store, cli: str | None = None, search: str = "",
+                               grep: str | None = None) -> list[tuple[dict, object]]:
+    """(projeto, conversa) de todos os projetos cadastrados, mais recente primeiro, filtradas por `search` e `grep`. O
+    `grep` lê as conversas de todos os projetos numa varredura só: os tetos de conversation_grep valem para o total. A
+    conversa que dois projetos enxergam (pastas que resolvem para a mesma pasta de conversas do CLI) vale uma vez, com o
+    primeiro projeto. As pastas de conversa de cada CLI são varridas uma vez por projeto."""
+    first: dict[tuple[str, str], tuple[dict, object]] = {}
+    for project in store.projects:
+        for item in found_conversations(store, project, cli):
+            first.setdefault((item.cli, item.id), (project, item))
+    pairs = sorted(first.values(), key=lambda pair: pair[1].updated, reverse=True)
+    owner = {id(item): project for project, item in pairs}
+    return [(owner[id(item)], item) for item in narrowed_conversations([item for _, item in pairs], search, grep)]
+
+
+def all_projects_conversations_tsv(store: Store, cli: str | None = None, search: str = "", grep: str | None = None,
+                                   sort: str = "recente") -> str:
+    """O texto de folder_conversations_tsv para as conversas de all_projects_conversations, com a coluna Projeto."""
+    pairs = all_projects_conversations(store, cli, search, grep)
+    found = [item for _, item in pairs]
+    used = conversation_usages(store.home, found)
+    names = {id(item): project["name"] for project, item in pairs}
+    ordered = sort_conversations(found, used, sort)
+    return conversations_tsv(ordered, used, branches=True, projects=[names[id(item)] for item in ordered])
+
+
+def conversation_json(item, used: dict, project: str | None = None) -> dict:
+    """A conversa com o contexto e o custo estimado dela em `used` e, no fim, o ramo git que o CLI gravou (a chave `branch`
+    só existe quando ele grava). Com `project`, a chave `project` logo depois dos dados da conversa."""
+    return {**item.as_json(), **({} if project is None else {"project": project}),
+            "context_tokens": used[item.id].context,
+            "cost_usd": None if used[item.id].cost is None else round(used[item.id].cost, 6),
+            **({"branch": item.branch} if item.branch else {})}
+
+
+def list_all_projects_conversations(store: Store, cli: str | None = None, search: str = "",
+                                    grep: str | None = None) -> list[dict]:
+    """As conversas de all_projects_conversations no formato de list_conversations, com a chave `project` (nome)."""
+    pairs = all_projects_conversations(store, cli, search, grep)
+    used = conversation_usages(store.home, [item for _, item in pairs])
+    return [conversation_json(item, used, project["name"]) for project, item in pairs]
+
+
+def all_projects_command(store: Store, options) -> str:
+    """`launcher conversations --grep TEXTO --all-projects`: a lista (JSON, ou o texto de `--tsv`) das conversas de todos os
+    projetos com o texto. Recusa, sem listar nada, o que não faz sentido sem um projeto só ou sem a busca."""
+    if options.grep is None:
+        raise LauncherError("--all-projects só vale com --grep TEXTO: varrer as conversas de todos os projetos sem filtro "
+                            "listaria tudo; use --grep, ou --project para um projeto só.")
+    for flag, given in (("--project", options.project), ("--add-here", options.add_here), ("--command", options.command)):
+        if given:
+            raise LauncherError(f"--all-projects varre todos os projetos cadastrados; não combina com {flag}.")
+    if options.connection or options.model or options.shell:
+        raise LauncherError("--connection, --model e --shell só valem com --command.")
+    if options.sort and not options.tsv:
+        raise LauncherError("--sort ordena a lista em texto; use junto com --tsv.")
+    if options.tsv:
+        return all_projects_conversations_tsv(store, options.cli, options.search, options.grep, options.sort or "recente")
+    return json.dumps(list_all_projects_conversations(store, options.cli, options.search, options.grep),
+                      ensure_ascii=False, indent=2)
+
+
 def folder_conversations_tsv(store: Store, project: dict, cli: str | None = None, search: str = "",
-                             grep: str | None = None) -> str:
+                             grep: str | None = None, sort: str = "recente") -> str:
     """As conversas de filtered_conversations no texto separado por tabulação que o "Copiar lista" da janela de conversas
-    copia (sem a janela do modelo: contexto sem porcentagem)."""
+    copia (sem a janela do modelo: contexto sem porcentagem), na ordem `sort` (ver sort_conversations)."""
     found = filtered_conversations(store, project, cli, search, grep)
-    return conversations_tsv(found, conversation_usages(store.home, found), branches=True)
+    used = conversation_usages(store.home, found)
+    return conversations_tsv(sort_conversations(found, used, sort), used, branches=True)
 
 
 def list_conversations(store: Store, project: dict, cli: str | None = None, search: str = "",
@@ -566,9 +664,7 @@ def list_conversations(store: Store, project: dict, cli: str | None = None, sear
     gravou (a chave `branch` só existe quando ele grava)."""
     found = filtered_conversations(store, project, cli, search, grep)
     used = conversation_usages(store.home, found)
-    return [{**item.as_json(), "context_tokens": used[item.id].context,
-             "cost_usd": None if used[item.id].cost is None else round(used[item.id].cost, 6),
-             **({"branch": item.branch} if item.branch else {})} for item in found]
+    return [conversation_json(item, used) for item in found]
 
 
 def conversation_command(store: Store, project: dict, reference: str, cli: str | None = None,
@@ -617,22 +713,31 @@ def sessions_command(store: Store, options) -> int:
 
 def keys_command(store: Store, options) -> int:
     """`launcher keys`: lista as sessões abertas, ou lê a tela e envia teclas a uma delas. Com --wait, espera o texto
-    aparecer (até --timeout) antes de ler e de enviar; prazo estourado é erro e nenhuma tecla vai."""
+    aparecer (até --timeout) antes de ler e de enviar; com --wait-idle, espera o transcript da sessão ficar parado (ver
+    activity.wait_idle). Prazo estourado é erro e nenhuma tecla vai."""
     if options.list:
         print(json.dumps(keys.sessions(), ensure_ascii=False))
         return 0
     if options.pid is None and not options.project:
         raise LauncherError("Informe --project (e --cli se preciso) ou --pid; veja --list.")
-    if options.timeout is not None and not options.wait:
-        raise LauncherError("--timeout só vale com --wait.")
-    if not options.keys and not options.screen and not options.wait:
-        raise LauncherError("Informe as teclas a enviar, --screen ou --wait.")
+    if options.wait and options.wait_idle:
+        raise LauncherError("--wait e --wait-idle são esperas diferentes (o texto na tela, o transcript parado); use uma só.")
+    if options.timeout is not None and not (options.wait or options.wait_idle):
+        raise LauncherError("--timeout só vale com --wait ou --wait-idle.")
+    if not options.keys and not options.screen and not options.wait and not options.wait_idle:
+        raise LauncherError("Informe as teclas a enviar, --screen, --wait ou --wait-idle.")
     try:
         ids = {store.find(options.project)["id"]} if options.project else set()
         session = keys.resolve(ids, options.cli, options.pid)
+        idle = None
         if options.wait:
             screen = keys.wait_for_text(session["pid"], options.wait,
                                         keys.WAIT_TIMEOUT if options.timeout is None else options.timeout)
+        elif options.wait_idle:
+            idle = activity.wait_idle(store, session["pid"],
+                                      activity.IDLE_WAIT_TIMEOUT_S if options.timeout is None else options.timeout)
+            if options.screen:
+                screen = keys.read_screen(session["pid"])
         elif options.screen:
             screen = keys.read_screen(session["pid"])
         if options.screen:
@@ -643,7 +748,10 @@ def keys_command(store: Store, options) -> int:
             done["sent"] = options.keys
         if options.wait:
             done["waited"] = options.wait
-        if options.keys or (options.wait and not options.screen):
+        if idle is not None:
+            done["waited_idle"] = True
+            done["last_activity"] = idle["last_activity"]
+        if options.keys or ((options.wait or options.wait_idle) and not options.screen):
             print(json.dumps(done, ensure_ascii=False))
     except keys.KeysError as error:
         raise LauncherError(str(error)) from error
@@ -1127,10 +1235,11 @@ def usage_command(store, options) -> int:
     return 0
 
 
-def status_report(store: Store, month: str | None = None, now: float | None = None) -> dict:
+def status_report(store: Store, month: str | None = None, now: float | None = None, with_usage: bool = False) -> dict:
     """Retrato único e sem segredos: CLIs, conexões, endpoint de cada uma, sessões abertas, projetos e o uso do mês.
     Cada parte vem da função por trás do `doctor`, do `endpoint status`, do `keys --list`, do `projects list` e do `usage`;
-    cada sessão aberta traz também `activity` (session/activity.py; `now` é o relógio, só para testes)."""
+    cada sessão aberta traz também `activity` (session/activity.py; `now` é o relógio, só para testes). Com `with_usage`,
+    `activity` traz ainda o contexto usado e o custo estimado da conversa da sessão (session/activity_usage.py)."""
     from agent_launcher.endpoint import registry as endpoints
     tools = []
     for harness in registry.all():
@@ -1149,7 +1258,7 @@ def status_report(store: Store, month: str | None = None, now: float | None = No
                          "quota_exhausted": (connection.get("status") or {}).get("state") == "quota_exhausted"}
                         for connection in store.connections],
         "endpoints": endpoints.status(store.home, store.connections),
-        "sessions": activity.annotate(store, keys.sessions(), now),
+        "sessions": activity.annotate(store, keys.sessions(), now, with_usage),
         "projects": json.loads(projects_json(store)),
         "usage": {**{key: report[key] for key in ("month", "currency", "destinations", "total")},
                   **({"limit": status} if status else {})},
@@ -1157,9 +1266,9 @@ def status_report(store: Store, month: str | None = None, now: float | None = No
 
 
 def status_command(store: Store, options) -> int:
-    """`launcher status [--month AAAA-MM]`: o retrato de `status_report` em JSON."""
+    """`launcher status [--month AAAA-MM] [--usage]`: o retrato de `status_report` em JSON."""
     try:
-        report = status_report(store, options.month)
+        report = status_report(store, options.month, with_usage=options.usage)
     except ValueError as error:
         raise LauncherError(str(error)) from error
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -1230,7 +1339,8 @@ def parser() -> argparse.ArgumentParser:
     connections.add_argument("--to", metavar="RESERVA", help="Conexão reserva usada por --set-fallback")
     connections.add_argument("--clear-fallback", metavar="NOME", help="Tira a conexão reserva de NOME")
     connections.add_argument("--endpoint-sessions", choices=("on", "off"),
-                             help="Liga ou desliga as sessões de terminal pelo endpoint local da conexão (use com --connection)")
+                             help="Liga ou desliga as sessões de terminal (Claude Code, Codex, Copilot CLI e Aider; o Aider no Ollama segue direto) "
+                                  "pelo endpoint local da conexão (use com --connection)")
     connections.add_argument("--connection", metavar="NOME", help="Conexão de --endpoint-sessions")
     connection_actions = connections.add_subparsers(dest="connection_action")
     add_connection = connection_actions.add_parser("add", help="Adicionar ou atualizar uma conexão (testa antes de salvar)")
@@ -1254,6 +1364,11 @@ def parser() -> argparse.ArgumentParser:
     duplicate_connection.add_argument("--name", required=True, help="Nome da conexão nova")
     duplicate_connection.add_argument("--secret-env", action="append", default=[], metavar="CAMPO=VARIAVEL",
                                       help="a chave da conta nova, lida da variável de ambiente")
+    detect_connection = connection_actions.add_parser(
+        "detect", help="Procurar o Ollama deste computador e, com --add, cadastrar a conexão (só quando você roda o comando)")
+    detect_connection.add_argument("--address", default="", metavar="URL", help="endereço do Ollama (padrão: http://127.0.0.1:11434)")
+    detect_connection.add_argument("--add", action="store_true", help="cadastra (ou atualiza) a conexão depois de testar")
+    detect_connection.add_argument("--name", default=None, help="nome da conexão (padrão: Ollama (local))")
     export_connection = connection_actions.add_parser(
         "export", help="Exportar uma conexão para um arquivo .alprofile, sem a chave (para passar a um colega)")
     export_connection.add_argument("reference", metavar="CONEXAO", help="Id ou nome da conexão")
@@ -1317,7 +1432,7 @@ def parser() -> argparse.ArgumentParser:
                                                   "leitura, o launcher nunca remove)")
     trees.add_argument("--project", help="Nome, ID ou caminho de projeto cadastrado; omitido usa a pasta atual")
     trees.add_argument("--json", action="store_true", help="Em vez do texto, a lista em JSON")
-    cli_command = commands.add_parser("cli", help="Ferramentas (Claude Code, Codex, Copilot CLI, VS Code, Copilot app): "
+    cli_command = commands.add_parser("cli", help="Ferramentas (Claude Code, Codex, Copilot CLI, Aider, VS Code, Copilot app): "
                                                   "situação e instalação por usuário, sem admin")
     cli_command.add_argument("--install", choices=(*clis.installable(), "all"),
                              help="instala a ferramenta que falta (instalador oficial, npm ou winget); "
@@ -1385,8 +1500,20 @@ def parser() -> argparse.ArgumentParser:
     send.add_argument("--wait", metavar="TEXTO",
                       help="Esperar este texto aparecer na tela da sessão antes de ler a tela e enviar as teclas; "
                            "passado o prazo sem o texto, erro e nenhuma tecla vai")
+    send.add_argument("--wait-idle", action="store_true",
+                      help="Esperar a sessão ficar sem atividade no transcript antes de ler a tela e enviar as teclas, "
+                           "sem precisar conhecer o texto da tela (Claude Code, Codex e Copilot CLI). Atenção: ocioso é "
+                           f"a idade da última gravação do transcript, então vale como \"sem atividade por "
+                           f"{activity.WORKING_WINDOW_S} s\", não como \"terminou de pensar\": uma geração ou "
+                           "ferramenta longa que não grava por esse tempo já conta como parada. Se o launcher não "
+                           "achar com certeza o transcript da sessão, erro com o motivo (use --wait TEXTO); passado o "
+                           "prazo ainda trabalhando, erro e nenhuma tecla vai. Ocioso só vale com duas leituras seguidas, "
+                           f"{activity.IDLE_CONFIRM_S:g} s uma da outra. Corrida que sobra: logo depois de enviar teclas, "
+                           "se o CLI demorar mais que isso para gravar a mensagem e a sessão já estava parada, a espera "
+                           "volta cedo demais; confirme pela tela (--wait TEXTO). Não combina com --wait")
     send.add_argument("--timeout", type=float, metavar="SEGUNDOS",
-                      help=f"Com --wait: prazo da espera (padrão {keys.WAIT_TIMEOUT:g} s)")
+                      help=f"Com --wait: prazo da espera (padrão {keys.WAIT_TIMEOUT:g} s); com --wait-idle, o padrão é "
+                           f"{activity.IDLE_WAIT_TIMEOUT_S:g} s")
     usage_parser = commands.add_parser("usage", help="Uso do mês do perfil: tokens e custo estimado por destino e modelo "
                                                      "(JSON; --all soma os perfis, --tsv imprime o texto do 'Copiar relatório')")
     usage_parser.add_argument("--month", metavar="AAAA-MM", help="Mês (padrão: o atual)")
@@ -1417,6 +1544,11 @@ def parser() -> argparse.ArgumentParser:
     state = commands.add_parser("status", help="Retrato único em JSON: CLIs, conexões (cota), endpoint, sessões abertas, "
                                                "projetos e uso do mês; sem chaves")
     state.add_argument("--month", metavar="AAAA-MM", help="Mês do uso (padrão: o atual)")
+    state.add_argument("--usage", action="store_true",
+                       help="Em cada sessão aberta, dentro de 'activity', o contexto usado, o custo estimado e o aviso de "
+                            "janela da conversa dela (context_tokens, cost_usd, window_warning; null com o motivo em "
+                            "usage_reason quando não se sabe). Lê o transcript, com cache e teto de 10 s; sem a opção o "
+                            "status não lê nenhum")
     update = commands.add_parser("update", help="Atualizar agora pela última versão publicada no registry")
     update.add_argument("--check", action="store_true", help="só mostra se há versão nova, sem instalar")
     talks = commands.add_parser("conversations", help="Conversas dos CLIs de terminal na pasta do projeto (JSON, mais "
@@ -1430,9 +1562,20 @@ def parser() -> argparse.ArgumentParser:
                        help="Só as conversas com o texto em alguma mensagem (a sua e a do modelo, sem distinguir "
                             "maiúsculas; metadados e resultados de ferramenta não contam). Lê os transcripts, só leitura, "
                             "com teto de 30 s no total e 64 MiB por conversa; combina com --search, --cli, --tsv e --command")
+    talks.add_argument("--all-projects", action="store_true",
+                       help="Com --grep: varre as conversas de todos os projetos cadastrados, e não só as de um; cada "
+                            "linha traz o projeto (coluna Projeto no --tsv, chave project no JSON). Os tetos do --grep "
+                            "valem para a varredura inteira. Custo: as pastas de conversa de cada CLI são varridas "
+                            "uma vez por projeto, então muitos projetos demoram; a mesma conversa vista por dois "
+                            "projetos aparece uma vez, com o primeiro. Sem --grep é recusado; não combina com "
+                            "--project, --add-here nem --command")
     talks.add_argument("--tsv", action="store_true",
                        help="Em vez do JSON, o texto separado por tabulação que 'Copiar lista' da janela de conversas "
                             "copia (traço no que não se sabe)")
+    talks.add_argument("--sort", choices=CONVERSATION_SORTS,
+                       help="Com --tsv, a ordem das linhas: recente (a de sempre, mais recente primeiro), custo (maior "
+                            "custo estimado primeiro) ou contexto (maior contexto usado primeiro); o que não se sabe vai "
+                            "para o fim e o empate fica do mais recente. Padrão: recente")
     talks.add_argument("--command", metavar="ID_OU_POSIÇÃO",
                        help="Em vez da lista, imprimir o comando que retoma esta conversa fora do launcher, com a "
                             "pasta, o ambiente e o modelo da conexão; a chave nunca vai no texto. Posição: 1 é a mais "
@@ -1572,6 +1715,8 @@ def main(arguments: list[str] | None = None) -> int:
                 values = {**source.get("options", {}), **parse_values(modules[source["connector"]], [], options.secret_env, prompt=False)}
                 connection = store.save_connection(options.name, source["connector"], values)
                 print(f"Conexão criada a partir de {source['name']}: {connection['name']}")
+            elif action == "detect":
+                detect_ollama_command(store, options)
             elif action == "test":
                 if options.reference:
                     Gateway(store, store.find_connection(options.reference)).verify()
@@ -1759,16 +1904,25 @@ def main(arguments: list[str] | None = None) -> int:
         elif options.action == "conversations":
             if options.grep is not None and not options.grep.strip():
                 raise LauncherError("--grep pede o texto a procurar nas mensagens; um valor vazio não filtra nada.")
+            if options.all_projects:
+                print(all_projects_command(store, options))
+                return cleanup_status
             project, added = resolve_project(store, options)
             if options.command:
                 if options.tsv:
                     raise LauncherError("--tsv lista as conversas; não combina com --command, que imprime um comando só.")
+                if options.sort:
+                    raise LauncherError("--sort ordena a lista de conversas; não combina com --command, que imprime um "
+                                        "comando só.")
                 output = conversation_command(store, project, options.command, options.cli, options.connection,
                                               options.model, options.shell or "cmd", options.grep)
             elif options.connection or options.model or options.shell:
                 raise LauncherError("--connection, --model e --shell só valem com --command.")
+            elif options.sort and not options.tsv:
+                raise LauncherError("--sort ordena a lista em texto; use junto com --tsv.")
             elif options.tsv:
-                output = folder_conversations_tsv(store, project, options.cli, options.search, options.grep)
+                output = folder_conversations_tsv(store, project, options.cli, options.search, options.grep,
+                                                  options.sort or "recente")
             else:
                 output = json.dumps(list_conversations(store, project, options.cli, options.search, options.grep),
                                     ensure_ascii=False, indent=2)

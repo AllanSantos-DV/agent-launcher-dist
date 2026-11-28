@@ -1001,6 +1001,103 @@ class WorktreeTask(BackgroundTask):
         return worktree.ensure(self.project_folder, self.name).name, ""
 
 
+class WorktreeListTask(BackgroundTask):
+    """Os worktrees que o launcher mantém no projeto (session/worktree.py, a lista do `launcher worktrees`) fora da thread da
+    interface: roda o `git`."""
+
+    def __init__(self, project_folder: str):
+        super().__init__()
+        self.project_folder = project_folder
+
+    def outcome(self):
+        from agent_launcher.session import worktree
+        return worktree.listing(self.project_folder), ""
+
+
+class WorktreeDialog(QDialog):
+    """Nome do worktree da nova sessão: digitado, ou o de um worktree que o launcher já criou no projeto e que a lista mostra
+    (clicar o põe no campo, se ele está vazio ou ainda com o nome que a própria lista pôs, nunca por cima do que o usuário
+    digitou; duplo clique ou Enter no item aceita). O campo `name` é a resposta; vazio deixa o launcher gerar um nome.
+    Worktree incompleto ou sem pasta aparece desligado, porque o launcher não o reabre."""
+
+    QUESTION = ("Nome do worktree (a pasta fica ao lado do projeto, na branch launcher/NOME).\n"
+                "Vazio gera um nome com a data e a hora; repetir um nome reaproveita o worktree:")
+    LISTING = "Procurando os worktrees do projeto…"
+
+    def __init__(self, parent, project_folder: str):
+        super().__init__(parent)
+        self.setWindowTitle("Nova sessão em worktree")
+        self.resize(560, 380)
+        layout = QVBoxLayout(self)
+        question = QLabel(self.QUESTION)
+        question.setWordWrap(True)
+        layout.addWidget(question)
+        self.name = QLineEdit()
+        self.name.setAccessibleName("Nome do worktree")
+        self.listed_name = ""
+        layout.addWidget(self.name)
+        self.status = QLabel(self.LISTING)
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.list = QListWidget()
+        self.list.setAccessibleName("Worktrees do projeto")
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list.itemSelectionChanged.connect(self.pick)
+        self.list.itemActivated.connect(self.choose)
+        layout.addWidget(self.list, 1)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        ok = QPushButton("OK")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        actions.addWidget(ok)
+        cancel = QPushButton("Cancelar")
+        cancel.clicked.connect(self.reject)
+        actions.addWidget(cancel)
+        layout.addLayout(actions)
+        task = self.task = WorktreeListTask(project_folder)
+        run_task(task, lambda rows, text="": task is self.task and self.show_rows(rows))
+
+    def show_rows(self, rows) -> None:
+        """Mostra a lista do `worktree.listing` (ou o erro dela) sem mexer no campo do nome."""
+        if isinstance(rows, Exception):
+            self.status.setText(f"Não foi possível listar os worktrees: {rows}. Você ainda pode digitar um nome.")
+            return
+        unusable = 0
+        for row in rows:
+            usable = row["exists"] and row["ready"]
+            state = "pronto" if usable else "pasta sumiu" if not row["exists"] else "incompleto: o launcher não o reabre"
+            item = QListWidgetItem(f"{row['name']} • {row['branch'] or 'cabeça solta'} • {state}")
+            item.setData(Qt.ItemDataRole.UserRole, row["name"])
+            if not usable:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+                unusable += 1
+            self.list.addItem(item)
+        if not rows:
+            self.status.setText("Nenhum worktree do launcher neste projeto ainda; digite um nome para criar o primeiro.")
+            return
+        rest = f" Desligados por estarem incompletos ou sem pasta: {unusable}." if unusable else ""
+        self.status.setText(f"{plural(len(rows), 'worktree do launcher neste projeto', 'worktrees do launcher neste projeto')}; "
+                            f"clique em um para usar o nome dele ou digite um nome novo.{rest}")
+
+    def done(self, code: int) -> None:
+        """Fecha a janela e descarta a lista que ainda chegar: o diálogo é apagado logo depois do `exec`."""
+        self.task = None
+        super().done(code)
+
+    def pick(self) -> None:
+        """Põe no campo o nome do worktree selecionado na lista, se o campo está vazio ou ainda tem o nome que a lista pôs."""
+        chosen = self.list.selectedItems()
+        if chosen and self.name.text() in ("", self.listed_name):
+            self.listed_name = chosen[0].data(Qt.ItemDataRole.UserRole)
+            self.name.setText(self.listed_name)
+
+    def choose(self, item: QListWidgetItem) -> None:
+        """Duplo clique ou Enter no item: usa o nome dele e aceita a janela."""
+        self.name.setText(item.data(Qt.ItemDataRole.UserRole))
+        self.accept()
+
+
 class DiscoverProjectsDialog(QDialog):
     """Achar projetos no histórico: lista, marcadas, as pastas que `launcher projects discover --add` cadastraria; Cadastrar
     grava só as que continuam marcadas. `added` é quantas foram cadastradas."""
@@ -3462,20 +3559,22 @@ class LauncherWindow(QMainWindow):
         menu.add_danger_action("Remover do launcher…", self.remove_project)
 
     def open_in_worktree(self) -> None:
-        """Item "Nova sessão em worktree…" do menu do projeto: pede o nome (vazio gera `sessao-AAAAMMDD-HHMMSS`) e abre a
-        nova sessão num worktree git do projeto, com o CLI, o modelo e a conexão escolhidos na tela. O worktree é preparado
-        em segundo plano; a sessão só abre quando ele está pronto."""
+        """Item "Nova sessão em worktree…" do menu do projeto: pede o nome, digitado ou escolhido entre os worktrees que o
+        launcher já criou no projeto (vazio gera `sessao-AAAAMMDD-HHMMSS`), e abre a nova sessão num worktree git do projeto,
+        com o CLI, o modelo e a conexão escolhidos na tela. O worktree é preparado em segundo plano; a sessão só abre quando
+        ele está pronto."""
         if self.worktree_task is not None:
             self.show_info("Já há um worktree sendo preparado; espere ele terminar.", origin="worktree")
             return
-        name, accepted = QInputDialog.getText(
-            self, "Nova sessão em worktree",
-            "Nome do worktree (a pasta fica ao lado do projeto, na branch launcher/NOME).\n"
-            "Vazio gera um nome com a data e a hora; repetir um nome reaproveita o worktree:")
-        if not (accepted and self.project):
+        if not self.project:
+            return
+        dialog = WorktreeDialog(self, self.project["path"])
+        accepted, name = dialog.exec() == QDialog.DialogCode.Accepted, dialog.name.text().strip()
+        dialog.deleteLater()
+        if not accepted or not self.project:
             return
         project_id, cli = self.project["id"], self.cli
-        task = self.worktree_task = WorktreeTask(self.project["path"], name.strip())
+        task = self.worktree_task = WorktreeTask(self.project["path"], name)
         self.clear_error("worktree")
         self.set_footer("worktree", "Preparando o worktree…", busy=True)
         run_task(task, lambda result, _text="": task is self.worktree_task and self.finish_worktree(project_id, cli, result))

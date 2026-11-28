@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from agent_launcher.connectors import ConnectorError, LoginPending, QuotaExhausted
+from agent_launcher.domain import ollama_local
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.gateway import Gateway
 from agent_launcher.domain.store import Store
@@ -888,7 +889,7 @@ class FallbackPanel(ConnectionSettingPanel):
 
 
 class EndpointSessionsPanel(ConnectionSettingPanel):
-    """Preferência da conexão selecionada: abrir as sessões de terminal (Claude Code e Codex) pelo endpoint local. Fica
+    """Preferência da conexão selecionada: abrir as sessões de terminal (Claude Code, Codex, Copilot CLI e Aider) pelo endpoint local. Fica
     abaixo do painel do endpoint e aparece para toda conexão, com ou sem porta gravada. Marcar ou desmarcar grava na hora;
     a recusa do cadastro aparece na faixa do painel e a caixa volta ao valor gravado."""
 
@@ -898,9 +899,10 @@ class EndpointSessionsPanel(ConnectionSettingPanel):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         self.box = QCheckBox("Abrir sessões de terminal pelo endpoint local")
-        self.box.setToolTip("Claude Code e Codex desta conexão passam pelo endpoint local: o log, a conexão reserva e o uso "
-                            "valem para a sessão, e a chave real não vai para o ambiente dela. Desmarcado, a sessão vai "
-                            "direto ao host, como sempre.")
+        self.box.setToolTip("Claude Code, Codex, Copilot CLI e Aider desta conexão passam pelo endpoint local: o log e a "
+                            "conexão reserva valem para a sessão, e a chave real não vai para o ambiente dela. O Aider em "
+                            "conexão Ollama segue direto (usa a rota nativa, que o endpoint não serve). Desmarcado, a sessão "
+                            "vai direto ao host, como sempre.")
         self.box.clicked.connect(self.save)  # clicked: só a ação do usuário, não o setChecked
         layout.addWidget(self.box)
         layout.addWidget(self.notice)
@@ -914,6 +916,107 @@ class EndpointSessionsPanel(ConnectionSettingPanel):
         """Grava a preferência da conexão selecionada."""
         self.commit(lambda store, connection_id: store.set_endpoint_sessions(connection_id, bool(enabled)),
                     lambda: self.box.setChecked(not enabled))
+
+
+class DetectOllamaDialog(GrowingDialog):
+    """Procura o Ollama deste computador e cadastra a conexão. A procura começa quando a janela abre (o clique do
+    usuário) e de novo em "Procurar"; nada sonda a rede por conta própria. Sem Ollama, a janela mostra o motivo e o
+    resto do launcher segue igual."""
+
+    def __init__(self, home: Path, parent=None, address: str = ""):
+        super().__init__(parent, QSize(560, 440))
+        self.home = home
+        self.added: dict | None = None
+        self.busy = False
+        self.task = None
+        self.detection = None
+        self.setWindowTitle("Achar o Ollama")
+        layout = self.body_layout
+        layout.addWidget(_label("Ollama neste computador", "title"))
+        layout.addWidget(_label("Procura o Ollama no endereço abaixo e, achando, cadastra a conexão para o Aider, o "
+                                "Copilot CLI e o Claude Code. Só procura quando você abre esta janela ou clica em Procurar.", "muted"))
+        row = QHBoxLayout()
+        self.address = QLineEdit(address or ollama_local.ollama.EXAMPLE)
+        self.address.setAccessibleName("Endereço do Ollama")
+        self.address.returnPressed.connect(self.search)
+        row.addWidget(self.address, 1)
+        self.search_button = QPushButton("Procurar")
+        self.search_button.clicked.connect(self.search)
+        row.addWidget(self.search_button)
+        layout.addLayout(row)
+        self.status = _label("", "muted")
+        layout.addWidget(self.status)
+        self.list = QListWidget()
+        self.list.setAccessibleName("Modelos do Ollama")
+        layout.addWidget(self.list, 1)
+        self.add_button = QPushButton("Adicionar conexão")
+        self.add_button.setObjectName("primary")
+        self.add_button.clicked.connect(self.add)
+        close = QPushButton("Fechar")
+        close.clicked.connect(self.accept)
+        footer = QHBoxLayout()
+        footer.addStretch()
+        footer.addWidget(self.add_button)
+        footer.addWidget(close)
+        self.footer_layout.addLayout(footer)
+        self.search()
+
+    def done(self, result: int) -> None:
+        """Fechar durante a procura ou a gravação espera terminar: a lista de Conexões lê `added` ao fechar."""
+        if not self.busy:
+            super().done(result)
+
+    def show_busy(self, busy: bool, text: str = "") -> None:
+        self.busy = busy
+        self.search_button.setEnabled(not busy)
+        self.add_button.setEnabled(not busy and bool(self.detection and self.detection.found) and self.added is None)
+        if text:
+            self.status.setText(text)
+
+    def search(self) -> None:
+        """Procura o Ollama no endereço digitado, fora da thread da interface; a resposta de uma procura anterior que
+        chega depois é descartada."""
+        if self.busy:
+            return
+        address = self.address.text()
+        self.detection = None
+        self.added = None
+        self.list.clear()
+        self.show_busy(True, "Procurando o Ollama…")
+        task = self.task = _Task(lambda: ollama_local.detect(address))
+        run_task(task, lambda result, text: self.show_result(result, task, text))
+
+    def show_result(self, detection, task, error: str = "") -> None:
+        """Mostra a procura que terminou (ou o motivo da falha inesperada em `error`); a de uma tarefa antiga é ignorada."""
+        if task is not self.task:
+            return
+        self.detection = detection
+        self.list.clear()
+        if detection is None:
+            self.show_busy(False, f"A procura falhou: {error or 'sem motivo informado'}")
+            return
+        for record in detection.models:
+            self.list.addItem(record.id)
+        self.show_busy(False, "\n".join((f"Ollama achado em {detection.address}.", *detection.notes)) if detection.found
+                       else detection.error)
+
+    def add(self) -> None:
+        """Cadastra a conexão do endereço achado (a gravação testa o host antes) fora da thread da interface."""
+        if self.busy or not self.detection or not self.detection.found:
+            return
+        detection = self.detection
+        self.show_busy(True, "Testando e salvando a conexão…")
+        task = self.task = _Task(lambda: ollama_local.register(Store(self.home), detection))
+        run_task(task, lambda result, text: self.show_saved(result, text, task))
+
+    def show_saved(self, result, error: str, task) -> None:
+        if task is not self.task:
+            return
+        if result is None:
+            self.show_busy(False, f"Não foi possível salvar a conexão: {error}")
+            return
+        self.added, updated = result
+        self.show_busy(False, f"Conexão {'atualizada' if updated else 'salva'}: {self.added['name']}.")
 
 
 class ConnectionsDialog(GrowingDialog):
@@ -939,7 +1042,8 @@ class ConnectionsDialog(GrowingDialog):
         body.addWidget(self.list, 1)
         buttons = QVBoxLayout()
         self.buttons = {}
-        for key, text, callback in (("add", "Adicionar…", self.add), ("edit", "Editar…", self.edit),
+        for key, text, callback in (("add", "Adicionar…", self.add), ("detect", "Achar Ollama…", self.detect),
+                                    ("edit", "Editar…", self.edit),
                                     ("duplicate", "Duplicar…", self.duplicate),
                                     ("test", "Testar", self.test), ("test_all", "Testar todas", self.test_all),
                                     ("default", "Tornar padrão", self.make_default),
@@ -1048,6 +1152,12 @@ class ConnectionsDialog(GrowingDialog):
         form = ConnectionForm(self.home, parent=self)
         if form.exec() and form.saved:
             self.populate(form.saved["id"])
+
+    def detect(self):
+        dialog = DetectOllamaDialog(self.home, self)
+        dialog.exec()
+        if dialog.added:
+            self.populate(dialog.added["id"])
 
     def edit(self):
         connection = self.current()

@@ -9,7 +9,7 @@ from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.user_modules import load_user_modules
 
 BUILTIN_MODULES = {"claude": "claude_code", "codex": "codex", "copilot": "copilot_cli", "vscode": "vscode",
-                   "copilot_app": "copilot_app"}  # ID -> módulo: achar um adaptador sem importar os outros
+                   "copilot_app": "copilot_app", "aider": "aider"}  # ID -> módulo: achar um adaptador sem importar os outros
 BUILTIN_NAMES = tuple(BUILTIN_MODULES.values())
 _loaded: dict | None = None
 _errors: list[str] = []

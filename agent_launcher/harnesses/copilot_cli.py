@@ -110,6 +110,7 @@ class CopilotCli(Harness):
     BYPASS_RISK = "Libera todas as ferramentas, caminhos e URLs do Copilot CLI sem confirmação (--allow-all)."
     BYPASS_HINT = "Sem pedir permissão"
     EXECUTABLE = "copilot"
+    ENDPOINT_SESSIONS = True
     SCRUB_PREFIXES = ("COPILOT_PROVIDER_",)
     SCRUB = frozenset({"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "COPILOT_MODEL", "COPILOT_OFFLINE",
                        "COPILOT_ALLOW_ALL"})
@@ -155,20 +156,25 @@ class CopilotCli(Harness):
         gateway, catalog, selected, model = context.gateway, context.catalog, context.selected, context.model
         protocol = self.protocol(gateway, selected, catalog)
         url = gateway.protocols[protocol]
-        if protocol == "messages":
-            url = url.removesuffix("/v1")  # o tipo anthropic acrescenta /v1/messages, como o Claude Code
+        key = gateway.key
+        bearer = bool(key) and protocol == "messages" and gateway.messages_auth == "bearer"
+        base_url = url.removesuffix("/v1") if protocol == "messages" else url  # o tipo anthropic acrescenta /v1/messages
+        if context.endpoint:
+            from agent_launcher.endpoint.registry import PLACEHOLDER_KEY
+            key, bearer = PLACEHOLDER_KEY, False
+            base_url = context.endpoint.url + ("" if protocol == "messages" else "/v1")
         overrides = {
-            "COPILOT_PROVIDER_BASE_URL": url,
+            "COPILOT_PROVIDER_BASE_URL": base_url,
             "COPILOT_PROVIDER_TYPE": PROVIDER_TYPES[protocol],
             "COPILOT_MODEL": model,
             "COPILOT_PROVIDER_MODEL_ID": known_model_id(model),
             "COPILOT_PROVIDER_WIRE_MODEL": model,
-            SECRET_VARIABLE: gateway.key,
+            SECRET_VARIABLE: key,
         }
         if protocol in WIRE_APIS:
             overrides["COPILOT_PROVIDER_WIRE_API"] = WIRE_APIS[protocol]
-        if gateway.key and protocol == "messages" and gateway.messages_auth == "bearer":
-            overrides["COPILOT_PROVIDER_BEARER_TOKEN"] = gateway.key
+        if bearer:
+            overrides["COPILOT_PROVIDER_BEARER_TOKEN"] = key
             overrides[SECRET_VARIABLE] = ""
         if catalog.verified and selected.max_input_tokens:
             overrides["COPILOT_PROVIDER_MAX_PROMPT_TOKENS"] = str(selected.max_input_tokens)
@@ -188,7 +194,10 @@ class CopilotCli(Harness):
         secret = ("COPILOT_PROVIDER_BEARER_TOKEN", SECRET_VARIABLE)
         return LaunchPlan(self.ID, model, context.directory, command, context.environment, overrides, context.input_limit,
                           selected.max_input_tokens if catalog.verified else None, None, {}, warnings, False,
-                          gateway.name, secret)
+                          gateway.name, () if context.endpoint else secret)
+
+    def prepare(self, plan) -> None:
+        self.ensure_endpoint(plan)
 
     def has_previous_conversation(self, directory: Path) -> bool:
         """Sessões em ~/.copilot/session-state/<id>/workspace.yaml com `cwd: <pasta>` (a mais recente primeiro)."""

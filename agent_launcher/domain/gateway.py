@@ -8,13 +8,14 @@ import time
 from agent_launcher.connectors import (PROTOCOLS, ConnectorError, QuotaExhausted, declares_sources, normalize_costs,
                                        normalize_targets, offers_costs)
 from agent_launcher.connectors._http import NO_KEY
-from agent_launcher.domain.catalog import Catalog, ModelInfo
+from agent_launcher.domain.catalog import Catalog, Change, ModelInfo, positive_integer, price, price_label, price_sides, token_label
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import atomic_json
 from agent_launcher.domain.store import secret_values
 
 CACHE_TTL = 6 * 60 * 60
 CACHE_SCHEMA = 4
+SEEN_FIELDS = ("input_cost_per_token", "output_cost_per_token", "max_input_tokens")
 
 
 class Gateway:
@@ -122,8 +123,9 @@ class Gateway:
         return Catalog(list(records), status, verified, self.clis, self.any_model, frozenset(self.protocols), declared)
 
     def _save(self, records, fetched_at: float, metadata: bool, segregates_sources: bool | None = None,
-              seen: list[str] | None = None) -> None:
-        """Grava o cache da conexão; `seen` são os ids da última lista que o usuário viu (ausente = sem base)."""
+              seen: list[str] | None = None, seen_values: dict | None = None) -> None:
+        """Grava o cache da conexão; `seen` são os ids da última lista que o usuário viu e `seen_values` o preço e a janela
+        de cada um (ausente = sem base)."""
         declared = self.segregates_sources if segregates_sources is None else segregates_sources
         shaped = records if declared else [record.without_source() for record in records]
         payload = {"schema": CACHE_SCHEMA, "fingerprint": self.fingerprint, "fetched_at": fetched_at,
@@ -131,6 +133,8 @@ class Gateway:
                    "records": [record.to_cache() for record in shaped]}
         if seen is not None:
             payload["seen"] = seen
+        if seen_values is not None:
+            payload["seen_values"] = seen_values
         atomic_json(self.cache_path, payload)
 
     def mark_news_seen(self, catalog: Catalog) -> None:
@@ -139,23 +143,28 @@ class Gateway:
         try:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
             data["seen"] = [record.id for record in catalog.records]
+            data["seen_values"] = self._snapshot(catalog.records)
             atomic_json(self.cache_path, data)
         except (OSError, ValueError):
             return
 
-    def _models(self) -> tuple[list[ModelInfo], bool]:
-        """models() do conector conferido contra o contrato (list[ModelInfo], bool)."""
+    def _models(self) -> tuple[list[ModelInfo], bool, tuple[str, ...]]:
+        """models() do conector conferido contra o contrato (list[ModelInfo], bool[, avisos]); os avisos são frases que
+        vão ao status do catálogo."""
         result = self.module.models(self.options)
         received = type(result).__name__
-        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], list) and isinstance(result[1], bool):
+        notes = result[2] if isinstance(result, tuple) and len(result) == 3 else ()
+        if (isinstance(result, tuple) and len(result) in (2, 3) and isinstance(result[0], list)
+                and isinstance(result[1], bool) and isinstance(notes, tuple)
+                and all(isinstance(note, str) for note in notes)):
             wrong = next((item for item in result[0] if not isinstance(item, ModelInfo)), None)
             if wrong is None:
                 if self.segregates_sources:
                     self._one_source_per_model(result[0])
-                return result
+                return result[0], result[1], notes
             received = f"uma lista com {type(wrong).__name__}"
         raise LauncherError(f"{self.name}: o conector {self.connection['connector']!r} devolveu {received} em models(); "
-                            "o esperado é (lista de ModelInfo, contexto confirmado como bool).")
+                            "o esperado é (lista de ModelInfo, contexto confirmado como bool[, tupla de avisos]).")
 
     def _one_source_per_model(self, records: list[ModelInfo]) -> None:
         """Um modelo, uma fonte: ConnectorError se algum id traz implantações de 2+ fontes distintas."""
@@ -166,6 +175,48 @@ class Gateway:
                 raise ConnectorError(
                     f"o modelo {record.id!r} vem de {len(sources)} fontes ({', '.join(sources)}); um modelo pertence a uma "
                     "só fonte, então cada fonte precisa expor o seu id (por exemplo com um prefixo por fonte).")
+
+    @staticmethod
+    def _snapshot(records) -> dict[str, dict]:
+        """Preço e janela de cada modelo, como ficam no cache para a próxima comparação."""
+        return {record.id: {key: getattr(record, key) for key in SEEN_FIELDS} for record in records}
+
+    @staticmethod
+    def _seen_values(value: object) -> dict[str, ModelInfo] | None:
+        """Os valores vistos do cache como registros só com preço e janela; qualquer forma inesperada é "sem base"."""
+        if not isinstance(value, dict):
+            return None
+        found = {}
+        for identifier, fields in value.items():
+            if not isinstance(identifier, str) or not isinstance(fields, dict):
+                return None
+            found[identifier] = ModelInfo(identifier, max_input_tokens=positive_integer(fields.get("max_input_tokens")),
+                                          input_cost_per_token=price(fields.get("input_cost_per_token")),
+                                          output_cost_per_token=price(fields.get("output_cost_per_token")))
+        return found
+
+    @staticmethod
+    def _changes(seen_values: dict[str, ModelInfo] | None, records) -> tuple[tuple[Change, ...], tuple[Change, ...]]:
+        """Preço e janela que mudaram nos modelos que já estavam na lista vista, na ordem do nome. Compara o que o usuário
+        lê (os rótulos): o preço de entrada e o de saída um a um, e o lado que o host deixou de informar não é mudança
+        (de "1/2" para "1/?" não houve alteração), nem o preço inteiro ou a janela que sumiram; o lado que passou de
+        desconhecido a informado ("3/?" para "3/15") conta como alteração; modelo novo é `added`, não alteração."""
+        if seen_values is None:
+            return (), ()
+        prices, windows = [], []
+        for record in sorted(records, key=lambda item: item.id.casefold()):
+            before = seen_values.get(record.id)
+            if before is None:
+                continue
+            old, new = price_label(before), price_label(record)
+            if old and new and any(after is not None and after != earlier for earlier, after
+                                   in zip(price_sides(before), price_sides(record))):
+                prices.append(Change(record.id, old, new))
+            if before.max_input_tokens and record.max_input_tokens:
+                old, new = token_label(before.max_input_tokens), token_label(record.max_input_tokens)
+                if old != new:
+                    windows.append(Change(record.id, old, new))
+        return tuple(prices), tuple(windows)
 
     @staticmethod
     def _news(seen: list[str] | None, records) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -182,18 +233,21 @@ class Gateway:
         fetched_at = 0
         metadata_available = False
         seen = None
+        seen_values = None
         try:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
             if data.get("schema") == CACHE_SCHEMA and data.get("fingerprint") == self.fingerprint:
                 fetched_at = float(data["fetched_at"])
                 if isinstance(data.get("seen"), list):
                     seen = [item for item in data["seen"] if isinstance(item, str)]
+                    seen_values = self._seen_values(data.get("seen_values"))
                 cached.segregates_sources = data.get("segregates_sources") is True
                 cached.records = [ModelInfo.from_cache(record) if cached.segregates_sources
                                   else ModelInfo.from_cache(record).without_source() for record in data["records"]]
                 metadata_available = data.get("metadata_available") is True
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
-            cached, seen = self.empty_catalog(segregates_sources=False), None
+            cached, seen, seen_values = self.empty_catalog(segregates_sources=False), None, None
+        kept_values = None if seen_values is None else self._snapshot(seen_values.values())
         age = time.time() - fetched_at
         fresh = 0 <= age < CACHE_TTL
         cached.verified = bool(cached.records and metadata_available and fresh)
@@ -206,9 +260,10 @@ class Gateway:
             return cached
         if cached.records and not refresh and fresh and (metadata_available or age < 60):
             cached.added, cached.removed = self._news(seen, cached.records)
+            cached.price_changes, cached.window_changes = self._changes(seen_values, cached.records)
             return cached
         try:
-            records, metadata_available = self._models()
+            records, metadata_available, notes = self._models()
             if not records:
                 raise ConnectorError("o host não retornou modelos para este acesso.")
         except ConnectorError as error:
@@ -217,7 +272,7 @@ class Gateway:
                 cached.status = f"AVISO: catálogo em cache sem confirmação; contexto não será configurado. {error}"
                 if save_cache:
                     try:
-                        self._save(cached.records, fetched_at, False, cached.segregates_sources, seen)
+                        self._save(cached.records, fetched_at, False, cached.segregates_sources, seen, kept_values)
                     except OSError:
                         pass
                 if not refresh:
@@ -225,14 +280,16 @@ class Gateway:
             raise LauncherError(f"{self.name}: {error}") from error
         status = ("Catálogo ao vivo • limites de contexto informados pelo host" if metadata_available else
                   "Catálogo ao vivo • o host não informa contexto; os CLIs usam seus próprios limites")
-        catalog = self.empty_catalog(records, status, metadata_available)
+        catalog = self.empty_catalog(records, status + "".join(f" • {note}" for note in notes), metadata_available)
         catalog.added, catalog.removed = self._news(seen, records)
+        catalog.price_changes, catalog.window_changes = self._changes(seen_values, records)
         if not catalog.segregates_sources:
             catalog.records = [record.without_source() for record in records]
         if save_cache:
             try:
                 self._save(records, time.time(), metadata_available,
-                           seen=[record.id for record in records] if seen is None else seen)
+                           seen=[record.id for record in records] if seen is None else seen,
+                           seen_values=self._snapshot(records) if kept_values is None else kept_values)
             except OSError:
                 catalog.status += " • não foi possível salvar o cache"
         return catalog

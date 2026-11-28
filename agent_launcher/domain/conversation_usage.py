@@ -99,14 +99,42 @@ def conversations_text(rows: list, header=CONVERSATIONS_HEADER) -> str:
 
 
 def conversations_tsv(conversations: list, usages: dict, record: ModelInfo | None = None, verified: bool = False,
-                      branches: bool = False) -> str:
-    """O texto de `conversations_text` para `conversations`, com o uso de cada uma em `usages` (por ID). Com `branches` e
-    alguma conversa com ramo gravado, a coluna final "Ramo" (traço onde não se sabe); sem nenhum ramo, o texto é o de sempre."""
+                      branches: bool = False, projects: list[str] | None = None) -> str:
+    """O texto de `conversations_text` para `conversations`, com o uso de cada uma em `usages` (por ID). Com `projects` (o
+    nome do projeto de cada conversa, na mesma ordem), a coluna "Projeto" depois das de uso. Com `branches` e alguma
+    conversa com ramo gravado, a coluna final "Ramo" (traço onde não se sabe); sem nenhum ramo e sem `projects`, o texto é
+    o de sempre."""
+    if projects is not None and len(projects) != len(conversations):
+        raise ValueError(f"{len(projects)} projeto(s) para {len(conversations)} conversa(s).")
     rows = [conversation_row(item, usages.get(item.id), record, verified) for item in conversations]
+    header = CONVERSATIONS_HEADER
+    if projects is not None:
+        rows = [(*row, name) for row, name in zip(rows, projects)]
+        header = (*header, "Projeto")
     if branches and any(item.branch for item in conversations):
         rows = [(*row, item.branch or "—") for row, item in zip(rows, conversations)]
-        return conversations_text(rows, (*CONVERSATIONS_HEADER, "Ramo"))
-    return conversations_text(rows)
+        header = (*header, "Ramo")
+    return conversations_text(rows, header)
+
+
+CONVERSATION_SORTS = ("recente", "custo", "contexto")
+
+
+def sort_conversations(conversations: list, usages: dict, order: str = "recente") -> list:
+    """`conversations` (já da mais recente à mais antiga) na ordem pedida: `recente` a mantém; `custo` e `contexto` põem o
+    maior valor primeiro, o empate fica na ordem original e o desconhecido (sem preço ou sem transcript) vai para o fim."""
+    if order not in CONVERSATION_SORTS:
+        raise ValueError(f"Ordem {order!r} desconhecida; use {', '.join(CONVERSATION_SORTS)}.")
+    if order == "recente":
+        return list(conversations)
+    field = "cost" if order == "custo" else "context"
+
+    def value(item):
+        return getattr(usages.get(item.id) or ConversationUsage(), field)
+
+    known = [item for item in conversations if value(item) is not None]
+    unknown = [item for item in conversations if value(item) is None]
+    return sorted(known, key=value, reverse=True) + unknown
 
 
 def resume_window_warning(home: Path, conversations: list, conversation: str | None, record: ModelInfo | None,

@@ -90,7 +90,7 @@ class LaunchContext:
 
 def uses_endpoint(gateway, harness) -> bool:
     """A conexão pede as sessões de terminal pelo endpoint local e o adaptador as aceita?"""
-    return harness.ENDPOINT_SESSIONS and gateway.store.endpoint_sessions_of(gateway.connection)
+    return harness.endpoint_serves(gateway) and gateway.store.endpoint_sessions_of(gateway.connection)
 
 
 def endpoint_route(gateway, harness) -> EndpointRoute | None:

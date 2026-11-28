@@ -53,7 +53,7 @@ IDLE_SECONDS = 4 * 60 * 60
 LOG_MAX_BYTES = 1_000_000  # endpoint.log: passando disso, fica a metade mais recente
 BODY_LIMIT = 64 * 1024 * 1024
 ROUTES = {"/v1/messages": "messages", "/v1/messages/count_tokens": "messages", "/v1/responses": "responses",
-          "/v1/chat/completions": "chat_completions"}
+          "/v1/chat/completions": "chat_completions", "/v1/embeddings": "chat_completions"}
 CLIENT_CREDENTIALS = {"authorization", "x-api-key", "api-key", "proxy-authorization"}
 HOP_BY_HOP = {"host", "connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade",
               "content-length", "accept-encoding"}

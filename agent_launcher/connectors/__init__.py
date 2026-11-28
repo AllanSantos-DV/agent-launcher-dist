@@ -118,7 +118,7 @@ def normalize_targets(raw: dict) -> dict:
 
 
 BUILTIN_NAMES = ("litellm", "ninerouter", "omniroute", "openrouter", "anthropic", "openai",
-                 "anthropic_compatible", "openai_compatible")
+                 "anthropic_compatible", "openai_compatible", "ollama")
 BUILTIN = tuple(importlib.import_module(f"{__name__}.{name}") for name in BUILTIN_NAMES)
 
 

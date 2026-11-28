@@ -1,9 +1,9 @@
 # Agent Launcher
 
-Abre **Claude Code**, **Codex** e **GitHub Copilot CLI** nos seus projetos, e configura o chat do Copilot no
+Abre **Claude Code**, **Codex**, **GitHub Copilot CLI** e **Aider** (agente local, opcional) nos seus projetos, e configura o chat do Copilot no
 **VS Code** e o **GitHub Copilot app**, usando o provedor de modelos que você escolher: um proxy LiteLLM ou host próprio
 (inclusive na rede ou por VPN), roteadores como **9router**, **OmniRoute** e **OpenRouter**, as APIs da **Anthropic** e da
-**OpenAI**, ou qualquer host compatível com Anthropic Messages, OpenAI Responses ou Chat Completions.
+**OpenAI**, um **Ollama** neste computador, ou qualquer host compatível com Anthropic Messages, OpenAI Responses ou Chat Completions.
 
 A lista de modelos vem do próprio host. O launcher lê o que cada host informa (disponibilidade, janela de entrada,
 saída máxima, ferramentas, entrada de imagem, áudio e vídeo) e configura cada sessão só com o que foi confirmado. Nada
@@ -26,7 +26,7 @@ Interface gráfica Windows (PySide6) e modo texto (biblioteca padrão). Para Win
 
 - Windows 10 ou 11 (x64) e Node.js 18 ou superior (para o `npx`). Não precisa de Python nem de administrador: o
   instalador prepara um Python só para o Agent Launcher, isolado do resto da máquina.
-- O pacote leva só o launcher. Cada ferramenta (Claude Code, Codex, Copilot CLI, VS Code, Copilot app) se instala sob
+- O pacote leva só o launcher. Cada ferramenta (Claude Code, Codex, Copilot CLI, Aider, VS Code, Copilot app) se instala sob
   demanda, pelo cartão dela na tela, por usuário e sem admin. O Codex precisa de um host com a API **Responses**: ele
   não aceita `/chat/completions`.
 
@@ -80,13 +80,14 @@ instalar". Um clique instala, por usuário e sem admin, uma ferramenta por vez:
 | Claude Code | instalador oficial (`claude.ai/install.ps1`), depois `npm install -g` | indeterminado até concluir |
 | Codex | instalador oficial (`chatgpt.com/codex/install.ps1`), depois `npm install -g` | indeterminado até concluir |
 | Copilot CLI | `npm install -g @github/copilot`, depois winget | indeterminado até concluir |
+| Aider | `uv` (o winget instala o `uv` se faltar) cria um ambiente próprio em `~/.agent-launcher/tools/aider` com o Python 3.12 e instala o `aider-chat` 0.86.2 fixado | indeterminado até concluir |
 | VS Code | instalador de usuário baixado da API de update da Microsoft, com SHA-256 e assinatura conferidos, depois winget | proporcional no download |
 | Copilot app | instalador da última release de `github/app`, com SHA-256 e assinatura conferidos, depois winget | proporcional no download |
 
 Durante a instalação a barra do cartão cresce e o ícone vai sendo pintado. Onde o próprio launcher baixa o instalador,
 a barra acompanha os bytes; onde o instalador oficial roda em silêncio, não há porcentagem e a barra corre de um lado a
 outro até o fim. Falha aparece na faixa de erros com o motivo e fica em `~/.agent-launcher/cli-install.log`. No modo
-texto: `launcher cli --install claude|codex|copilot|vscode|copilot_app|all` (`all` = os três CLIs de terminal), e
+texto: `launcher cli --install claude|codex|copilot|aider|vscode|copilot_app|all` (`all` = os três CLIs de terminal; o Aider só entra pelo nome), e
 abrir sessão de uma ferramenta que falta pergunta se instala. Não é preciso fazer login nos CLIs: a chave vem da conexão.
 
 **Atualização das CLIs.** Cada botão de CLI mostra a versão instalada (`--version`) e, quando o registro do npm tem uma mais
@@ -136,17 +137,33 @@ ou Entra ID, Store removida ou restrita, MSIX por usuário bloqueado, winget des
 | Claude Code | aba do Windows Terminal | Anthropic Messages | — |
 | Codex | aba do Windows Terminal | OpenAI Responses | — |
 | GitHub Copilot CLI | aba do Windows Terminal | Messages (Claude), Responses (GPT-5 em diante), Chat Completions (os outros) | não precisa |
+| Aider | aba do Windows Terminal | Chat Completions | — |
 | VS Code | janela do VS Code no perfil **Agent Launcher** | os três, pelo endpoint local | não precisa |
 | GitHub Copilot app | o app, com o provider **Agent Launcher — conexão** | Responses (GPT-5 em diante) e Chat Completions, pelo endpoint local | o app pede conta GitHub |
 
-Os três de terminal recebem a conexão só no ambiente do processo da sessão: nada é gravado na configuração deles. Todos
+Os de terminal recebem a conexão só no ambiente do processo da sessão: nada é gravado na configuração deles. Todos
 se instalam pelo cartão (veja [Instalar as ferramentas](#instalar-as-ferramentas)). Claude Code e Codex têm sessão
-controlada pelo orquestrador; o Copilot CLI ainda não.
+controlada pelo orquestrador; o Copilot CLI e o Aider não.
+
+**Aider (agente local).** Edita por texto, sem chamada de ferramenta nativa, e por isso funciona com modelo pequeno e local: com
+`qwen3:4b` num Ollama local ele fez 3 de 3 tarefas pequenas, enviando cerca de mil tokens por tarefa. Aparece para toda conexão
+que serve Chat Completions. Com a conexão **Ollama (local)** a sessão usa a rota nativa do Ollama (`ollama_chat/`) e pede a
+janela de 16384 tokens (`num_ctx`), porque sem isso o Ollama usa uma janela bem menor; nas outras conexões usa a rota
+OpenAI-compatível (`openai/`). A sessão abre sem telemetria, sem aviso de versão e sem a pergunta de modelo desconhecido;
+**Sem pedir permissão** vira `--yes-always`. O Aider grava `.aider.*` na pasta do projeto; **Retomar última** passa `--restore-chat-history` quando a pasta tem `.aider.chat.history.md` (não há lista de conversas para escolher).
+
+**Achar o Ollama.** Em **Conexões**, o botão **Achar Ollama…** (e `launcher connections detect [--address URL] [--add] [--name NOME]` no modo
+texto) procura o Ollama no endereço padrão `http://127.0.0.1:11434` (ou no que você digitar), lista os modelos que ele tem e o que cada um
+informa pelo `/api/show` (ferramentas, imagem e embedding; a janela máxima do modelo, com o aviso de que o Ollama carrega menos por
+padrão e de `OLLAMA_CONTEXT_LENGTH`; Ollama antigo sem `/api/show` aparece como "não informa"; a atualização do catálogo de uma conexão Ollama faz uma consulta `/api/show` por modelo, 8 em paralelo). Só procura quando você clica ou roda o comando: o
+launcher nunca sonda a rede sozinho. Achando, **Adicionar conexão** (ou `--add`) testa o host e cadastra a conexão **Ollama (local)**; se o nome já
+existe, atualiza. Sem Ollama no endereço, ou com Ollama sem nenhum modelo baixado, a janela mostra o motivo e o comando (`ollama pull qwen3:4b`), o
+comando de texto sai com 1 e nada é gravado; o launcher segue funcionando com as outras conexões.
 
 **VS Code e Copilot app guardam a configuração**, então nunca recebem a chave nem o endereço real do host. Eles
 apontam para o **endpoint local** da conexão, um processo oculto do launcher que escuta só em `127.0.0.1` (porta fixa
 por conexão, a partir de 47910), descarta qualquer credencial que o destino mande, acrescenta a da conexão e repassa
-ao host com streaming. Trocar a chave ou o host no launcher vale na próxima requisição, sem mexer no destino. O endpoint
+ao host com streaming (Messages, Responses, Chat Completions e `POST /v1/embeddings`, que segue o protocolo Chat Completions da conexão: ferramentas de busca e editores passam a usar a conexão, com a chave guardada, o log e o uso). Trocar a chave ou o host no launcher vale na próxima requisição, sem mexer no destino. O endpoint
 sobe ao abrir o destino e encerra sozinho após 4 h sem uso; `launcher endpoint autostart --connection NOME` faz ele
 subir com o Windows (sem janela, sem admin), para o VS Code e o app acharem a conexão com o launcher fechado. O log
 (`~/.agent-launcher/endpoint.log`) tem rota, modelo, status e duração; nunca corpo, prompt ou chave; `launcher endpoint logs [--lines N] [--summary]` mostra o fim dele (com `--summary`, o resumo: pedidos, erros por modelo, failovers e latência). Além de repassar, o endpoint
@@ -173,17 +190,23 @@ ganha uma linha `failover <de> -> <para> motivo=<429|402>` (ou `motivo=cota marc
 **Conexão reserva** e **Salvar**) ou por `launcher connections --set-fallback NOME --to RESERVA` (`--clear-fallback NOME`
 tira); a própria conexão, um ciclo ou uma conexão inexistente são recusados.
 
-**Sessões de terminal pelo endpoint local (opt-in, por conexão).** Por padrão o Claude Code e o Codex vão direto ao
-host da conexão, com a chave no ambiente da sessão, como sempre. Com a preferência ligada (caixa **Abrir sessões de
-terminal pelo endpoint local**, desmarcada por padrão, logo abaixo do painel do endpoint em **Gerenciar conexões**, ou `launcher connections --endpoint-sessions
-on --connection NOME`; `off` volta ao caminho direto) as duas CLIs passam a falar com o endpoint local da conexão:
-o launcher o sobe ao abrir a sessão, aponta o Claude Code para o endereço sem `/v1` e o Codex para o endereço com `/v1`, e
-a chave que vai no ambiente é um texto fixo sem valor (o endpoint acrescenta a credencial real). Com isso o `endpoint.log`
-e a **Conexão reserva** (failover por cota esgotada) passam a valer também para a sessão. Se o endpoint não sobe, a
-abertura é recusada com o motivo, sem cair para o host às escondidas. O resumo do plano (olho) e `launch --dry-run` mostram o
-endereço do endpoint local; o Copilot CLI segue direto. O uso da sessão vem das conversas, como antes: o endpoint reconhece
-o Claude Code e o Codex pelo `User-Agent` e o Uso do mês não soma essas linhas de novo, então a sessão conta uma vez só (VS Code
-e Copilot app continuam somando do endpoint). `launcher connections` marca com "sessões pelo endpoint" a conexão que tem a preferência ligada.
+**Sessões de terminal pelo endpoint local (opt-in, por conexão).** Por padrão o Claude Code, o Codex, o Copilot CLI e o
+Aider vão direto ao host da conexão, com a chave no ambiente da sessão, como sempre. Com a preferência ligada (caixa
+**Abrir sessões de terminal pelo endpoint local**, desmarcada por padrão, logo abaixo do painel do endpoint em **Gerenciar
+conexões**, ou `launcher connections --endpoint-sessions on --connection NOME`; `off` volta ao caminho direto) as sessões
+dessa conexão passam a falar com o endpoint local dela: o launcher o sobe ao abrir a sessão, aponta o Claude Code para o
+endereço sem `/v1`, o Codex e o Aider para o endereço com `/v1` e o Copilot CLI para o endereço que o protocolo do modelo
+pede (sem `/v1` em Messages, com `/v1` em Responses e Chat Completions), e a chave que vai no ambiente é um texto fixo sem
+valor (o endpoint acrescenta a credencial real; a chave real nunca vai em argumento de linha de comando). Com isso o
+`endpoint.log` e a **Conexão reserva** (failover por cota esgotada) passam a valer também para a sessão. O Aider em
+conexão **Ollama** continua direto, mesmo com a preferência ligada: ele usa a rota nativa `/api/chat` para pedir a janela
+de contexto (`num_ctx`), e o endpoint só serve `/v1/*`; nas demais conexões que servem Chat Completions o Aider vai pelo
+endpoint. Se o endpoint não sobe, a abertura é recusada com o motivo, sem cair para o host às escondidas. O resumo do
+plano (olho) e `launch --dry-run` mostram o endereço do endpoint local. O uso do Claude Code e do Codex vem das conversas,
+como antes: o endpoint os reconhece pelo `User-Agent` e o Uso do mês não soma essas linhas de novo, então a sessão conta
+uma vez só (VS Code e Copilot app continuam somando do endpoint). O Aider e o Copilot CLI não têm `User-Agent` próprio: as
+chamadas deles aparecem no destino **Endpoint local**, e o Copilot CLI, que também grava o uso na própria conversa, conta
+nos dois lugares enquanto a preferência estiver ligada. `launcher connections` marca com "sessões pelo endpoint" a conexão que tem a preferência ligada.
 
 - **VS Code:** o launcher abre o projeto num perfil próprio, **Agent Launcher** (criado pelo VS Code na primeira
   vez), e grava nele os modelos da conexão (`chatLanguageModels.json`, provider Custom Endpoint) e o modelo escolhido
@@ -290,6 +313,7 @@ usa quando a selecionada fica sem cota; salvar grava na hora, e ao reabrir a tel
 | OpenAI API | — | `https://api.openai.com/v1` | GPT/o | não informado |
 | Compatível com Anthropic | `{endereço}` | — | o que o host listar + extras | se o host informar (grafias abaixo) |
 | Compatível com OpenAI | — | `{endereço}` (Responses) | o que o host listar + extras | se o host informar (grafias abaixo) |
+| Ollama (local) | `{endereço}` (para o Claude Code; só edita arquivo com modelo que usa ferramentas, como `qwen3:4b`) | — (o Codex não é oferecido: a prova não editou o arquivo) |  o que o Ollama listar + extras | só nas notas da procura (o Ollama carrega menos que o máximo do modelo) |
 
 Os conectores, exceto o LiteLLM, leem de cada item do `/v1/models` o primeiro valor que vier, nesta ordem:
 
@@ -330,7 +354,7 @@ launcher connections test OpenRouter
 launcher connections test   # sem o nome, testa todas as conexões, uma a uma, e diz o resultado de cada; código 1 se alguma falhou
 launcher connections --set-fallback "Meu proxy" --to OpenRouter   # reserva usada pelo endpoint local se a cota acabar
 launcher connections --clear-fallback "Meu proxy"
-launcher connections --endpoint-sessions on --connection "Meu proxy"   # Claude Code e Codex pelo endpoint local (off volta ao direto)
+launcher connections --endpoint-sessions on --connection "Meu proxy"   # sessões de terminal da conexão pelo endpoint local (off volta ao direto)
 ```
 
 Chaves nunca vão na linha de comando: `--secret-env` lê de uma variável de ambiente, e sem ela o comando pergunta de
@@ -354,7 +378,7 @@ avisados na janela) do `launcher conversations --grep TEXTO`, que procura dentro
 (a sua e a do modelo, sem distinguir maiúsculas) das conversas de Claude Code, Codex e Copilot CLI, e deixa de fora metadados,
 resultados de ferramenta, raciocínio e o contexto de ambiente. Só lê os transcripts, nunca grava nada neles; a busca para em 30 s
 no total, lê no máximo 64 MiB de cada conversa e pula linha acima de 16 MiB, e o que ficou sem ler aparece como `[AVISO]` no stderr.
-Valor vazio é erro. Com `--command`, a posição conta a lista já filtrada pelo `--grep`.
+Valor vazio é erro. Com `--command`, a posição conta a lista já filtrada pelo `--grep`. Com `--all-projects` (só junto com `--grep`), a busca varre as conversas de todos os projetos cadastrados, e cada linha diz de qual projeto é: coluna **Projeto** no `--tsv` (depois do custo e antes do ramo), chave `project` no JSON; os tetos valem para a varredura inteira, não por projeto. A varredura lê as pastas de conversa de cada CLI uma vez por projeto, então muitos projetos custam mais tempo; a mesma conversa vista por dois projetos (pastas que resolvem para a mesma pasta de conversas) aparece uma vez, com o primeiro projeto.
 **Copiar comando de retomada** copia, para a conversa selecionada, o comando do cmd que a continua num terminal seu (SSH,
 outro shell): vai à pasta do projeto, limpa do shell as variáveis que o launcher tira do ambiente das sessões, define o
 ambiente da conexão e roda o CLI com o modelo escolhido na tela; é o mesmo plano do botão **Retomar** e do `--dry-run`, que
@@ -435,7 +459,12 @@ o histórico do repositório com o projeto. Sem a opção, nada muda: a sessão 
 - **Quais destinos:** Claude Code, Codex e Copilot CLI, igual para os três: só muda a pasta em que a sessão roda. VS Code e
   GitHub Copilot app abrem numa pasta própria e recusam a opção com uma mensagem.
 - **Pela interface:** botão direito no projeto, **Nova sessão em worktree…** (só quando o destino escolhido é de terminal):
-  pergunta o NOME (vazio gera um) e abre com o CLI, o modelo e a conexão escolhidos na tela.
+  pergunta o NOME (vazio gera um) e abre com o CLI, o modelo e a conexão escolhidos na tela. A janela também lista os
+  worktrees que o launcher já criou no projeto (os mesmos de `launcher worktrees`, lidos em segundo plano): clicar em um
+  põe o nome dele no campo, e duplo clique ou Enter no item abre direto; o campo segue livre para digitar um nome novo.
+  Worktree incompleto (sem o marcador `launcher-pronto`) ou sem a pasta aparece desligado, porque o launcher não o
+  reabre. Se a lista não puder ser lida (pasta que não é repositório git, `git` fora do ar), a janela diz o motivo e o
+  nome continua podendo ser digitado.
 
 ### Contexto
 
@@ -451,10 +480,14 @@ o histórico do repositório com o projeto. Sem a opção, nada muda: a sessão 
 - Cache de catálogo: seis horas por conexão. Cache vencido ou catálogo sem confirmação nunca ativa aumentos de contexto.
 - Novidades do catálogo: os modelos que entraram e saíram desde a última lista que você viu aparecem na faixa
   informativa da tela e numa linha logo depois do estado em `launcher models` ("Novidades do catálogo: 2 modelos novos
-  (…); 1 removido (…)."; com `--json` a linha vai para o stderr). A lista vista fica em `models-<id>.json` e só muda
-  quando a tela ou `launcher models` mostra a novidade: se outra rotina (como o `doctor`) atualizar o cache antes, a
-  diferença se acumula até alguém mostrá-la, e mostrada uma vez ela não volta. É só informação: sem lista vista (primeira
-  leitura ou cache de versão anterior) não há comparação.
+  (…); 1 removido (…)."; com `--json` a linha vai para o stderr). Modelo que já estava na lista e mudou de preço ou de
+  janela de entrada ganha mais um trecho, só quando mudou, com o valor de antes e o de agora ("1 preço alterado
+  (modelo: US$ 3/15 → 4/20 por 1M); 1 janela alterada (modelo: 200k → 1M)"; o preço é entrada/saída por 1M de tokens).
+  Valor que o host deixou de informar não conta como mudança. A lista vista (ids, preços e janelas) fica em
+  `models-<id>.json` e só muda quando a tela ou `launcher models` mostra a novidade: se outra rotina (como o `doctor`)
+  atualizar o cache antes, a diferença se acumula até alguém mostrá-la, e mostrada uma vez ela não volta. É só
+  informação: sem lista vista (primeira leitura ou cache de versão anterior) não há comparação; um cache anterior só com
+  os ids vistos não avisa preço nem janela até a próxima busca ao host, que grava os valores como base.
 
 ### Bypass de permissões
 
@@ -547,7 +580,7 @@ console da sessão sem trazer a janela para a frente: funciona com a janela mini
 Cada janela de sessão fica registrada em `~/.cli-launcher/sessions/<pid>.json` enquanto existir.
 
 ```
-launcher keys [TECLA ...] (--project PROJETO [--cli claude|codex] | --pid PID) [--screen] [--wait TEXTO [--timeout S]]
+launcher keys [TECLA ...] (--project PROJETO [--cli claude|codex] | --pid PID) [--screen] [--wait TEXTO | --wait-idle] [--timeout S]
 launcher keys --list
 ```
 
@@ -558,11 +591,12 @@ launcher keys --list
 | `--pid` | pid da janela da sessão (de `--list`); dispensa `--project`. |
 | `--screen` | Imprime o que a sessão mostra agora (antes das teclas, se houver), para decidir o que enviar. |
 | `--wait` | Espera `TEXTO` aparecer na tela da sessão (lida a cada segundo) antes de ler a tela e enviar as teclas; espaços e quebras de linha valem como um só, porque o console quebra a linha na largura. Com `--screen`, imprime a tela em que o texto apareceu; sem teclas, confirma com `{"ok": true, "pid": ..., "title": ..., "waited": "TEXTO"}`. |
-| `--timeout` | Com `--wait`: prazo da espera em segundos (padrão 30). Sem o texto até o prazo, `Erro: ...` no stderr, código 1 e nenhuma tecla é enviada; sem `--wait`, o comando é o de sempre. |
+| `--wait-idle` | Espera a sessão ficar parada (estado `idle` do `launcher status`, lido do transcript do Claude Code, do Codex ou do Copilot CLI) antes de ler a tela e enviar as teclas, sem precisar conhecer o texto da tela; lida a cada 2 segundos. **Cuidado:** `idle` é a idade da última gravação do transcript (30 s), então vale como "sem atividade por 30 s", não como "terminou de pensar": uma geração ou uma ferramenta longa que não grava por esse tempo já conta como parada. `idle` só vale com duas leituras seguidas, 1 s uma da outra (a confirmação pode passar do prazo por esse tempo). **Corrida que sobra:** logo depois de enviar teclas, se o CLI demorar mais que esse 1 s para gravar a mensagem recebida e a sessão já estava parada, as duas leituras ainda dizem `idle` e a espera volta cedo demais; para esse caso confirme pela tela (`--wait TEXTO`). Se o launcher não acha com certeza o transcript da sessão (estado `unknown`: duas sessões do mesmo projeto e CLI abertas juntas, sessão retomada sem id de conversa, conversa ainda sem transcript, projeto de outro perfil), `Erro: ...` com o motivo na hora, nunca um palpite; use então `--wait TEXTO`. Não combina com `--wait`. Sem teclas, confirma com `{"ok": true, "pid": ..., "title": ..., "waited_idle": true, "last_activity": "..."}`. |
+| `--timeout` | Com `--wait`: prazo da espera em segundos (padrão 30); com `--wait-idle`, o padrão é 300 (a espera já exige 30 s de silêncio). Sem o texto (ou sem a sessão parar) até o prazo, `Erro: ...` no stderr, código 1 e nenhuma tecla é enviada; sem `--wait` nem `--wait-idle`, o comando é o de sempre. |
 | `--list` | JSON com as sessões abertas: `pid, project, project_id, cli, title, controlled, startedAt`. |
 
 Saída ao enviar: `{"ok": true, "pid": 123, "title": "Projeto — Claude Code", "sent": ["down", "enter"]}`, código 0 (com
-`--wait`, o JSON ganha `"waited": "TEXTO"`).
+`--wait`, o JSON ganha `"waited": "TEXTO"`; com `--wait-idle`, `"waited_idle": true` e `"last_activity"`).
 Falha (tecla desconhecida, sessão inexistente ou ambígua, console inacessível, texto que não apareceu no prazo): `Erro: ...`
 no stderr e código 1; nada é enviado quando alguma tecla é inválida.
 
@@ -572,10 +606,11 @@ launcher keys --project "Meu app" --cli claude down enter  # escolher a 2ª opç
 launcher keys --project "Meu app" 1                        # opção numerada
 launcher keys --pid 4242 esc                               # dispensar
 launcher keys --project "Meu app" --wait "Do you want to proceed" --timeout 120 1   # esperar o diálogo e então responder
+launcher keys --project "Meu app" --wait-idle --timeout 600 text:continue enter   # esperar a sessão ficar 30 s sem gravar no transcript e então enviar
 ```
 
 Em Python: `keys.sessions()`, `keys.resolve(ids_do_projeto, cli, pid)`, `keys.send(pid, tokens)`,
-`keys.read_screen(pid)`, `keys.wait_for_text(pid, texto, prazo)`.
+`keys.read_screen(pid)`, `keys.wait_for_text(pid, texto, prazo)`, `activity.wait_idle(store, pid, prazo)`.
 
 **Estado e última atividade das sessões:** cada sessão de `sessions` no `launcher status` (e no `GET /status`) traz um
 objeto novo `activity` com `last_activity` (carimbo ISO, com fuso, da última gravação do transcript da sessão) e `state`:
@@ -585,6 +620,17 @@ mensagem e a cada ferramenta, e 30 s cobre o intervalo comum entre elas), `idle`
 última gravação, então uma geração longa ou uma ferramenta lenta pode aparecer como `idle`. Os campos que já existiam
 não mudam, e `launcher keys --list` segue igual. O launcher só lê o transcript (Claude `~/.claude/projects`, Codex
 `~/.codex/sessions`, Copilot CLI `~/.copilot/session-state`), nunca o grava, e ignora arquivo ausente ou linha inválida.
+
+**Contexto e custo da sessão (`launcher status --usage`):** só com `--usage`, o `activity` de cada sessão aberta ganha,
+depois de `state` e `last_activity`, `context_tokens` (tokens do último pedido, o que a retomada carrega), `cost_usd` (custo
+estimado da conversa, equivalente de API), `window_warning` (o mesmo aviso da retomada, quando a conversa ocupa 90% ou mais
+da janela confirmada do modelo da abertura) e `usage_reason`. Vale para Claude Code, Codex e Copilot CLI, pelo mesmo leitor
+da lista de conversas e com o cache dela. O que não se sabe é `null`, nunca zero: `usage_reason` diz por quê (conversa da
+sessão não identificada, transcript não encontrado ou sem uso registrado, modelo sem preço no catálogo, erro de leitura com o
+tipo e a mensagem, ou o teto de 10 s, `USAGE_BUDGET_S` em `session/activity.py`, estourado: o que ficou na fila continua do
+cache na leitura seguinte, mas um transcript que sozinho passa do teto só entra no cache quando a leitura inteira termina, e
+o `status` encerra antes disso, então a próxima leitura pode estourar de novo, o que o motivo diz). Sem `--usage`, e no
+`GET /status`, o `activity` é o de antes e nenhum transcript é lido para o uso.
 Como acha o transcript: cada abertura do registro do perfil (`sessions.jsonl`), na pasta do projeto ou na do worktree dele,
 vai para a sessão aberta do mesmo projeto e CLI que registrou mais recentemente antes dela, e a sessão só vale com
 exatamente uma abertura (a conversa é procurada na pasta em que a abertura aconteceu); daí vale a mesma regra do
@@ -693,6 +739,8 @@ cd "C:\caminho\do\projeto"; launcher conversations   # sem --project (em convers
 cd "C:\caminho\do\projeto"; launcher launch --add-here --cli claude --model "ID completo"   # --add-here (em launch e conversations): pasta atual ainda não cadastrada vira projeto, com o nome da pasta, e o comando segue; --project, se vier, tem de ser o nome ou o caminho da pasta atual; recusa raiz de disco, pasta do sistema e pasta de usuário (a do seu perfil, a que a contém e as pastas de outros perfis, Public, Default e All Users; as subpastas delas servem); projeto já cadastrado não é regravado; o cadastro só é gravado depois que o pedido inteiro passou nas validações (conexão, modelo e combinação de opções), então pedido recusado não cadastra nada; com --dry-run cadastra só na memória. Sem a flag o erro "Projeto não cadastrado" é o de sempre
 launcher conversations --search janela   # só as conversas com o texto no título, no CLI ou na data (sem distinguir maiúsculas)
 launcher conversations --grep "erro de cache"   # só as conversas com o texto em alguma mensagem (a sua ou a do modelo, sem distinguir maiúsculas); combina com --search, --cli, --tsv e --command
+launcher conversations --grep "erro de cache" --all-projects   # a mesma busca em todos os projetos cadastrados (não só num); a saída ganha o projeto de cada conversa (coluna Projeto no --tsv, chave project no JSON) e os tetos de 30 s e 64 MiB valem para a varredura inteira; sem --grep é recusado, e não combina com --project, --add-here nem --command
+launcher conversations --tsv --sort custo   # ordem das linhas do --tsv: recente (a de sempre), custo (maior custo estimado primeiro) ou contexto (maior contexto usado primeiro); o que não se sabe vai para o fim e o empate fica do mais recente; sem --tsv ou com --command é recusado
 launcher conversations --tsv             # em vez do JSON, o texto do "Copiar lista" da janela de conversas: tabulação, traço no custo desconhecido (não combina com --command); ganha a coluna final Ramo (traço no que não se sabe) só quando alguma conversa da lista tem ramo gravado
 launcher sessions --reopen --dry-run [--hours 48]   # JSON do que reabriria (padrão 24 h): projeto, CLI, conversa, e o motivo da linha que não abre
 launcher sessions --reopen [--hours 48]   # reabre todas as que têm conversa identificada, como abas em segundo plano; código 1 se alguma aba falhar
@@ -707,6 +755,7 @@ launcher usage --days 7   # tokens e custo de cada um dos 7 últimos dias (1 a 3
 launcher usage --blocks   # blocos de 5 h de uso dos últimos 8 dias, do mais recente para trás, com o tempo restante do ativo (custo = equivalente de API; hora local; --tsv em tabela, --active só o ativo)
 launcher usage --by-source --connection Central --month 2026-11 --tsv   # custo do mês por fonte, como o conector informa (JSON sem --tsv); só em conector com a rota costs
 launcher usage --limit 100,50    # teto de gasto do mês deste perfil (US$); off desliga; a janela só avisa a 80% e 100%
+launcher status --usage        # o mesmo JSON; cada `activity` ganha context_tokens, cost_usd, window_warning e usage_reason (null com o motivo quando não se sabe), ver abaixo
 launcher status                # um JSON: CLIs, conexões (cota), endpoint, sessões abertas (cada uma com `activity`: `state` working|idle|unknown e `last_activity`, ver abaixo), projetos e uso do mês; sem chaves
 launcher completion powershell >> $PROFILE   # Tab completa comandos, opções, CLIs, projetos e conexões no PowerShell
 launcher cli --install vscode    # qualquer ferramenta por usuário: claude, codex, copilot, vscode, copilot_app

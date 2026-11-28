@@ -686,7 +686,7 @@ class Store:
 
     @staticmethod
     def endpoint_sessions_of(connection: dict) -> bool:
-        """A conexão abre as sessões de terminal (Claude Code e Codex) pelo endpoint local? Só `true` liga; ausente ou de
+        """A conexão abre as sessões de terminal (Claude Code, Codex, Copilot CLI e Aider) pelo endpoint local? Só `true` liga; ausente ou de
         outro tipo vale como desligado (caminho direto ao host)."""
         return connection.get("endpoint_sessions") is True
 

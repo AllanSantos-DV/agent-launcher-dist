@@ -249,6 +249,11 @@ class Harness:
     def prepare(self, plan) -> None:
         """Efeitos antes de abrir (confiança da pasta, perfil...). Falha visível, nunca silenciosa."""
 
+    def endpoint_serves(self, gateway) -> bool:
+        """A sessão deste destino nesta conexão pode ir pelo endpoint local? Só vale com `ENDPOINT_SESSIONS`; o adaptador
+        recusa a conexão cuja rota o endpoint não serve."""
+        return self.ENDPOINT_SESSIONS
+
     def ensure_endpoint(self, plan) -> None:
         """Sessão pelo endpoint local: sobe o endpoint da conexão antes de abrir. LauncherError com o motivo se ele não
         sobe ou se a porta não é a do plano; a sessão nunca cai sozinha para o host."""

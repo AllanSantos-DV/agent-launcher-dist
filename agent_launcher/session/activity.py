@@ -25,10 +25,15 @@ from pathlib import Path
 
 from agent_launcher.domain.errors import LauncherError
 from agent_launcher.domain.files import path_key
+from agent_launcher.platform import keys
 from agent_launcher.session import conversations, registry
 
 WORKING_WINDOW_S = 30  # Claude, Codex e Copilot gravam a cada mensagem e a cada ferramenta; 30 s cobre o intervalo comum entre elas
 OPENING_WINDOW_S = 120  # a abertura é gravada logo após o registro da sessão; a espera pela conexão (BOOT_RETRY_DELAYS) soma 30 s
+USAGE_BUDGET_S = 10  # teto do tempo lendo transcripts para o uso; o que passar disso volta como ausente
+IDLE_WAIT_TIMEOUT_S = 300.0  # prazo padrão de `keys --wait-idle`: "idle" já pede WORKING_WINDOW_S de silêncio, então o de `--wait` (30 s) nunca bastaria
+IDLE_POLL_S = 2.0  # cada leitura lista as conversas da pasta do projeto
+IDLE_CONFIRM_S = 1.0  # intervalo entre as duas leituras "idle" seguidas, para o CLI gravar a mensagem que acabou de receber
 UNKNOWN = {"state": "unknown", "last_activity": None}
 
 
@@ -81,9 +86,12 @@ def _state(updated: float, now: float) -> str:
     return "working" if now - updated < WORKING_WINDOW_S else "idle"
 
 
-def annotate(store, sessions: list[dict], now: float | None = None) -> list[dict]:
+def annotate(store, sessions: list[dict], now: float | None = None, with_usage: bool = False,
+             budget_s: float | None = None) -> list[dict]:
     """As mesmas sessões, cada uma com `activity` = {"state", "last_activity"} (ISO com fuso; None em "unknown").
-    `now` (epoch) é o relógio; sem ele vale o do sistema."""
+    `now` (epoch) é o relógio; sem ele vale o do sistema. Com `with_usage`, `activity` ganha depois dessas duas chaves as
+    de `activity_usage` (contexto, custo estimado, aviso de janela e `usage_reason`), com teto de `budget_s` segundos
+    (padrão USAGE_BUDGET_S) de leitura; sem ele nenhum transcript é lido além da data."""
     from agent_launcher.harnesses import registry as harnesses
     moment = time.time() if now is None else now
     projects: dict[str, dict] = {}
@@ -98,9 +106,11 @@ def annotate(store, sessions: list[dict], now: float | None = None) -> list[dict
                for session in sessions if session.get("project_id") in projects}
     openings = _openings(store.home, sessions, folders)
     found: dict[tuple, list] = {}
-    annotated = []
+    results = []
+    targets = []
     for session in sessions:
         result = dict(UNKNOWN)
+        target = (session.get("cli"), None, None)
         opening = openings.get(int(session["pid"]))
         harness = harnesses.find(session.get("cli", ""))
         key = (session.get("project_id"), session.get("cli"))
@@ -117,5 +127,61 @@ def annotate(store, sessions: list[dict], now: float | None = None) -> list[dict
             if conversation is not None:
                 result = {"state": _state(conversation.updated, moment),
                           "last_activity": conversation.as_json()["updated"]}
-        annotated.append({**session, "activity": result})
-    return annotated
+                target = (session.get("cli"), conversation.id, entry)
+        results.append(result)
+        targets.append(target)
+    if with_usage:
+        from agent_launcher.session import activity_usage
+        extras = activity_usage.read(store, targets, USAGE_BUDGET_S if budget_s is None else budget_s)
+        results = [{**result, **extra} for result, extra in zip(results, extras)]
+    return [{**session, "activity": result} for session, result in zip(sessions, results)]
+
+
+def session_item(store, pid: int, now: float | None = None) -> dict:
+    """A sessão aberta `pid` como `annotate` a devolve. Anota todas as abertas, não só ela: duas sessões abertas juntas no
+    mesmo projeto e CLI só se distinguem olhando as duas. Sessão que não está aberta é LauncherError."""
+    for item in annotate(store, keys.sessions(), now):
+        if item.get("pid") == pid:
+            return item
+    raise LauncherError(f"A sessão (pid {pid}) não está mais aberta.")
+
+
+def _unknown_reason(item: dict) -> str:
+    from agent_launcher.harnesses import registry as harnesses
+    harness = harnesses.find(item.get("cli", ""))
+    if harness is None or not conversations.lists_conversations(harness):
+        return f"o launcher não lê transcript do CLI {item.get('cli')!r}."
+    return ("o launcher não achou com certeza o transcript dela. Pode ser: duas sessões do mesmo projeto e CLI abertas "
+            "juntas, sessão retomada sem id de conversa, conversa ainda sem transcript ou projeto de outro perfil.")
+
+
+def wait_idle(store, pid: int, timeout: float, poll: float = IDLE_POLL_S) -> dict:
+    """Relê o estado da sessão `pid` a cada `poll` s até ele ser "idle" e devolve a `activity` dela. Passado `timeout` s
+    ainda "working" é LauncherError; o estado é lido ao menos uma vez. "unknown" é LauncherError na hora, com o motivo.
+    "idle" é a idade da última gravação do transcript (WORKING_WINDOW_S): vale como "sem atividade por 30 s", não como
+    "terminou de pensar"; uma geração ou ferramenta longa que não grava por esse tempo já conta como parada.
+    "idle" só vale com duas leituras seguidas, IDLE_CONFIRM_S s uma da outra (a confirmação pode passar do prazo por esse
+    tempo). Corrida que sobra: logo depois de enviar teclas, se o CLI demorar mais que esse intervalo para gravar a
+    mensagem recebida e a sessão já estava parada, as duas leituras ainda dizem "idle" e a espera volta cedo demais."""
+    if timeout < 0:
+        raise LauncherError(f"O prazo da espera não pode ser negativo ({timeout:g} s).")
+    end = time.monotonic() + timeout
+    confirming = False
+    while True:
+        item = session_item(store, pid)
+        state = item["activity"]["state"]
+        if state == "idle":
+            if confirming:
+                return item["activity"]
+            confirming = True
+            time.sleep(IDLE_CONFIRM_S)
+            continue
+        confirming = False
+        if state == "unknown":
+            raise LauncherError(f"Não dá para saber se a sessão (pid {pid}) terminou de trabalhar: {_unknown_reason(item)} "
+                                "Use --wait TEXTO, que olha a tela.")
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            raise LauncherError(f"A sessão (pid {pid}) não ficou {WORKING_WINDOW_S} s sem atividade no transcript em "
+                                f"{timeout:g} s.")
+        time.sleep(min(poll, remaining))

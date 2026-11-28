@@ -88,19 +88,22 @@ def quota_suffix(payload: dict) -> str:
     return f": {' '.join(str(detail).split())[:200]}" if detail else "."
 
 
-def get_json(url: str, headers: dict | None = None, timeout: float = 15, quota=None) -> dict:
-    """GET de JSON. `quota(status, corpo_do_erro)` diz quais respostas de erro são cota esgotada (QuotaExhausted) neste
+def get_json(url: str, headers: dict | None = None, timeout: float = 15, quota=None, body: dict | None = None) -> dict:
+    """GET de JSON (POST com `body`, enviado como JSON). `quota(status, corpo_do_erro)` diz quais respostas de erro são cota esgotada (QuotaExhausted) neste
     provedor; sem ele, todo status de erro é ConnectorError comum."""
     import http.client
     import urllib.error
     import urllib.request
-    request = urllib.request.Request(url, headers={"Accept": "application/json", **(headers or {})})
+    sent = {"Accept": "application/json", **(headers or {})}
+    if body is not None:
+        sent["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode(), headers=sent)
     try:
         with _opener(url).open(request, timeout=timeout) as response:
-            body = response.read(LIMIT + 1)
-        if len(body) > LIMIT:
+            received = response.read(LIMIT + 1)
+        if len(received) > LIMIT:
             raise ConnectorError(f"Resposta de {url} acima de {LIMIT // (1024 * 1024)} MB.")
-        result = json.loads(body)
+        result = json.loads(received)
     except urllib.error.HTTPError as error:
         payload = _error_payload(error) if quota else {}
         error.close()

@@ -29,7 +29,7 @@ def add_parser(commands) -> None:
     actions = session.add_subparsers(dest="session_action", required=True)
     opened = actions.add_parser("open", help="Abrir a janela de uma sessão nova ou retomada (JSON no stdout)")
     opened.add_argument("--project", required=True, help="Nome, ID ou caminho de projeto cadastrado")
-    opened.add_argument("--cli", help="Claude Code, Codex ou Copilot CLI; omitido usa o último do projeto")
+    opened.add_argument("--cli", help="Destino de terminal (claude, codex, copilot, aider); omitido usa o último do projeto")
     opened.add_argument("--connection", help="Nome ou ID; omitido usa a última do projeto ou a padrão")
     opened.add_argument("--model", help="ID completo; omitido usa o último modelo desse CLI/projeto/conexão")
     opened.add_argument("--resume", action="store_true", help="Retomar a última conversa do CLI na pasta do projeto")
